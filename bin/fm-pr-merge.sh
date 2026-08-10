@@ -136,6 +136,16 @@ if ! fm_pr_task_id_valid "$ID" || ! fm_pr_url_parse "$RAW_URL"; then
   echo "error: invalid PR merge request" >&2
   exit 2
 fi
+# bin/fm-pr-lib.sh also parses Gitea pull request URLs so the watcher can follow
+# them, but only GitHub and GitLab have a merge path here. Any other provider is
+# refused before anything is recorded or armed rather than sent to a forge CLI.
+case "$FM_PR_PROVIDER" in
+  github|gitlab) ;;
+  *)
+    echo "error: invalid PR merge request" >&2
+    exit 2
+    ;;
+esac
 URL=$FM_PR_URL
 PROVIDER=$FM_PR_PROVIDER
 PR_HOST=$FM_PR_HOST

@@ -3,8 +3,9 @@
 # exact pr_head=<sha> when available, then atomically arm a static merge poll.
 # The watcher check source is byte-for-byte bin/fm-pr-poll.sh; task and PR data
 # live only in a private sidecar and are never interpolated into shell source.
-# A GitHub pull request URL and a GitLab merge request URL are both accepted,
-# including a merge request on a self-hosted GitLab instance.
+# A GitHub pull request URL, a GitLab merge request URL, and a Gitea pull
+# request URL are all accepted, including one on a self-hosted GitLab or Gitea
+# instance.
 # A GitHub pull request the forge reports as a draft is refused, naming the draft
 # state and recording and arming nothing: a draft cannot be merged, so a poll armed on it
 # would wait for an event that cannot occur while nobody is asked to act.
@@ -68,6 +69,28 @@ if [ "$PROVIDER" = gitlab ] && ! command -v glab >/dev/null 2>&1; then
   exit 1
 fi
 
+# Gitea needs the same refusal for tea, plus one more: tea picks the instance
+# from a login name in its own config rather than from the URL, so a host with
+# no configured login, or with more than one, leaves the poll unable to address
+# this pull request at all. Both are read from local configuration only. The
+# instance itself is deliberately not contacted here, because a self-hosted
+# Gitea is routinely off the network when its pull request is opened and
+# refusing to arm then would lose the watch for a reachability dip.
+if [ "$PROVIDER" = gitea ]; then
+  if ! command -v tea >/dev/null 2>&1; then
+    echo "error: watching a Gitea pull request requires tea on PATH" >&2
+    exit 1
+  fi
+  GITEA_LOGIN=$(tea logins list --output tsv 2>/dev/null \
+    | awk -F'\t' -v h="https://$HOST" '
+        NR > 1 { u = $2; sub(/\/+$/, "", u); if (u == h) { name = $1; n++ } }
+        END { if (n == 1) print name }') || GITEA_LOGIN=
+  if [ -z "$GITEA_LOGIN" ]; then
+    echo "error: watching a Gitea pull request requires exactly one tea login for https://$HOST" >&2
+    exit 1
+  fi
+fi
+
 # The draft state is read before anything is recorded or armed. Only a positive
 # draft reading refuses, because an unreadable one must not block arming.
 if [ "$PROVIDER" = github ] && [ "${FM_PR_CHECK_MERGE:-}" != 1 ] && command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
@@ -80,10 +103,13 @@ fi
 
 "$FM_ROOT/bin/fm-guard.sh" || true
 
-# pr_head is recorded only when the forge's CLI can supply it. gh exposes the
-# head commit as a selectable field; plain glab exposes it only inside its JSON
-# output, which would need a JSON processor firstmate does not require, so a
-# GitLab task records no pr_head. Both consumers already treat it as optional:
+# pr_head is recorded only when the forge's CLI can supply it without changing
+# what arming costs. gh exposes the head commit as a selectable field; plain
+# glab exposes it only inside its JSON output, which would need a JSON processor
+# firstmate does not require, so a GitLab task records no pr_head. tea does
+# expose it, but only over the network, which would make arming a Gitea watch
+# wait on a self-hosted instance that is routinely unreachable, so a Gitea task
+# records none either. Both consumers already treat it as optional:
 # bin/fm-teardown.sh reads the head from the forge at teardown rather than from
 # metadata and falls back to its provider-agnostic content check, and
 # bin/fm-review-diff.sh resolves the head from the remote when none is recorded.

@@ -1322,6 +1322,12 @@ pr_number_from_target() {
       n=${target##*/pull/}
       n=${n%%[!0-9]*}
       ;;
+    # Gitea's plural route, which serves refs/pull/<n>/head exactly as GitHub
+    # does, so ensure_commit_object below needs nothing further.
+    *"/pulls/"*)
+      n=${target##*/pulls/}
+      n=${n%%[!0-9]*}
+      ;;
     [0-9]*)
       n=${target%%[!0-9]*}
       ;;

@@ -133,6 +133,26 @@ test_pr_meta_fetches_pull_head_without_recorded_sha() {
   pass "fm-review-diff fetches refs/pull/<n>/head when pr_head= is absent"
 }
 
+# Gitea serves refs/pull/<n>/head exactly as GitHub does, and its route is the
+# plural /pulls/<n>, so only the number extraction in front of the fetch had to
+# learn that spelling.
+test_gitea_pr_meta_fetches_pull_head() {
+  local case_dir out
+  case_dir=$(make_case gitea-pr-fetch)
+  stale_and_pr_commits "$case_dir"
+  git -C "$case_dir/wt" push -q origin "pr-head-tmp:refs/pull/9/head"
+  write_task_meta "$case_dir" "pr=https://git.example/example/repo/pulls/9"
+
+  out=$(run_review_diff "$case_dir" task-x1 2> "$case_dir/stderr")
+
+  assert_contains "$out" '+pr-fixed' "gitea-pr-fetch: diff should use the fetched PR head"
+  assert_not_contains "$out" 'stale-local' \
+    "gitea-pr-fetch: diff must not fall back to the stale local branch"
+  assert_not_contains "$(cat "$case_dir/stderr")" 'warning: PR head unavailable' \
+    "gitea-pr-fetch: should not warn when fetch succeeds"
+  pass "fm-review-diff fetches refs/pull/<n>/head for a Gitea pull request URL"
+}
+
 test_no_pr_meta_uses_local_branch() {
   local case_dir out
   case_dir=$(make_case no-pr-meta)
@@ -171,6 +191,7 @@ test_unreachable_pr_head_falls_back_with_warning() {
 
 test_pr_meta_uses_pr_head_not_stale_local
 test_pr_meta_fetches_pull_head_without_recorded_sha
+test_gitea_pr_meta_fetches_pull_head
 test_stale_recorded_pr_head_loses_to_fetched_pull_head
 test_no_pr_meta_uses_local_branch
 test_unreachable_pr_head_falls_back_with_warning

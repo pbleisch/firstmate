@@ -82,6 +82,12 @@ pr_number_from_target() {
       n=${target##*/pull/}
       n=${n%%[!0-9]*}
       ;;
+    # Gitea's plural route, which serves refs/pull/<n>/head exactly as GitHub
+    # does, so fetch_pull_head below needs nothing further.
+    *"/pulls/"*)
+      n=${target##*/pulls/}
+      n=${n%%[!0-9]*}
+      ;;
     [0-9]*)
       n=${target%%[!0-9]*}
       ;;

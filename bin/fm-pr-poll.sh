@@ -4,8 +4,9 @@
 # otherwise, including on every error, so a failed lookup can never be read as
 # a merge. The provider-tagged identity is data in the sidecar and is never
 # interpolated into this source: these bytes are identical for every task.
-# Each provider is read through its own standard CLI, gh for GitHub and glab
-# for GitLab, so an upstream checkout needs no extra tooling to follow either.
+# Each provider is read through its own standard CLI, gh for GitHub, glab for
+# GitLab, and tea for Gitea, so an upstream checkout needs no extra tooling to
+# follow any of them.
 set -u
 LC_ALL=C
 export LC_ALL
@@ -104,6 +105,48 @@ case "$provider" in
     raw=$(glab mr view "$number" -R "https://$host/$path" 2>/dev/null) || exit 0
     state=$(printf '%s\n' "$raw" | sed -n 's/^state:[[:space:]]*//p' | head -1) || exit 0
     [ "$state" = merged ] && printf '%s\n' merged
+    ;;
+  gitea)
+    [ "${#host}" -ge 1 ] && [ "${#host}" -le 253 ] || exit 0
+    [ "$host" != github.com ] || exit 0
+    case "$host" in
+      .*|*.|*..*|*[!a-z0-9.-]*) exit 0 ;;
+    esac
+    # A Gitea repository is owner/repository at no other depth, so the path is
+    # rejected unless it splits into exactly those two segments.
+    owner=${path%%/*}
+    repo=${path#*/}
+    [ "$owner/$repo" = "$path" ] || exit 0
+    for segment in "$owner" "$repo"; do
+      [ "${#segment}" -ge 1 ] && [ "${#segment}" -le 255 ] || exit 0
+      case "$segment" in
+        .|..|-*|*.git|*.atom|*[!A-Za-z0-9._-]*) exit 0 ;;
+      esac
+    done
+    [ "$url" = "https://$host/$owner/$repo/pulls/$number" ] || exit 0
+    # tea addresses a repository by bare owner/repository and picks the instance
+    # from a login name in its own config, so it cannot be pointed at a host the
+    # way glab can. The login is therefore resolved from the validated host and
+    # accepted only when exactly one configured login serves it, and the answer
+    # is then bound to the stored URL below, so neither a doctored sidecar nor a
+    # mis-resolved instance can produce a merge for another repository.
+    login=$(tea logins list --output tsv 2>/dev/null \
+      | awk -F'\t' -v h="https://$host" '
+          NR > 1 { u = $2; sub(/\/+$/, "", u); if (u == h) { name = $1; n++ } }
+          END { if (n == 1) print name }') || exit 0
+    [ -n "$login" ] || exit 0
+    # Gitea reports a merged and an abandoned pull request alike as state
+    # "closed", so the merged boolean is the only discriminator and the detail
+    # form is read for it. tea's list form has no index filter and would have to
+    # be searched page by page, which fails silently into a permanent
+    # "not merged" once a repository outgrows one page. tea prints one field per
+    # line and escapes strings, so a line-anchored read cannot be fooled by
+    # pull request body text, and only the exact merged token wakes firstmate.
+    raw=$(tea pulls "$number" --repo "$owner/$repo" --login "$login" --output json 2>/dev/null) || exit 0
+    seen=$(printf '%s\n' "$raw" | sed -n 's/^[[:space:]]*"url": "\(.*\)",\{0,1\}$/\1/p' | head -1) || exit 0
+    [ "$seen" = "$url" ] || exit 0
+    merged=$(printf '%s\n' "$raw" | sed -n 's/^[[:space:]]*"hasMerged": true,\{0,1\}$/true/p' | head -1) || exit 0
+    [ "$merged" = true ] && printf '%s\n' merged
     ;;
   *) exit 0 ;;
 esac
