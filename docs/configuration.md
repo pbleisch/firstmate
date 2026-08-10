@@ -706,6 +706,10 @@ T3 discovery requires explicit `FM_BACKEND=t3code` or `config/backend=t3code` an
 That keeps a nested tmux or Herdr pane on its own transport, matching the runtime backend's innermost-first rule.
 Target detection uses `FM_SUPERVISOR_TARGET`, then `$TMUX_PANE`, then `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr, then the prefix-stripped `REX_SESSION` and `REX_BLOCK` under Rex, then `"${HC_SESSION:-default}:${HC_TERMINAL_ID}"` when both hc terminal markers are present, then the thread id from that T3 cwd match, then the legacy `firstmate:0` tmux fallback with a warning.
 
+When `bin/fm-session-start.sh` runs inside a primary session that holds the session lock, it publishes the discovered backend and target as the volatile lease `state/primary.endpoint`.
+External integrations should read and validate that lease instead of requiring their own supervisor environment.
+The lease is replaced on the next locked session start and is never treated as a durable endpoint identity.
+
 Selecting or discovering any other supervisor backend, including `hc`, `zellij`, `orca`, `cmux`, or `tern`, refuses at daemon startup instead of trying tmux injection primitives against a non-tmux pane.
 
 ## Away-mode wedge alarm channels (config/wedge-alarm)
