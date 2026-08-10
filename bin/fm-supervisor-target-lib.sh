@@ -21,6 +21,34 @@
 FM_SUPERVISOR_TARGET_DEFAULT="firstmate:0"
 FM_SUPERVISOR_BACKEND_DEFAULT="tmux"
 
+primary_endpoint_file() {  # <state-dir>
+  printf '%s/primary.endpoint' "$1"
+}
+
+write_primary_endpoint() {  # <state-dir> <backend> <target>
+  local state=$1 backend=$2 target=$3 file tmp
+  [ -n "$state" ] && [ -n "$backend" ] && [ -n "$target" ] || return 1
+  mkdir -p "$state" || return 1
+  file=$(primary_endpoint_file "$state")
+  tmp="$file.tmp.$$"
+  {
+    printf 'version=1\n'
+    printf 'backend=%s\n' "$backend"
+    printf 'target=%s\n' "$target"
+    printf 'pid=%s\n' "$$"
+    printf 'recorded_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } > "$tmp" || return 1
+  mv -f "$tmp" "$file"
+}
+
+read_primary_endpoint() {  # <state-dir> <field>
+  local state=$1 field=$2 value
+  case "$field" in backend|target|pid|recorded_at) ;; *) return 1 ;; esac
+  value=$(primary_endpoint_file "$state")
+  [ -r "$value" ] || return 1
+  sed -n "s/^${field}=//p" "$value" | tail -1
+}
+
 # discover_supervisor_target: resolve the pane running firstmate. Priority:
 #   1. FM_SUPERVISOR_TARGET env (explicit override) - may be a tmux target or a
 #      herdr "<session>:<pane-id>" target (paired with discover_supervisor_backend

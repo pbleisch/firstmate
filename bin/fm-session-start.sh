@@ -656,6 +656,16 @@ if [ "$READ_ONLY" -eq 0 ]; then
     rm -f "$COMPLETION_FILE" 2>/dev/null || true
   fi
   fm_trace_context_session_start "$CONFIG" "$STATE/.trace-context-effective"
+  # Publish the current primary intake lease for local integrations such as Flo.
+  # Only the session that holds the lock publishes, so a read-only session can
+  # never redirect intake away from the live primary. Discovery is runtime-aware
+  # and only writes when the session's own environment identifies a real
+  # endpoint; it never persists the legacy fallback.
+  # shellcheck source=bin/fm-supervisor-target-lib.sh
+  . "$SCRIPT_DIR/fm-supervisor-target-lib.sh"
+  if primary_target=$(discover_supervisor_target) && primary_backend=$(discover_supervisor_backend); then
+    write_primary_endpoint "$STATE" "$primary_backend" "$primary_target" || true
+  fi
   # A full locked start publishes this home's current structured summary.
   # Publication is side-band and best-effort, so it can never change the
   # session-start result. A context re-emit is not another session start.
