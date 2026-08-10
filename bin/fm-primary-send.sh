@@ -14,11 +14,16 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 # shellcheck source=bin/fm-supervisor-target-lib.sh
 . "$SCRIPT_DIR/fm-supervisor-target-lib.sh"
 
+check=0
+if [ "${1:-}" = "--check" ]; then
+  check=1
+  shift
+fi
 message="${*:-}"
 if [ -z "$message" ] && [ ! -t 0 ]; then
   message=$(cat)
 fi
-[ -n "$message" ] || { echo "error: primary message is empty" >&2; exit 2; }
+[ "$check" -eq 1 ] || [ -n "$message" ] || { echo "error: primary message is empty" >&2; exit 2; }
 
 target=$(discover_supervisor_target) || true
 backend=$(discover_supervisor_backend) || true
@@ -35,6 +40,11 @@ composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null || true)
 if [ "$composer" != empty ]; then
   echo "error: primary session composer is not confirmed empty (state=${composer:-unknown})" >&2
   exit 1
+fi
+
+if [ "$check" -eq 1 ]; then
+  printf 'primary intake ready via %s:%s (composer=%s)\n' "$backend" "$target" "$composer"
+  exit 0
 fi
 
 retries="${FM_PRIMARY_SEND_RETRIES:-3}"
