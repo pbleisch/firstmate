@@ -25,10 +25,14 @@ if [ -z "$message" ] && [ ! -t 0 ]; then
 fi
 [ "$check" -eq 1 ] || [ -n "$message" ] || { echo "error: primary message is empty" >&2; exit 2; }
 
-if target=$(discover_supervisor_target) && backend=$(discover_supervisor_backend); then
+state="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+if [ -z "${FM_SUPERVISOR_TARGET:-}" ] \
+  && target=$(read_primary_endpoint "$state" target 2>/dev/null) \
+  && backend=$(read_primary_endpoint "$state" backend 2>/dev/null); then
+  : # Prefer Firstmate's current primary lease over this process's terminal.
+elif target=$(discover_supervisor_target) && backend=$(discover_supervisor_backend); then
   : # The caller is running in the primary session's environment.
 else
-  state="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
   target=$(read_primary_endpoint "$state" target 2>/dev/null || true)
   backend=$(read_primary_endpoint "$state" backend 2>/dev/null || true)
 fi
