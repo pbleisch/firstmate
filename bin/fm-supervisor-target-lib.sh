@@ -35,7 +35,6 @@ write_primary_endpoint() {  # <state-dir> <backend> <target>
     printf 'version=1\n'
     printf 'backend=%s\n' "$backend"
     printf 'target=%s\n' "$target"
-    printf 'pid=%s\n' "$$"
     printf 'recorded_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   } > "$tmp" || return 1
   mv -f "$tmp" "$file"
@@ -43,7 +42,7 @@ write_primary_endpoint() {  # <state-dir> <backend> <target>
 
 read_primary_endpoint() {  # <state-dir> <field>
   local state=$1 field=$2 value
-  case "$field" in backend|target|pid|recorded_at) ;; *) return 1 ;; esac
+  case "$field" in backend|target|recorded_at) ;; *) return 1 ;; esac
   value=$(primary_endpoint_file "$state")
   [ -r "$value" ] || return 1
   sed -n "s/^${field}=//p" "$value" | tail -1
