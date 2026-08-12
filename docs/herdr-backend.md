@@ -323,6 +323,7 @@ Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never 
 - Retiring a stale agent record needs the pane's own shell to be lone, idle, and childless.
   A task pane whose shell keeps a persistent helper child - gitstatusd, a zsh-async worker, direnv - cannot satisfy that proof, so an exited agent there stays classified `live` and its task still needs manual reconciliation.
   This is the safe direction and is bounded by a short settle window, not a hang; a weaker proof would risk replacing a suspended or backgrounded agent.
+  Narrowing the child check to ignore prompt-helper daemons was considered and deliberately rejected: telling a helper daemon apart from a suspended or backgrounded agent is inference, which is exactly what this classifier exists to remove, and a wrong answer there launches a second agent into a pane that still holds a live one.
 - OpenCode 1.18.4 can accept Enter while busy without clearing the composer.
   The tmux backend has a busy-queue fallback, but Herdr still reports this case as submit pending and needs a separate adapter fix.
 - Only tmux and Herdr can host the away-mode supervisor terminal.
