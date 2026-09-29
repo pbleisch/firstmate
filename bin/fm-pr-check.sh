@@ -81,10 +81,7 @@ if [ "$PROVIDER" = gitea ]; then
     echo "error: watching a Gitea pull request requires tea on PATH" >&2
     exit 1
   fi
-  GITEA_LOGIN=$(tea logins list --output tsv 2>/dev/null \
-    | awk -F'\t' -v h="https://$HOST" '
-        NR > 1 { u = $2; sub(/\/+$/, "", u); if (u == h) { name = $1; n++ } }
-        END { if (n == 1) print name }') || GITEA_LOGIN=
+  GITEA_LOGIN=$(fm_pr_gitea_login "$HOST") || GITEA_LOGIN=
   if [ -z "$GITEA_LOGIN" ]; then
     echo "error: watching a Gitea pull request requires exactly one tea login for https://$HOST" >&2
     exit 1

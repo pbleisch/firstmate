@@ -480,8 +480,8 @@ EOF
     [ "$FM_PR_HOST" = "$host" ] || fail "parser returned wrong Gitea host"
     [ "$FM_PR_PATH" = "$path" ] || fail "parser returned wrong Gitea repository path"
     [ "$FM_PR_NUMBER" = "$number" ] || fail "parser returned wrong Gitea pull request number"
-    [ -z "$FM_PR_OWNER" ] && [ -z "$FM_PR_REPO" ] \
-      || fail "parser set GitHub owner/repository for a Gitea pull request URL"
+    [ "$FM_PR_OWNER/$FM_PR_REPO" = "$path" ] \
+      || fail "parser did not split a Gitea pull request path into owner/repository"
   done <<'EOF'
 https://git.example/owner/repo/pulls/1|git.example|owner/repo|1
 https://codeberg.org/o/repo-name_with.parts/pulls/123456|codeberg.org|o/repo-name_with.parts|123456
@@ -1690,23 +1690,6 @@ EOF
   grep -q '^logins list' "$dir/tea.log" || fail "arming a Gitea watch did not resolve the login"
   ! grep -q '^pulls ' "$dir/tea.log" \
     || fail "arming a Gitea watch contacted the instance"
-
-  # The merge path has no Gitea support, so it refuses before recording or
-  # arming anything rather than sending a Gitea pull request to another forge.
-  write_task_meta "$dir" task-e
-  : > "$dir/gh.log"
-  : > "$dir/gh-axi.log"
-  : > "$dir/glab.log"
-  : > "$dir/tea.log"
-  set +e
-  run_merge_entry "$dir" task-e "$url" >/dev/null 2>&1
-  rc=$?
-  set -e
-  [ "$rc" -eq 2 ] || fail "merge wrapper did not refuse a Gitea pull request URL"
-  [ ! -s "$dir/gh.log" ] && [ ! -s "$dir/gh-axi.log" ] && [ ! -s "$dir/glab.log" ] \
-    && [ ! -s "$dir/tea.log" ] || fail "merge wrapper reached a forge CLI for a Gitea URL"
-  ! grep -q '^pr=' "$state/task-e.meta" || fail "merge wrapper recorded a Gitea pull request it refused"
-  [ ! -e "$state/task-e.check.sh" ] || fail "merge wrapper armed a poll for a Gitea pull request it refused"
 
   pass "Gitea pull requests are followed on any instance and never wake falsely"
 }

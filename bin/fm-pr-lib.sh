@@ -185,6 +185,21 @@ fm_pr_gitea_host_valid() {
   done
 }
 
+# The one tea login that serves https://<host>, printed only when exactly one
+# configured login's URL matches. tea picks an instance from a login name in its
+# own config rather than from a URL, and silently falls back to some login when
+# none is named, so a caller always passes the login this resolves. Reads local
+# configuration only and never contacts the instance. bin/fm-pr-poll.sh keeps
+# its own copy because its source bytes are static and source no library.
+fm_pr_gitea_login() {  # <host>
+  local host=${1-}
+  [ -n "$host" ] || return 1
+  tea logins list --output tsv 2>/dev/null \
+    | awk -F'\t' -v h="https://$host" '
+        NR > 1 { u = $2; sub(/\/+$/, "", u); if (u == h) { name = $1; n++ } }
+        END { if (n == 1) print name }'
+}
+
 # A Gitea repository is addressed as owner/repository and sits at no other
 # depth, so exactly two segments are accepted. Gitea forbids a leading hyphen
 # and serves a repository's git data at <repo>.git, so neither can name a real
@@ -217,8 +232,8 @@ fm_pr_gitea_path_valid() {
 # bin/fm-pr-merge.sh addresses GitHub by owner/repository. A gitlab URL leaves
 # them empty, and that path addresses the project by FM_PR_HOST and FM_PR_PATH
 # instead, so a merge request on any instance resolves without a hardcoded host.
-# A gitea URL leaves them empty too; the merge path has no Gitea support and
-# refuses that URL before recording anything rather than merging it.
+# A gitea URL sets them too, because tea's API addresses a repository by
+# owner/repository and the instance by a login resolved from FM_PR_HOST.
 fm_pr_url_parse() {
   local raw=${1-} pattern host path
   local LC_ALL=C
@@ -274,6 +289,10 @@ fm_pr_url_parse() {
   FM_PR_URL=$raw
   FM_PR_HOST=$host
   FM_PR_PATH=$path
+  # shellcheck disable=SC2034
+  FM_PR_OWNER=${path%%/*}
+  # shellcheck disable=SC2034
+  FM_PR_REPO=${path#*/}
   FM_PR_NUMBER=${BASH_REMATCH[3]}
 }
 

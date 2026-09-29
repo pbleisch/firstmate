@@ -66,7 +66,26 @@
 # recorded value stale. Reading that state needs glab and jq, and either one
 # absent stops the merge before any state is recorded.
 #
-# Before either forge merge, the task's existing per-task control lock
+# A Gitea pull request is merged through tea's authenticated API, because tea
+# has no merge command that binds a head. The instance comes from the one tea
+# login bin/fm-pr-lib.sh resolves for the parsed host, and every read is bound
+# to the requested URL through the pull request's own html_url. The merge is
+# refused unless every pre-merge condition holds, each read live: the pull
+# request is open, not merged, not a draft, mergeable, and every commit status
+# at the exact current head is success, where an --allow-red <context> waives
+# only that exact context. A head with no statuses at all has nothing red. The
+# verified head is sent as head_commit_id, so Gitea itself refuses a merge whose
+# head moved after that read. The merge style is the caller's --squash,
+# --merge, --rebase, or --method <style>, and otherwise the repository's own
+# default_merge_style; no other extra argument is accepted, and the request
+# never asks Gitea to wait for checks, force past protection, or delete the
+# branch. tea api exits 0 on an HTTP error, so each call's HTTP status line is
+# read and only a 200 counts. After the merge, the pull request is read back
+# and accepted only when it reports merged. Reading that state needs tea, jq,
+# and exactly one tea login for the host, and any of them absent stops the
+# merge before any state is recorded.
+#
+# Before any forge merge, the task's existing per-task control lock
 # serializes the captain-hold check through the forge command. A still-held or
 # unreadable row refuses before that command, so a captain approval must be
 # recorded as an `answer --release` before this entrypoint is invoked. While
@@ -136,11 +155,10 @@ if ! fm_pr_task_id_valid "$ID" || ! fm_pr_url_parse "$RAW_URL"; then
   echo "error: invalid PR merge request" >&2
   exit 2
 fi
-# bin/fm-pr-lib.sh also parses Gitea pull request URLs so the watcher can follow
-# them, but only GitHub and GitLab have a merge path here. Any other provider is
-# refused before anything is recorded or armed rather than sent to a forge CLI.
+# Only providers with a merge path here are accepted; any other is refused
+# before anything is recorded or armed rather than sent to a forge CLI.
 case "$FM_PR_PROVIDER" in
-  github|gitlab) ;;
+  github|gitlab|gitea) ;;
   *)
     echo "error: invalid PR merge request" >&2
     exit 2
@@ -294,6 +312,43 @@ reject_repo_overrides "$@" || exit 1
 reject_head_overrides "$@" || exit 1
 reject_protected_forge_args "$@" || exit 1
 
+# The Gitea merge is one API request this script composes, so the only extra
+# arguments it can honor are a merge style. Anything else is refused rather
+# than silently dropped.
+GITEA_CALLER_STYLE=
+if [ "$PROVIDER" = gitea ]; then
+  pending_style=false
+  for arg in "$@"; do
+    if [ "$pending_style" = true ]; then
+      GITEA_CALLER_STYLE=$arg
+      pending_style=false
+      continue
+    fi
+    case "$arg" in
+      --squash) GITEA_CALLER_STYLE=squash ;;
+      --merge) GITEA_CALLER_STYLE=merge ;;
+      --rebase) GITEA_CALLER_STYLE=rebase ;;
+      --method) pending_style=true ;;
+      --method=*) GITEA_CALLER_STYLE=${arg#--method=} ;;
+      *)
+        echo "error: a Gitea merge accepts only a merge style (--squash, --merge, --rebase, or --method <style>) as an extra argument, not '$arg'" >&2
+        exit 2
+        ;;
+    esac
+  done
+  if [ "$pending_style" = true ]; then
+    echo "error: --method requires a merge style" >&2
+    exit 2
+  fi
+  case "$GITEA_CALLER_STYLE" in
+    ''|merge|rebase|rebase-merge|squash|fast-forward-only) ;;
+    *)
+      echo "error: '$GITEA_CALLER_STYLE' is not a Gitea merge style this script sends (merge, rebase, rebase-merge, squash, fast-forward-only)" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 FM_PR_GITHUB_AUTO_REQUESTED=false
 if [ "$PROVIDER" = github ] && caller_requested_auto_merge "$@"; then
   FM_PR_GITHUB_AUTO_REQUESTED=true
@@ -385,6 +440,24 @@ if [ "$PROVIDER" = github ]; then
   fi
   if [ -n "$GITHUB_MISSING" ]; then
     echo "error: merging a GitHub pull request requires $GITHUB_MISSING on PATH" >&2
+    exit 1
+  fi
+fi
+
+GITEA_LOGIN=
+if [ "$PROVIDER" = gitea ]; then
+  GITEA_MISSING=
+  command -v tea >/dev/null 2>&1 || GITEA_MISSING="tea"
+  if ! command -v jq >/dev/null 2>&1; then
+    GITEA_MISSING="${GITEA_MISSING:+$GITEA_MISSING and }jq"
+  fi
+  if [ -n "$GITEA_MISSING" ]; then
+    echo "error: merging a Gitea pull request requires $GITEA_MISSING on PATH" >&2
+    exit 1
+  fi
+  GITEA_LOGIN=$(fm_pr_gitea_login "$PR_HOST") || GITEA_LOGIN=
+  if [ -z "$GITEA_LOGIN" ]; then
+    echo "error: merging a Gitea pull request requires exactly one tea login for https://$PR_HOST" >&2
     exit 1
   fi
 fi
@@ -1125,6 +1198,183 @@ gitlab_confirm_merged() {
   [ "$state" = merged ]
 }
 
+# One tea api request against the resolved login. Sets GITEA_HTTP_STATUS to the
+# response's HTTP status code and GITEA_BODY to its body. tea api exits 0 on an
+# HTTP error, so the status line it prints with -i is the only success signal;
+# a request whose status line cannot be read returns non-zero.
+GITEA_HTTP_STATUS=
+GITEA_BODY=
+gitea_api() {  # <endpoint> [<raw JSON body to POST>]
+  local endpoint=$1 body=${2-} err status_line rc=0
+  GITEA_HTTP_STATUS=
+  GITEA_BODY=
+  err=$(mktemp "${TMPDIR:-/tmp}/fm-pr-merge-gitea.XXXXXX") || return 1
+  if [ "$#" -ge 2 ]; then
+    GITEA_BODY=$(tea api -i --login "$GITEA_LOGIN" -X POST -d "$body" "$endpoint" 2>"$err") || rc=$?
+  else
+    GITEA_BODY=$(tea api -i --login "$GITEA_LOGIN" "$endpoint" 2>"$err") || rc=$?
+  fi
+  status_line=$(grep -E '^HTTP/[0-9.]+ [0-9]{3}( |$)' "$err" | head -1 || true)
+  rm -f -- "$err"
+  [ "$rc" -eq 0 ] && [ -n "$status_line" ] || return 1
+  status_line=${status_line#* }
+  GITEA_HTTP_STATUS=${status_line%% *}
+}
+
+# Pre-merge conditions for a Gitea pull request, read from one live view of the
+# pull request plus the commit statuses at its head. Sets FM_PR_MERGE_HEAD and
+# GITEA_MERGE_STYLE on success and returns non-zero after reporting every
+# condition that failed.
+GITEA_MERGE_STYLE=
+gitea_verify_mergeable() {
+  local fields line total=0 named=0 refusals=''
+  local url='' state='' merged='' draft='' mergeable='' live_head=''
+  local statuses status_sha='' red='' context name waived
+
+  if ! gitea_api "/repos/$PR_OWNER/$PR_REPO/pulls/$PR_NUMBER" || [ "$GITEA_HTTP_STATUS" != 200 ]; then
+    echo "error: could not read the Gitea pull request state before merging" >&2
+    return 1
+  fi
+  if ! fields=$(printf '%s' "$GITEA_BODY" | jq -r '
+      if type == "object" then
+        "url=" + ((.html_url // "") | tostring),
+        "state=" + ((.state // "") | tostring),
+        "merged=" + (.merged | tostring),
+        "draft=" + (.draft | tostring),
+        "mergeable=" + (.mergeable | tostring),
+        "head=" + ((.head.sha // "") | tostring)
+      else
+        error("pull request payload is not an object")
+      end' 2>/dev/null); then
+    echo "error: could not read the Gitea pull request state before merging" >&2
+    return 1
+  fi
+  while IFS= read -r line; do
+    total=$((total + 1))
+    case "$line" in
+      url=*) url=${line#url=} ;;
+      state=*) state=${line#state=} ;;
+      merged=*) merged=${line#merged=} ;;
+      draft=*) draft=${line#draft=} ;;
+      mergeable=*) mergeable=${line#mergeable=} ;;
+      head=*) live_head=${line#head=} ;;
+      *) continue ;;
+    esac
+    named=$((named + 1))
+  done <<FIELDS
+$fields
+FIELDS
+  if [ "$named" -ne 6 ] || [ "$total" -ne 6 ]; then
+    echo "error: could not read the Gitea pull request state before merging" >&2
+    return 1
+  fi
+  # tea resolves the instance from a login rather than the URL, so the answer is
+  # honored only when it describes exactly the requested pull request.
+  if [ "$url" != "$URL" ]; then
+    echo "error: the Gitea pull request read back as '${url:-unreadable}', not $URL; refusing to merge" >&2
+    return 1
+  fi
+  if ! fm_pr_head_valid "$live_head"; then
+    echo "error: could not read the Gitea pull request head commit before merging" >&2
+    return 1
+  fi
+
+  [ "$state" = open ] \
+    || refusals="$refusals  - state is \"${state:-unreadable}\", not open
+"
+  [ "$merged" = false ] \
+    || refusals="$refusals  - merged is \"${merged:-unreadable}\", not false
+"
+  [ "$draft" = false ] \
+    || refusals="$refusals  - draft is \"${draft:-unreadable}\", not false
+"
+  [ "$mergeable" = true ] \
+    || refusals="$refusals  - mergeable is \"${mergeable:-unreadable}\", not true
+"
+
+  # Gitea's combined status lists the latest status per context. A page that
+  # holds fewer entries than total_count is refused as unreadable rather than
+  # judged on part of the set.
+  if ! gitea_api "/repos/$PR_OWNER/$PR_REPO/commits/$live_head/status?limit=50" \
+    || [ "$GITEA_HTTP_STATUS" != 200 ] \
+    || ! statuses=$(printf '%s' "$GITEA_BODY" | jq -r '
+        if type == "object" and (.statuses | type == "array")
+          and ((.total_count // 0) == (.statuses | length)) then
+          "sha=" + ((.sha // "") | tostring),
+          (.statuses[] | ((.status // "") | tostring) + "\t" + ((.context // "") | tostring | gsub("[\t\n]"; " ")))
+        else
+          error("combined status is unreadable or incomplete")
+        end' 2>/dev/null); then
+    refusals="$refusals  - the commit statuses at head $live_head could not be read completely
+"
+  else
+    while IFS= read -r line; do
+      case "$line" in
+        sha=*) status_sha=${line#sha=}; continue ;;
+        '') continue ;;
+      esac
+      [ "${line%%$'\t'*}" = success ] && continue
+      context=${line#*$'\t'}
+      waived=false
+      for name in ${ALLOW_RED[@]+"${ALLOW_RED[@]}"}; do
+        [ "$context" = "$name" ] && waived=true
+      done
+      if [ "$waived" = true ]; then
+        printf 'notice: waiving status "%s" (%s) at head %s on the attended --allow-red instruction\n' \
+          "$context" "${line%%$'\t'*}" "$live_head" >&2
+        continue
+      fi
+      red="$red  - status \"$context\" is \"${line%%$'\t'*}\", not success
+"
+    done <<STATUSES
+$statuses
+STATUSES
+    if [ -n "$status_sha" ] && [ "$status_sha" != "$live_head" ]; then
+      refusals="$refusals  - the commit statuses describe $status_sha, not the current head $live_head
+"
+    fi
+    refusals="$refusals$red"
+  fi
+
+  GITEA_MERGE_STYLE=$GITEA_CALLER_STYLE
+  if [ -z "$GITEA_MERGE_STYLE" ]; then
+    if gitea_api "/repos/$PR_OWNER/$PR_REPO" && [ "$GITEA_HTTP_STATUS" = 200 ]; then
+      GITEA_MERGE_STYLE=$(printf '%s' "$GITEA_BODY" \
+        | jq -r 'if type == "object" and (.default_merge_style | type == "string") then .default_merge_style else empty end' \
+          2>/dev/null) || GITEA_MERGE_STYLE=
+    fi
+    case "$GITEA_MERGE_STYLE" in
+      merge|rebase|rebase-merge|squash|fast-forward-only) ;;
+      *)
+        refusals="$refusals  - the repository's default merge style \"${GITEA_MERGE_STYLE:-unreadable}\" is not one this script sends; pass --squash, --merge, --rebase, or --method <style>
+"
+        ;;
+    esac
+  fi
+
+  if [ -n "$refusals" ]; then
+    printf 'error: refusing to merge %s\n' "$URL" >&2
+    printf '%s' "$refusals" >&2
+    return 1
+  fi
+  printf 'verified: %s is open and mergeable, with every commit status green at head %s\n' \
+    "$URL" "$live_head" >&2
+  FM_PR_MERGE_HEAD=$live_head
+}
+
+# Read the pull request back after the forge accepted the merge. Returns 0 when
+# it reports merged, 1 when it reads back unmerged, and 2 when it is unreadable.
+gitea_confirm_merged() {
+  local merged
+  if ! gitea_api "/repos/$PR_OWNER/$PR_REPO/pulls/$PR_NUMBER" || [ "$GITEA_HTTP_STATUS" != 200 ] \
+    || ! merged=$(printf '%s' "$GITEA_BODY" | jq -r --arg url "$URL" '
+        if type == "object" and .html_url == $url and (.merged | type == "boolean")
+        then .merged | tostring else error("unreadable") end' 2>/dev/null); then
+    return 2
+  fi
+  [ "$merged" = true ]
+}
+
 # Record before either forge call. This arms the merge poll without claiming a
 # landed outcome, so even a provider read failure after a real merge cannot
 # leave teardown without the PR identity it needs to verify the result.
@@ -1229,6 +1479,52 @@ case "$PROVIDER" in
     gitlab_confirm_rc=0
     gitlab_confirm_merged || gitlab_confirm_rc=$?
     [ "$gitlab_confirm_rc" -eq 0 ] || exit 0
+    ;;
+  gitea)
+    gitea_verify_mergeable || exit 1
+    # head_commit_id binds the merge to the head this run verified, so Gitea
+    # refuses a merge whose head moved after that read. The body never asks
+    # Gitea to wait for checks, force past branch protection, or delete the
+    # branch. The away record is locked first, so this last presence and
+    # authority read and the forge request share one live-owner critical section.
+    hold_away_record_for_merge || exit 1
+    away_status=0
+    require_current_away_authority || away_status=$?
+    [ "$away_status" -eq 0 ] || exit "$away_status"
+    gitea_merge_body=$(jq -cn --arg style "$GITEA_MERGE_STYLE" --arg head "$FM_PR_MERGE_HEAD" \
+      '{Do: $style, head_commit_id: $head}') || exit 1
+    merge_status=0
+    gitea_api "/repos/$PR_OWNER/$PR_REPO/pulls/$PR_NUMBER/merge" "$gitea_merge_body" || merge_status=$?
+    if [ "$merge_status" -ne 0 ] || [ "$GITEA_HTTP_STATUS" != 200 ]; then
+      fm_afk_contract_lock_release || true
+      fm_lock_release "$MERGE_CONTROL_LOCK" || true
+      MERGE_CONTROL_LOCK=
+      printf 'error: Gitea refused the merge of %s (HTTP %s)\n' "$URL" "${GITEA_HTTP_STATUS:-unreadable}" >&2
+      [ -z "$GITEA_BODY" ] || printf 'forge said: %s\n' "$GITEA_BODY" >&2
+      if gitea_confirm_merged; then
+        printf 'actionable: the merge request for %s failed, but the pull request reads back as merged\n' "$URL" >&2
+      fi
+      exit 1
+    fi
+    persist_accepted_merge_authority || exit 1
+    fm_afk_contract_lock_release || true
+    fm_lock_release "$MERGE_CONTROL_LOCK" || true
+    MERGE_CONTROL_LOCK=
+    gitea_confirm_rc=0
+    gitea_confirm_merged || gitea_confirm_rc=$?
+    case "$gitea_confirm_rc" in
+      0) ;;
+      1)
+        printf 'actionable: Gitea accepted the merge request for %s but the pull request reads back unmerged; the merge poll remains armed\n' \
+          "$URL" >&2
+        exit 1
+        ;;
+      *)
+        printf 'actionable: Gitea accepted the merge request for %s but its landed state could not be confirmed; the merge poll remains armed\n' \
+          "$URL" >&2
+        exit 0
+        ;;
+    esac
     ;;
   *)
     echo "error: invalid PR merge request" >&2

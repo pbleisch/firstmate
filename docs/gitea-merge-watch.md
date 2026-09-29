@@ -185,10 +185,16 @@ An unreachable instance costs nothing beyond a bounded check: every check runs u
 The stored record and its provenance format are unchanged, so `fm-pr-poll-registration-v2` still parses and every GitHub and GitLab watch already armed keeps working untouched.
 Unlike the GitLab change, this one needs no version bump and no migration.
 
-## What this change does not cover
+## Merging, and what the watch does not cover
 
-`bin/fm-pr-merge.sh` merges only GitHub pull requests and GitLab merge requests.
-It refuses a Gitea pull request URL before recording or arming anything rather than sending it to another forge's CLI, so merging one stays a deliberate manual step.
+Merging a Gitea pull request is `bin/fm-pr-merge.sh`'s job, and its header owns that contract.
+One fact from this instance, recorded on 2026-09-28, shapes it: `tea api` exits 0 on an HTTP error, so the merge path reads the status line `tea api -i` prints rather than the exit code.
+
+```
+$ cd /tmp && tea api -i --login gitea /repos/pbleisch/mpfs/pulls/99999 2>err >/dev/null; echo "rc=$?"; head -1 err
+rc=0
+HTTP/1.1 404 Not Found
+```
 
 A Gitea task records no `pr_head=`.
 `tea` does expose the head commit as `headSha`, but only over the network, and reading it at arming would make arming wait on an instance that is routinely unreachable.
