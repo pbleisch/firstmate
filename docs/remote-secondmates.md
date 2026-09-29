@@ -229,6 +229,64 @@ The underlying `fm-on` transport never retries automatically, but `fm-send` retr
 Semantic callers preserve the route or pending request; an operation that is not idempotent requires same-host reconciliation rather than a blind resend, while an unconfirmed steer may be retried only through the correlation-preserving command described above.
 An unavailable remote home is projected as unknown and is never replaced by a local second mate.
 
+## Working on the remote host
+
+### A Claude sandbox profile for the remote account
+
+A remote home's workers launch with the permission mode the home configures, which is bypass unless `config/claude-permission-mode` says `auto`, so Claude Code's Bash sandbox is the per-command limit on what an agent there can touch.
+Put the profile in the remote account's `~/.claude/settings.json`, which applies to the second mate and every worker it launches:
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "allowWrite": [
+        "/home/agent/fm-home",
+        "/home/agent/.treehouse",
+        "/home/agent/.cache"
+      ],
+      "denyRead": [
+        "/home/agent/.ssh"
+      ]
+    },
+    "network": {
+      "allowUnixSockets": [
+        "/home/agent/.config/herdr/sessions/fm-remote/herdr.sock"
+      ],
+      "allowedDomains": [
+        "git.example.internal",
+        "github.com",
+        "api.github.com",
+        "*.githubusercontent.com"
+      ]
+    }
+  }
+}
+```
+
+- Replace `/home/agent` with the account's home, `/home/agent/fm-home` with the remote home, and the domains with the forges and package registries the home's projects use.
+- The second mate's Bash drives Herdr through the `fm-remote` session socket and creates worker worktrees under `~/.treehouse`, and its workers write status and git objects into the remote home, so those three grants are the minimum for a working home; everything else stays outside the sandbox's write set.
+- `allowUnsandboxedCommands: false` makes a command the sandbox blocks fail rather than retry outside the sandbox, which matters because bypass mode would approve that retry.
+- `failIfUnavailable: true` stops Claude Code from starting unsandboxed when bubblewrap or socat is missing, so install both on the host.
+- Keep the forge credentials the home needs (`tea`, `gh`) readable; the account holds only its role's credentials, and the host firewall and egress allowlist remain the boundary this profile adds a layer to.
+
+These keys were checked against Claude Code 2.1.284's settings schema; the profile's working grants are proven only by the real-host smoke test below, which launches a second mate and a worker under it.
+
+### Dev servers and review boards
+
+The remote host's ports stay on its own loopback, and every connection starts from the primary, so reach a dev server or a review board through an SSH local forward rather than by widening any network grant:
+
+```sh
+ssh -N -o ExitOnForwardFailure=yes -L 5173:127.0.0.1:5173 <ssh-alias>
+```
+
+- Add one `-L <local>:127.0.0.1:<remote>` per port; the forward lives until that command stops.
+- Pick a different local port when the local one is taken, for example `-L 14387:127.0.0.1:4387` for a Lavish board on the remote host while the primary's own Lavish server holds 4387.
+- Run it as its own command, and keep `LocalForward` out of the alias's configuration: `fm-on.sh` clears all forwardings on its own calls, and a forward in the alias would otherwise open on every interactive login.
+
 ## Backlog handoff
 
 Move already-judged queued work with the normal command:
@@ -286,6 +344,7 @@ bin/fm-test-run.sh tests/fm-remote-job.test.sh
 bin/fm-test-run.sh tests/fm-remote-transport-lanes.test.sh
 bin/fm-test-run.sh tests/fm-remote-doctor.test.sh
 bin/fm-test-run.sh tests/fm-remote-herdr-guard.test.sh
+bin/fm-test-run.sh tests/fm-remote-liveness.test.sh
 bin/fm-test-run.sh tests/fm-project-origin.test.sh
 bin/fm-test-run.sh tests/fm-secondmate-sync.test.sh
 bin/fm-test-run.sh tests/fm-remote-reply.test.sh
@@ -298,5 +357,5 @@ The account-level checks the doctor performs - a real Aqua login session, a real
 The audit-session facts the guard relies on are recorded with their commands in [runtime backend verification](verification/runtime-backends.md#fm-remote-server-birth-and-login-keychain-access).
 
 For a real-host smoke test, provision a disposable remote account and project, run the doctor and its repair against that account, launch the second mate, send one marked request, verify its correlated reply and structured fleet projection, simulate an unreachable host to confirm unknown-without-failover behavior, then retire only after the remote queue is empty.
+On a Linux host, also confirm under the sandbox profile above that the second mate launches a worker and that the worker's PR comes back, then reboot the host and confirm the worker, the `fm-remote` server, and the liveness timer return and the next session start relaunches the second mate.
 The deterministic suite is automated; real-host validation is still an operator-run smoke test and is not claimed by the repository tests.
-bin/fm-test-run.sh tests/fm-remote-liveness.test.sh
