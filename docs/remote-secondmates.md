@@ -27,7 +27,7 @@ Provisioning checks any available supported backend; launch checks the selected 
 
 - `fm-remote` is reserved for remote fleet work and must not be used for personal work.
 - The user's interactive Herdr session remains `default` and is not a remote-secondmate prerequisite.
-- Herdr's remote-session server belongs to the host's own GUI login session rather than to the SSH connection.
+- Herdr's remote-session server belongs to the host's own GUI login session on macOS, and to the account's systemd user manager on Linux, rather than to the SSH connection.
   As a result, the agent's endpoint survives every disconnection the primary's supervision depends on.
 - A remote Rex endpoint requires a persistent rex server started with `rex server start`, which is a detached daemon no SSH session owns.
   An ephemeral `rex server run --exit-empty` server exits when its last session or control connection disappears, so it can never satisfy remote readiness.
@@ -309,6 +309,9 @@ The guard's header owns the decision table, and [`bin/fm-remote-herdr-owner-lib.
 `--fix` also takes these actions:
 
 - It starts the same workers directly on Linux.
+  On a herdr-backed Linux host whose account a systemd user manager serves, it also writes and enables two Firstmate-owned user units so both come back after a reboot: `dev.firstmate.remote-job.service` for the worker and `dev.firstmate.herdr.fm-remote.service`, which runs the same guard through the account's login shell (found in the passwd database).
+  On Linux the guard keeps any running server, because no login keychain ties a server to a session there, and the Herdr unit restarts the server if it fails.
+  A host with no reachable user manager skips both unit checks and keeps on-demand starts only.
 - It recreates the `~/.local/bin/fm-remote-entrypoint.sh` symlink when it is absent.
 - It creates only Firstmate-owned required-tool wrappers that it can prove resolve to a version-manager target.
   It stops after one harness satisfies the at-least-one requirement, which is the harness line of the [required remote tools](#required-remote-tools).
@@ -328,6 +331,7 @@ These steps are never automated and are always reported rather than silently att
 - FileVault, which holds a reboot at pre-boot authentication before any login session exists.
 - Installing any missing required tool that no safe wrapper can resolve.
 - Each worker runtime's own `/login`, and any keychain password prompt that login needs.
+- On Linux, lingering for the remote account (`sudo loginctl enable-linger <account>`), without which its user units start only while it has a login session and nothing comes back after a reboot.
 
 Firstmate never writes an auto-login password, never changes FileVault, and never stores an account password.
 A file at `~/.local/bin/fm-remote-entrypoint.sh` that is not Firstmate's own symlink is reported for the operator to inspect and is never overwritten.
@@ -755,6 +759,7 @@ The doctor performs these account-level checks, and they are only ever exercised
 
 - A real Aqua login session.
 - A real `launchctl` domain.
+- A real systemd user manager and linger setting.
 - A real herdr server.
 
 So the readiness gate's behavior on a genuine Mac remains an operator-run smoke test.
