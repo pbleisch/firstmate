@@ -744,6 +744,53 @@ publish_healthy_watcher_identity "$PARENT/state" "$PARENT" "$ROOT/bin/fm-watch.s
   || fail "remote endpoint delivery observation did not execute on its own host"
 pass "remote spawn launches on the remote-local backend and records a host-qualified route"
 
+# --- the host-side liveness probe ---------------------------------------------
+# The probe runs on the remote host itself (a systemd timer there), reads the
+# endpoint through the same host-local state reader, and reports a death on the
+# home's parent channel only after two consecutive down reads.
+liveness_probe() {
+  FM_HOME="$REMOTE_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
+    FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux FM_REMOTE_JOB_STATE_ROOT="$TMP_ROOT/remote-jobs" \
+    PATH="$REMOTE_ROOT/bin:$PATH" \
+    "$REMOTE_ROOT/bin/fm-remote-liveness.sh" probe --textfile "$TMP_ROOT/liveness/ios.prom"
+}
+REMOTE_CHANNEL="$REMOTE_HOME/state/parent-replies.status"
+channel_lines() {
+  local n
+  n=$(grep -c 'remote-liveness-' "$REMOTE_CHANNEL" 2>/dev/null)
+  printf '%s\n' "${n:-0}"
+}
+LIVE_OUT=$(liveness_probe)
+assert_contains "$LIVE_OUT" 'secondmate=ios' "the probe did not name the home's secondmate"
+assert_contains "$LIVE_OUT" 'state=alive' "the probe did not read the live endpoint as alive"
+assert_contains "$LIVE_OUT" 'herdr=up' "the probe did not see the running fm-remote server"
+assert_grep 'firstmate_remote_secondmate_up{id="ios",state="alive"} 1' "$TMP_ROOT/liveness/ios.prom" \
+  "the probe did not write the textfile metric for a live secondmate"
+[ "$(channel_lines)" = 0 ] || fail "a live secondmate produced a liveness line"
+cp "$HERDR_STATE" "$TMP_ROOT/herdr-before-liveness.state"
+reset_remote_herdr_fixture "$HERDR_STATE"
+LIVE_OUT=$(liveness_probe)
+assert_contains "$LIVE_OUT" 'state=missing' "the probe did not read the vanished endpoint as missing"
+assert_grep 'firstmate_remote_secondmate_up{id="ios",state="missing"} 0' "$TMP_ROOT/liveness/ios.prom" \
+  "the textfile did not report the missing secondmate"
+[ "$(channel_lines)" = 0 ] || fail "one down read already published a liveness line"
+liveness_probe >/dev/null
+[ "$(channel_lines)" = 1 ] || fail "two down reads did not publish exactly one liveness line"
+assert_grep 'blocked [key=remote-liveness-' "$REMOTE_CHANNEL" "the down line is not a keyed blocked line"
+assert_grep 'remote secondmate ios agent is missing on its host; relaunch it with bin/fm-spawn.sh ios --secondmate' \
+  "$REMOTE_CHANNEL" "the down line did not name the secondmate, its state, and the recovery command"
+liveness_probe >/dev/null
+[ "$(channel_lines)" = 1 ] || fail "a continuing down episode published a second line"
+cp "$TMP_ROOT/herdr-before-liveness.state" "$HERDR_STATE"
+LIVE_OUT=$(liveness_probe)
+assert_contains "$LIVE_OUT" 'state=alive' "the restored endpoint was not read alive again"
+[ "$(channel_lines)" = 2 ] || fail "recovery did not publish exactly one resolving line"
+down_key=$(sed -n 's/^blocked \[key=\(remote-liveness-[0-9]*\)\].*/\1/p' "$REMOTE_CHANNEL" | head -1)
+[ -n "$down_key" ] || fail "the down line carried no readable key"
+assert_grep "resolved [key=$down_key]" "$REMOTE_CHANNEL" "the resolving line did not close the down line's key"
+assert_absent "$REMOTE_HOME/state/.remote-liveness" "recovery left the down episode open"
+pass "the host-side liveness probe reports a dead remote secondmate once, after two reads, and resolves it"
+
 remote_route_meta="$REMOTE_HOME/state/parent-route/ios.meta"
 cp "$remote_route_meta" "$TMP_ROOT/remote-ios-before-default-session.meta"
 legacy_pane=$(sed -n 's/^herdr_pane_id=//p' "$remote_route_meta")

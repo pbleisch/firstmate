@@ -173,6 +173,13 @@ Backends that already refuse secondmate launch, currently Orca and cmux, remain 
 
 Startup liveness recovery relaunches a dead or missing remote second mate through this same command, so recovery passes the same readiness gate rather than a weaker one.
 
+Between session starts, the remote host watches its own second mate.
+Each host-local launch installs a systemd user timer, `dev.firstmate.remote-liveness-<id>.timer`, when a user manager serves the account, and retirement removes it.
+Every two minutes the timer runs [`bin/fm-remote-liveness.sh`](../bin/fm-remote-liveness.sh), which reads the endpoint with the same recovery-grade state the startup sweep uses and writes `~/.firstmate/metrics/<id>.prom` for a node_exporter textfile collector.
+After two consecutive `dead` or `missing` reads it adds one keyed `blocked` line to the home's parent channel, which reaches the primary through the reply mirror below; the primary then relaunches with the command above, and the probe's next alive read adds the matching `resolved` line.
+The probe never relaunches anything itself, and its header owns the exact facts, metrics, and episode rules.
+It needs the primary's reply source to be running to reach firstmate, so a death while no primary session runs surfaces at the next session start as before, or through an alert on the metric.
+
 A persistent remote route's parent metadata intentionally has no local spawn-generation marker and identifies the route by its recorded host instead.
 The Bearings inventory-reconcile hook therefore accepts these markerless routes, revalidates the sampled host at delivery, and refuses a route that changed hosts; [`fm-secondmate-reconcile.sh`](../bin/fm-secondmate-reconcile.sh) owns the exact cooldown, identity, and reporting contract.
 
@@ -292,3 +299,4 @@ The audit-session facts the guard relies on are recorded with their commands in 
 
 For a real-host smoke test, provision a disposable remote account and project, run the doctor and its repair against that account, launch the second mate, send one marked request, verify its correlated reply and structured fleet projection, simulate an unreachable host to confirm unknown-without-failover behavior, then retire only after the remote queue is empty.
 The deterministic suite is automated; real-host validation is still an operator-run smoke test and is not claimed by the repository tests.
+bin/fm-test-run.sh tests/fm-remote-liveness.test.sh

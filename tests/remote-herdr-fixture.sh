@@ -118,6 +118,13 @@ esac
 exit 0
 SH
   chmod +x "$script"
+  # The host-local launch installs a systemd --user liveness timer when a user
+  # manager serves HOME. These suites keep the invoking account's HOME, so the
+  # fake host reports no user manager, and no test run on a Linux machine can
+  # write units into its real manager.
+  printf '#!/usr/bin/env bash\nprintf "Failed to connect to bus: No medium found\\n" >&2\nexit 1\n' \
+    > "$remote_root/bin/systemctl"
+  chmod +x "$remote_root/bin/systemctl"
   reset_remote_herdr_fixture "$state"
 }
 

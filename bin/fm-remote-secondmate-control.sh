@@ -127,6 +127,16 @@ state_value() { # <id>; prints recovery-grade state
   fm_backend_agent_state "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" 2>/dev/null || printf 'unreadable\n'
 }
 
+# The host-side liveness timer (bin/fm-remote-liveness.sh) watches this
+# endpoint mid-session and after a reboot. Installing it is best-effort and
+# idempotent, so a host without a systemd user manager still launches, and an
+# endpoint launched before the timer existed gains it on its next launch call.
+ensure_liveness_timer() { # <id>
+  FM_HOME="$TARGET_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" \
+    "$SCRIPT_DIR/fm-remote-liveness.sh" install "$1" >&2 \
+    || printf 'warning: the liveness timer for %s could not be installed\n' "$1" >&2
+}
+
 print_route() { # <id>
   local id=$1 harness traceparent
   remote_endpoint_require "$id"
@@ -176,6 +186,7 @@ cmd_launch() {
     current=$(fm_backend_agent_state "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" 2>/dev/null || printf 'unreadable\n')
     case "$current" in
       alive)
+        ensure_liveness_timer "$id"
         print_route "$id"
         return 0
         ;;
@@ -207,6 +218,7 @@ cmd_launch() {
   herdr_session=$(fm_meta_get "$meta" herdr_session)
   [ "$herdr_session" = "$REMOTE_HERDR_SESSION" ] \
     || die "remote launch recorded Herdr session '${herdr_session:-missing}', expected '$REMOTE_HERDR_SESSION'"
+  ensure_liveness_timer "$id"
   print_route "$id"
 }
 
@@ -417,6 +429,10 @@ cmd_retire() {
       FM_CONFIG_OVERRIDE="$TARGET_HOME/config" FM_TEARDOWN_GUARD_DONE=1 \
       "$SCRIPT_DIR/fm-teardown.sh" "$id"
   fi
+  # Reached only after a completed retirement: set -e stops above on a refusal,
+  # which leaves the still-live secondmate's timer running.
+  FM_HOME="$TARGET_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" \
+    "$SCRIPT_DIR/fm-remote-liveness.sh" remove "$id" >&2 || true
 }
 
 case "${1:-}" in
