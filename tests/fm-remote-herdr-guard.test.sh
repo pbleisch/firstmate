@@ -162,6 +162,7 @@ guard() { # [extra env assignments...]
       FM_FAKE_SOCKET_OWNER="$CASE_OWNER" FM_FAKE_HERDR_SOCKET="$CASE_SOCKET" \
       FM_HOLDER_JQ="$JQ" \
       FM_REMOTE_HERDR_GUARD_STOP_WAIT_TENTHS=8 \
+      FM_REMOTE_JOB_PLATFORM_OVERRIDE=Darwin \
       "$@" "$GUARD" "$FAKE/herdr" "$SESSION" 2>&1
   )
   GUARD_RC=$?
@@ -325,6 +326,21 @@ assert_contains "$GUARD_OUT" 'released its socket after' "the guard did not repo
 [ "$(grep -c "^status --json --session $SESSION$" "$CASE_LOG")" -ge 4 ] \
   || fail "the guard did not keep polling the session status until the socket was released"
 pass "the guard starts as soon as the foreign server releases the socket"
+
+# --- on Linux any running server is kept -------------------------------------
+
+new_case running
+printf '%s\n' "$SSH_PID" > "$CASE_OWNER"
+guard FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux
+expect_code 0 "$GUARD_RC" "the Linux guard did not rest on a running server"
+assert_not_contains "$(herdr_calls)" 'server stop' "the Linux guard stopped a running server"
+assert_not_started "the Linux guard started a second server"
+assert_contains "$GUARD_OUT" 'already has a running server' "the Linux guard did not report keeping the server"
+new_case stopped
+guard FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux
+expect_code 0 "$GUARD_RC" "the Linux guard failed on an empty session"
+assert_started "the Linux guard did not start the server when none ran"
+pass "on Linux the guard starts an empty session and never takes a running one over"
 
 # --- usage errors never touch a server ---------------------------------------
 

@@ -45,9 +45,18 @@
 # fixed. Any remaining fixable or human gap, and any missing required tool,
 # exits non-zero.
 #
+# On Linux with a reachable systemd user manager, boot persistence is two
+# Firstmate-owned systemd --user units: dev.firstmate.remote-job.service, which
+# bin/fm-remote-job-lib.sh renders, and dev.firstmate.herdr.fm-remote.service,
+# which runs the same guard through the account's login shell. User units start
+# at boot only while the account lingers, so an account without linger is a
+# human gap; a host with no reachable user manager skips both checks.
+#
 # --fix is idempotent and closes only automatable gaps: it writes and reloads
 # both Firstmate-owned Aqua agents, starts the Linux workers where no Aqua agent
-# applies, recreates the entrypoint symlink, and may add an owned ~/.local/bin
+# applies, writes and enables both Linux systemd --user units (it never starts
+# the worker through them or changes linger), recreates the entrypoint symlink,
+# and may add an owned ~/.local/bin
 # wrapper for a required tool it can discover under nvm, asdf, or mise. It never
 # installs packages, creates a login session, writes an auto-login password,
 # changes FileVault, stores an account password, or replaces a non-Firstmate
@@ -80,6 +89,8 @@ LAUNCH_AGENT_PLIST="$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist"
 LAUNCH_AGENT_LOG_DIR="${HOME:-}/Library/Logs"
 LAUNCH_AGENT_LOG="$LAUNCH_AGENT_LOG_DIR/$LAUNCH_AGENT_LABEL.log"
 ENTRYPOINT_LINK="${HOME:-}/.local/bin/fm-remote-entrypoint.sh"
+SYSTEMD_USER_DIR="${HOME:-}/.config/systemd/user"
+HERDR_SYSTEMD_UNIT="$LAUNCH_AGENT_LABEL.service"
 
 usage() { sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
@@ -238,6 +249,15 @@ resolve_launch_agent_shell() {
         if (length) { print; exit }
       }
     ')
+    if [ -n "$shell" ] && [ -x "$shell" ]; then
+      printf '%s' "$shell"
+      return 0
+    fi
+  fi
+  # Linux keeps the login shell in the passwd database, and a remote job's
+  # environment carries no $SHELL.
+  if [ -n "$user" ] && command -v getent >/dev/null 2>&1; then
+    shell=$(getent passwd "$user" 2>/dev/null | cut -d: -f7)
     if [ -n "$shell" ] && [ -x "$shell" ]; then
       printf '%s' "$shell"
       return 0
@@ -657,6 +677,83 @@ check_launch_agent_loaded() { # <resolved-login-shell>
     "close the login-session gap first; a launch agent can only be bootstrapped into an existing GUI session"
 }
 
+render_herdr_systemd_unit() { # <resolved-herdr-path> <resolved-login-shell>
+  local herdr_bin=$1 shell=$2 value
+  for value in "$herdr_bin" "$shell" "$(launch_agent_guard_path)"; do
+    fm_remote_job_systemd_safe_value "$value" || return 1
+  done
+  cat <<UNIT
+# Firstmate-owned; bin/fm-remote-doctor.sh --fix rewrites this file.
+[Unit]
+Description=Firstmate fm-remote Herdr server
+
+[Service]
+Type=simple
+ExecStart="$shell" -l -c "$(launch_agent_exec_command "$herdr_bin")"
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+UNIT
+}
+
+# The check and the repair compare against the same rendered body, so a unit
+# is reported drifted exactly when --fix would rewrite it.
+systemd_unit_matches() { # <unit-file> <rendered-body>
+  local path="$SYSTEMD_USER_DIR/$1"
+  [ -f "$path" ] && [ ! -L "$path" ] && [ "$(cat "$path")" = "$2" ]
+}
+
+systemd_unit_enabled() { # <unit-name>
+  [ "$(fm_remote_job_systemd_user is-enabled "$1" 2>/dev/null)" = enabled ]
+}
+
+check_systemd_units() { # <resolved-login-shell>
+  local shell=$1 herdr_bin job_body herdr_body gaps=''
+  if [ "$PLATFORM" != linux ]; then
+    record systemd-units "skip: systemd user units apply only on linux"
+    return 0
+  fi
+  if ! fm_remote_job_systemd_user_available; then
+    record systemd-units "skip: no systemd user manager is reachable, so this host's boot persistence is not managed here"
+    return 0
+  fi
+  if ! herdr_bin=$(command -v herdr 2>/dev/null) \
+    || ! herdr_body=$(render_herdr_systemd_unit "$herdr_bin" "$shell") \
+    || ! job_body=$(fm_remote_job_render_systemd_unit "$FM_ROOT" "${HOME:-}"); then
+    record systemd-units "human: the herdr, login-shell, or Firstmate paths cannot be embedded safely in a systemd unit" \
+      "install herdr and Firstmate at paths without quotes, backslashes, % or \$, then rerun this command with --fix"
+    return 0
+  fi
+  systemd_unit_matches "$FM_REMOTE_JOB_SYSTEMD_UNIT" "$job_body" || gaps="$gaps $FM_REMOTE_JOB_SYSTEMD_UNIT"
+  systemd_unit_matches "$HERDR_SYSTEMD_UNIT" "$herdr_body" || gaps="$gaps $HERDR_SYSTEMD_UNIT"
+  systemd_unit_enabled "$FM_REMOTE_JOB_SYSTEMD_UNIT" || gaps="$gaps $FM_REMOTE_JOB_SYSTEMD_UNIT(disabled)"
+  systemd_unit_enabled "$HERDR_SYSTEMD_UNIT" || gaps="$gaps $HERDR_SYSTEMD_UNIT(disabled)"
+  if [ -z "$gaps" ]; then
+    record systemd-units "ok: $FM_REMOTE_JOB_SYSTEMD_UNIT and $HERDR_SYSTEMD_UNIT are installed and enabled in $SYSTEMD_USER_DIR"
+    return 0
+  fi
+  record systemd-units "fixable: the boot-persistence units are missing, drifted, or disabled:$gaps" \
+    "rerun this command with --fix to write and enable them"
+}
+
+check_linger() {
+  local user linger
+  if ! fm_remote_job_systemd_user_available; then
+    record linger "skip: no systemd user manager is reachable on this host"
+    return 0
+  fi
+  user=$(id -un 2>/dev/null || true)
+  linger=$(loginctl show-user "$user" --property=Linger --value 2>/dev/null || true)
+  if [ "$linger" = yes ]; then
+    record linger "ok: $user lingers, so its user units start at boot without a login"
+    return 0
+  fi
+  record linger "human: ${user:-this account} does not linger, so its systemd user units start only while it has a login session and nothing restarts after a reboot" \
+    "an administrator runs 'sudo loginctl enable-linger ${user:-<account>}' on that host; Firstmate never changes it"
+}
+
 check_herdr_server() {
   if ! herdr_cli_available; then
     record herdr-server "human: herdr server status cannot be read without both herdr and jq on the runtime PATH" \
@@ -727,6 +824,8 @@ run_checks() { # <resolved-login-shell>
   check_gui_session
   check_remote_job_worker
   check_launch_agent "$shell"
+  check_systemd_units "$shell"
+  check_linger
   check_herdr_server
   check_entrypoint_link
 }
@@ -809,12 +908,58 @@ start_herdr_server() {
     fix_report herdr-server failed "herdr and jq must both resolve before the server can be started"
     return 1
   fi
+  # An enabled boot unit owns the server, so start it there: systemd then
+  # restarts it on failure and the server gets the account's login environment.
+  if fm_remote_job_systemd_user_available && systemd_unit_enabled "$HERDR_SYSTEMD_UNIT"; then
+    if fm_remote_job_systemd_user start "$HERDR_SYSTEMD_UNIT" >/dev/null 2>&1 && wait_for_herdr_server; then
+      fix_report herdr-server applied "started $HERDR_SYSTEMD_UNIT for session $HERDR_SESSION_NAME"
+      return 0
+    fi
+    fix_report herdr-server failed "$HERDR_SYSTEMD_UNIT did not bring session $HERDR_SESSION_NAME up within 10s"
+    return 1
+  fi
   if fm_backend_herdr_server_ensure "$HERDR_SESSION_NAME" >/dev/null 2>&1; then
     fix_report herdr-server applied "started the herdr server for session $HERDR_SESSION_NAME"
     return 0
   fi
   fix_report herdr-server failed "the herdr server for session $HERDR_SESSION_NAME did not come up"
   return 1
+}
+
+write_systemd_unit() { # <unit-file> <rendered-body>
+  local path="$SYSTEMD_USER_DIR/$1" tmp
+  systemd_unit_matches "$1" "$2" && return 0
+  if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+    fix_report systemd-units failed "$path exists and is not a regular file"
+    return 1
+  fi
+  tmp="$SYSTEMD_USER_DIR/.$1.tmp.$$"
+  if ! printf '%s\n' "$2" > "$tmp" 2>/dev/null || ! chmod 0644 "$tmp" || ! mv -f -- "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    fix_report systemd-units failed "cannot publish $path"
+    return 1
+  fi
+}
+
+# Writes and enables both units without starting the worker through systemd:
+# the worker already runs, and a second one would only lose the ownership race.
+install_systemd_units() { # <resolved-login-shell>
+  local shell=$1 herdr_bin job_body herdr_body out
+  herdr_bin=$(command -v herdr 2>/dev/null) || return 1
+  herdr_body=$(render_herdr_systemd_unit "$herdr_bin" "$shell") || return 1
+  job_body=$(fm_remote_job_render_systemd_unit "$FM_ROOT" "${HOME:-}") || return 1
+  if ! mkdir -p "$SYSTEMD_USER_DIR" 2>/dev/null || [ -L "$SYSTEMD_USER_DIR" ]; then
+    fix_report systemd-units failed "cannot create $SYSTEMD_USER_DIR"
+    return 1
+  fi
+  write_systemd_unit "$FM_REMOTE_JOB_SYSTEMD_UNIT" "$job_body" || return 1
+  write_systemd_unit "$HERDR_SYSTEMD_UNIT" "$herdr_body" || return 1
+  if ! out=$(fm_remote_job_systemd_user daemon-reload 2>&1) \
+    || ! out=$(fm_remote_job_systemd_user enable "$FM_REMOTE_JOB_SYSTEMD_UNIT" "$HERDR_SYSTEMD_UNIT" 2>&1); then
+    fix_report systemd-units failed "systemctl --user refused: ${out:-no diagnostic}"
+    return 1
+  fi
+  fix_report systemd-units applied "wrote and enabled $FM_REMOTE_JOB_SYSTEMD_UNIT and $HERDR_SYSTEMD_UNIT"
 }
 
 link_entrypoint() {
@@ -860,6 +1005,7 @@ apply_fixes() { # <resolved-login-shell>
         launch_agent_reloaded=1
         reload_launch_agent launchagent-loaded || true
         ;;
+      systemd-units) install_systemd_units "$shell" || true ;;
       herdr-server)
         # On darwin the launch agent owns the server, so restart it through
         # launchd rather than starting a stray one outside the Aqua session. A
@@ -896,7 +1042,7 @@ fi
 printf 'platform=%s\n' "$PLATFORM"
 
 LAUNCH_AGENT_SHELL=
-if [ "$PLATFORM" = darwin ]; then
+if [ "$PLATFORM" = darwin ] || [ "$PLATFORM" = linux ]; then
   LAUNCH_AGENT_SHELL=$(resolve_launch_agent_shell)
 fi
 run_checks "$LAUNCH_AGENT_SHELL"

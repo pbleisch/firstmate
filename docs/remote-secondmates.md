@@ -7,7 +7,7 @@ Firstmate does not support placing an individual worker remotely or failing a re
 The remote second-mate agent itself always runs on the [Herdr backend](herdr-backend.md) in the shared `fm-remote` session, and every path that provisions or launches one refuses a host that is not ready for it.
 `fm-remote` is reserved for remote fleet work and must not be used for personal work.
 The user's interactive Herdr session remains `default` and is not a remote-secondmate prerequisite.
-Herdr's remote-session server belongs to the host's own GUI login session rather than to the SSH connection, so the agent's endpoint survives every disconnection the primary's supervision depends on.
+Herdr's remote-session server belongs to the host's own GUI login session on macOS, and to the account's systemd user manager on Linux, rather than to the SSH connection, so the agent's endpoint survives every disconnection the primary's supervision depends on.
 Local second mates are unaffected and keep their ordinary backend and session selection, as do the workers a remote second mate supervises inside its own home.
 
 ## Prerequisites
@@ -102,7 +102,10 @@ The Herdr agent runs [`bin/fm-remote-herdr-guard.sh`](../bin/fm-remote-herdr-gua
 The `gui/<uid>` domain, not the login shell, is what gives that server and every pane it spawns the Aqua audit session and login-keychain access; a server born in any other session cannot read the login keychain, and every claude pane under it falls back to a stale plaintext credentials file and reports "Login expired".
 Herdr's own SSH remote attach starts such a server when it finds none, and at boot it wins the `fm-remote` socket because sshd accepts connections before the login session exists, so the guard is what makes the launch agent converge: it execs the server in the foreground under launchd when nothing owns the socket, exits 0 when an Aqua-born server already does, and otherwise stops the foreign server and takes the session over, closing its panes so the parent firstmate relaunches its mates into the Aqua-born server.
 `KeepAlive={SuccessfulExit=false}` lets that exit 0 rest instead of respawning against a held socket; the guard's header owns the decision table and [`bin/fm-remote-herdr-owner-lib.sh`](../bin/fm-remote-herdr-owner-lib.sh) owns the birth markers it reads.
-It starts the same workers directly on Linux, recreates the `~/.local/bin/fm-remote-entrypoint.sh` symlink when it is absent, and creates only Firstmate-owned required-tool wrappers that it can prove resolve to a version-manager target, stopping after one harness satisfies the at-least-one requirement.
+On Linux it starts the same workers directly, and when a systemd user manager serves the account it also writes and enables two Firstmate-owned user units so both come back after a reboot: `dev.firstmate.remote-job.service` for the worker and `dev.firstmate.herdr.fm-remote.service`, which runs the same guard through the account's login shell (found in the passwd database).
+On Linux the guard keeps any running server, because no login keychain ties a server to a session there, and the Herdr unit restarts the server if it fails.
+A host with no reachable user manager skips both unit checks and keeps on-demand starts only.
+It also recreates the `~/.local/bin/fm-remote-entrypoint.sh` symlink when it is absent, and creates only Firstmate-owned required-tool wrappers that it can prove resolve to a version-manager target, stopping after one harness satisfies the at-least-one requirement.
 It never installs packages or overwrites a non-Firstmate file at a reserved wrapper path.
 The dedicated Herdr launch agent owns only the remote-secondmate `fm-remote` server and does not inspect, rewrite, start, stop, or require the user's interactive `default` session or its `dev.firstmate.herdr` launch agent.
 It re-derives every check from the host afterwards, so what it prints is the state after the repair rather than the intent of one.
@@ -114,6 +117,7 @@ These steps are never automated and are always reported rather than silently att
 - Installing any missing required tool that no safe wrapper can resolve.
 - The required remote tool set is `git`, `jq`, `herdr`, compatible `tasks-axi`, `treehouse`, and at least one of `claude`, `codex`, `opencode`, `pi`, `pi-signed`, `grok`, or `kimi`; macOS additionally requires `lsof` so the doctor and guard can prove which process owns the session socket.
 - Each worker runtime's own `/login`, and any keychain password prompt that login needs.
+- On Linux, lingering for the remote account (`sudo loginctl enable-linger <account>`), without which its user units start only while it has a login session and nothing comes back after a reboot.
 
 Firstmate never writes an auto-login password, never changes FileVault, and never stores an account password.
 A file at `~/.local/bin/fm-remote-entrypoint.sh` that is not Firstmate's own symlink is reported for the operator to inspect and is never overwritten.
@@ -283,7 +287,7 @@ bin/fm-test-run.sh tests/fm-remote-secondmate-lifecycle-e2e.test.sh
 bin/fm-test-run.sh tests/fm-remote-secondmate-trace-context.test.sh
 ```
 
-The account-level checks the doctor performs - a real Aqua login session, a real `launchctl` domain, and a real herdr server - are only ever exercised against fixtures here, so the readiness gate's behavior on a genuine Mac remains an operator-run smoke test.
+The account-level checks the doctor performs - a real Aqua login session, a real `launchctl` domain, a real systemd user manager and linger setting, and a real herdr server - are only ever exercised against fixtures here, so the readiness gate's behavior on a genuine Mac remains an operator-run smoke test.
 The audit-session facts the guard relies on are recorded with their commands in [runtime backend verification](verification/runtime-backends.md#fm-remote-server-birth-and-login-keychain-access).
 
 For a real-host smoke test, provision a disposable remote account and project, run the doctor and its repair against that account, launch the second mate, send one marked request, verify its correlated reply and structured fleet projection, simulate an unreachable host to confirm unknown-without-failover behavior, then retire only after the remote queue is empty.

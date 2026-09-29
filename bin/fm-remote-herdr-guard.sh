@@ -36,6 +36,12 @@
 # markers; FM_REMOTE_HERDR_GUARD_STOP_WAIT_TENTHS (default 50) bounds the
 # release wait in tenths of a second. Every decision prints one line to
 # stdout, which launchd routes to the agent's log.
+#
+# On Linux the same guard is the ExecStart of the systemd --user unit
+# dev.firstmate.herdr.fm-remote.service (Restart=on-failure). No login keychain
+# ties a server to a session there, so any running server is kept: the guard
+# execs the server when none runs and otherwise exits 0, and never takes a
+# session over. FM_REMOTE_JOB_PLATFORM_OVERRIDE selects the platform in tests.
 set -u
 
 SCRIPT_SELF=${BASH_SOURCE[0]}
@@ -74,6 +80,14 @@ if ! status_running "$STATUS"; then
   log "no server owns session $SESSION"
   start_server
 fi
+
+case "${FM_REMOTE_JOB_PLATFORM_OVERRIDE:-$(uname -s 2>/dev/null || true)}" in
+  Darwin|darwin) ;;
+  *)
+    log "session $SESSION already has a running server; nothing to do on this platform"
+    exit 0
+    ;;
+esac
 
 SOCKET=$(printf '%s' "$STATUS" | jq -r '.server.socket // empty' 2>/dev/null)
 OWNER=$(fm_remote_herdr_socket_owner "$SOCKET"); OWNER_RC=$?

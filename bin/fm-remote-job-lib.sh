@@ -881,6 +881,66 @@ fm_remote_job_launchagent_contract_matches() { # <remote-root> <account-home>
   [ "$actual" = "$expected" ]
 }
 
+# Linux boot persistence. The worker normally starts on demand from whichever
+# SSH call finds it missing, which leaves nothing running after a reboot, so
+# bin/fm-remote-doctor.sh --fix also installs and enables this systemd --user
+# unit to start the same worker at boot. It adds no second supervisor: the
+# worker keeps its own restart supervisor, a worker that loses the ownership
+# race exits 0, and fm-on's ensure path still restarts one that gave up, so
+# Restart=no. KillMode=process confines a stop to the worker's own tree, because
+# a herdr server that a job started on demand sits in this unit's cgroup and
+# must outlive a worker replaced for a code update. Output goes to the journal.
+FM_REMOTE_JOB_SYSTEMD_UNIT="$FM_REMOTE_JOB_LABEL.service"
+
+fm_remote_job_systemd_unit_path() { # <account-home>
+  printf '%s/.config/systemd/user/%s\n' "$1" "$FM_REMOTE_JOB_SYSTEMD_UNIT"
+}
+
+# A value is embedded in a unit only where systemd reads it back verbatim: no
+# quote, backslash, specifier (%), variable reference ($), or control character.
+fm_remote_job_systemd_safe_value() {
+  case "$1" in ''|*'"'*|*"'"*|*\\*|*'%'*|*'$'*|*[[:cntrl:]]*) return 1 ;; esac
+}
+
+# systemctl --user reaches the user manager through XDG_RUNTIME_DIR, which a
+# remote job's env -i environment does not carry, so the standard location is
+# supplied.
+fm_remote_job_systemd_user() {
+  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" systemctl --user "$@"
+}
+
+# True only on Linux with a reachable user manager whose own HOME is this HOME:
+# units written under another HOME would never be read by that manager, and a
+# fixture HOME must never enable anything in the invoking account's manager.
+fm_remote_job_systemd_user_available() {
+  local manager_home
+  [ "$(fm_remote_job_platform)" = linux ] || return 1
+  command -v systemctl >/dev/null 2>&1 || return 1
+  manager_home=$(fm_remote_job_systemd_user show-environment 2>/dev/null | sed -n 's/^HOME=//p' | head -1) || return 1
+  [ -n "$manager_home" ] && [ "$manager_home" = "${HOME:-}" ]
+}
+
+fm_remote_job_render_systemd_unit() { # <remote-root> <account-home>
+  local root=$1 account_home=$2 worker
+  worker="$root/bin/fm-remote-job-worker.sh"
+  fm_remote_job_systemd_safe_value "$worker" && fm_remote_job_systemd_safe_value "$account_home" || return 1
+  cat <<UNIT
+# Firstmate-owned; bin/fm-remote-doctor.sh --fix rewrites this file.
+[Unit]
+Description=Firstmate remote job worker
+
+[Service]
+Type=simple
+Environment="HOME=$account_home" "FM_ROOT_OVERRIDE=$root"
+ExecStart="$worker"
+Restart=no
+KillMode=process
+
+[Install]
+WantedBy=default.target
+UNIT
+}
+
 fm_remote_job_gui_available() { # <uid>
   local uid=$1
   command -v launchctl >/dev/null 2>&1 && launchctl print "gui/$uid" >/dev/null 2>&1

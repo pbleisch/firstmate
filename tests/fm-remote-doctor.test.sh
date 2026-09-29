@@ -199,6 +199,40 @@ esac
 exit 0
 SH
 
+  # Every case carries its own systemctl and loginctl, so a Linux runner's real
+  # user manager is never reached. The user manager is unreachable unless the
+  # case creates state/systemd-user; linger is on only with state/linger.
+  cat > "$CASE_BIN/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s XDG_RUNTIME_DIR=%s\n' "$*" "${XDG_RUNTIME_DIR-<unset>}" >> "$FM_FAKE_STATE/systemctl.log"
+[ "${1:-}" = --user ] || exit 1
+shift
+[ -f "$FM_FAKE_STATE/systemd-user" ] || { printf 'Failed to connect to bus: No medium found\n' >&2; exit 1; }
+case "${1:-}" in
+  show-environment)
+    if [ -f "$FM_FAKE_STATE/systemd-other-home" ]; then printf 'HOME=/elsewhere\n'; else printf 'HOME=%s\n' "$HOME"; fi
+    exit 0
+    ;;
+  daemon-reload) exit 0 ;;
+  is-enabled)
+    if [ -f "$FM_FAKE_STATE/enabled-${2:-}" ]; then printf 'enabled\n'; exit 0; fi
+    printf 'disabled\n'; exit 1
+    ;;
+  enable) shift; for unit in "$@"; do : > "$FM_FAKE_STATE/enabled-$unit"; done; exit 0 ;;
+  start)
+    [ "${2:-}" = dev.firstmate.herdr.fm-remote.service ] && printf 'true\n' > "$FM_FAKE_HERDR_RUNNING"
+    exit 0
+    ;;
+esac
+exit 1
+SH
+  cat > "$CASE_BIN/loginctl" <<'SH'
+#!/usr/bin/env bash
+if [ -f "$FM_FAKE_STATE/linger" ]; then printf 'yes\n'; else printf 'no\n'; fi
+SH
+  chmod +x "$CASE_BIN/systemctl" "$CASE_BIN/loginctl"
+
   # Any attempt to reach for auto-login, FileVault, or the keychain records
   # itself here so the test can prove the doctor never goes near them.
   local forbidden
@@ -777,7 +811,74 @@ expect_code 0 "$DOCTOR_RC" "--fix did not start the herdr server on linux"
 assert_contains "$DOCTOR_OUT" 'fix herdr-server=applied:' "--fix did not report starting the server"
 assert_contains "$DOCTOR_OUT" 'check herdr-server=ok:' "the started server was not confirmed by the re-check"
 [ ! -s "$CASE_LAUNCHCTL_LOG" ] || fail "the linux path invoked launchctl"
+assert_contains "$DOCTOR_OUT" 'check systemd-units=skip: no systemd user manager is reachable' \
+  "a linux host without a user manager was not exempted from boot persistence"
+assert_contains "$DOCTOR_OUT" 'check linger=skip:' "linger was required without a user manager"
 pass "a non-darwin host skips launch agents and starts its herdr server directly"
+
+# --- linux boot persistence: systemd --user units and linger -----------------
+
+new_case Linux with-herdr no-gui
+touch "$CASE_STATE/systemd-user"
+printf 'true\n' > "$CASE_HERDR_RUNNING"
+UNIT_DIR="$CASE_HOME/.config/systemd/user"
+doctor
+expect_code 1 "$DOCTOR_RC" "a linux host without boot-persistence units was reported ready"
+assert_contains "$DOCTOR_OUT" 'check systemd-units=fixable:' "missing units were not tagged fixable"
+assert_contains "$DOCTOR_OUT" 'check linger=human:' "an account without linger was not left to a person"
+assert_contains "$DOCTOR_OUT" "sudo loginctl enable-linger" "the linger gap did not name the operator step"
+doctor --fix
+assert_contains "$DOCTOR_OUT" 'fix systemd-units=applied:' "--fix did not report installing the units"
+assert_contains "$DOCTOR_OUT" 'check systemd-units=ok:' "the installed units were not confirmed by the re-check"
+assert_contains "$DOCTOR_OUT" 'check linger=human:' "--fix claimed to close the linger gap"
+expect_code 1 "$DOCTOR_RC" "a host without linger was reported ready after --fix"
+assert_grep "ExecStart=\"$ROOT/bin/fm-remote-job-worker.sh\"" "$UNIT_DIR/dev.firstmate.remote-job.service" \
+  "the worker unit does not start this code root's worker"
+assert_grep "\"HOME=$CASE_HOME\" \"FM_ROOT_OVERRIDE=$ROOT\"" "$UNIT_DIR/dev.firstmate.remote-job.service" \
+  "the worker unit does not carry the account home and code root"
+assert_grep 'KillMode=process' "$UNIT_DIR/dev.firstmate.remote-job.service" \
+  "a worker unit stop could reach a herdr server started from a job"
+assert_grep "ExecStart=\"$CASE_LOGIN_SHELL\" -l -c \"exec '$GUARD' '$CASE_BIN/herdr' 'fm-remote'\"" \
+  "$UNIT_DIR/dev.firstmate.herdr.fm-remote.service" \
+  "the herdr unit does not exec the guard through the login shell"
+assert_grep 'WantedBy=default.target' "$UNIT_DIR/dev.firstmate.herdr.fm-remote.service" \
+  "the herdr unit is not wanted at boot"
+assert_grep 'enable dev.firstmate.remote-job.service dev.firstmate.herdr.fm-remote.service' "$CASE_STATE/systemctl.log" \
+  "--fix did not enable both units"
+assert_no_grep 'start dev.firstmate.remote-job.service' "$CASE_STATE/systemctl.log" \
+  "--fix started a second worker through systemd"
+assert_grep "XDG_RUNTIME_DIR=/run/user/$(id -u)" "$CASE_STATE/systemctl.log" \
+  "systemctl --user was not pointed at the account's runtime directory"
+touch "$CASE_STATE/linger"
+: > "$CASE_STATE/systemctl.log"
+doctor --fix
+expect_code 0 "$DOCTOR_RC" "a lingering host with installed units was not ready"
+assert_contains "$DOCTOR_OUT" 'check linger=ok:' "linger was not confirmed"
+assert_no_grep 'daemon-reload' "$CASE_STATE/systemctl.log" "a second --fix rewrote units that already matched"
+printf '# edited\n' >> "$UNIT_DIR/dev.firstmate.herdr.fm-remote.service"
+doctor
+assert_contains "$DOCTOR_OUT" 'check systemd-units=fixable: the boot-persistence units are missing, drifted, or disabled: dev.firstmate.herdr.fm-remote.service' \
+  "a drifted herdr unit was not reported"
+pass "linux boot persistence installs and enables owned user units and leaves linger to a person"
+
+new_case Linux with-herdr no-gui
+touch "$CASE_STATE/systemd-user" "$CASE_STATE/linger"
+doctor --fix
+expect_code 0 "$DOCTOR_RC" "--fix did not bring a stopped linux server up through its unit"
+assert_grep 'start dev.firstmate.herdr.fm-remote.service' "$CASE_STATE/systemctl.log" \
+  "the stopped server was not started through its enabled unit"
+assert_contains "$DOCTOR_OUT" 'fix herdr-server=applied: started dev.firstmate.herdr.fm-remote.service' \
+  "--fix did not report starting the unit"
+pass "an enabled herdr unit, not a stray process, starts a stopped linux server"
+
+new_case Linux with-herdr no-gui
+touch "$CASE_STATE/systemd-user" "$CASE_STATE/systemd-other-home"
+doctor --fix
+assert_contains "$DOCTOR_OUT" 'check systemd-units=skip: no systemd user manager is reachable' \
+  "a user manager serving another HOME was treated as this account's"
+assert_no_grep 'enable' "$CASE_STATE/systemctl.log" "--fix enabled units in a manager serving another HOME"
+assert_absent "$CASE_HOME/.config/systemd/user" "--fix wrote units no manager for this HOME would read"
+pass "a user manager that serves another HOME is never written to"
 
 # --- --fix may add only owned wrappers for version-manager tools -------------
 
