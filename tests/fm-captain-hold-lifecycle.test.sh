@@ -115,9 +115,10 @@ case "${1:-} ${2:-}" in
   "pr view")
     case " $* " in
       *statusCheckRollup*)
-        printf '%s\n' '{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"1111111111111111111111111111111111111111","baseRefName":"main","statusCheckRollup":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}'
+        printf '{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"%s","baseRefName":"main","statusCheckRollup":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}\n' \
+          "$(cat "$FM_TEST_GH_HEAD_FILE" 2>/dev/null || echo 1111111111111111111111111111111111111111)"
         ;;
-      *headRefOid*) printf '%s\n' 1111111111111111111111111111111111111111 ;;
+      *headRefOid*) cat "$FM_TEST_GH_HEAD_FILE" 2>/dev/null || printf '%s\n' 1111111111111111111111111111111111111111 ;;
     esac
     ;;
   "pr merge") printf 'merged:\n  number: %s\n  status: ok\n' "${3:-}" ;;
@@ -151,7 +152,18 @@ run_pr_merge() {  # <home> <id> <url>
   PATH="$home/fakebin:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_CONFIG_OVERRIDE="$home/config" FM_TEST_GH_LOG="$home/gh.log" \
-    FM_TEST_GH_AXI_LOG="$home/gh-axi.log" "$ROOT/bin/fm-pr-merge.sh" "$@"
+    FM_TEST_GH_AXI_LOG="$home/gh-axi.log" FM_TEST_GH_HEAD_FILE="$home/gh-head" \
+    "${FM_TEST_PR_ENTRY:-$ROOT/bin/fm-pr-merge.sh}" "$@"
+}
+
+# Record a PR binding the way firstmate does, through bin/fm-pr-check.sh, with
+# the forge mock serving <wt>'s HEAD as the pull request head, so a later merge
+# is bound to a real commit the content guard can read. Args: home id url wt
+record_pr() {
+  local home=$1 id=$2 url=$3 wt=$4
+  git -C "$wt" rev-parse HEAD > "$home/gh-head"
+  FM_TEST_PR_ENTRY="$ROOT/bin/fm-pr-check.sh" run_pr_merge "$home" "$id" "$url" >/dev/null \
+    || fail "could not record $url for $id through fm-pr-check.sh"
 }
 
 wait_for_test_file() {  # <path> <pid>
@@ -3528,7 +3540,8 @@ test_pr_merge_entrypoint_refuses_a_captain_held_task() {
   fm_write_meta "$home/state/$pr_id.meta" \
     "window=firstmate:fm-$pr_id" "endpoint_task_id=$pr_id" "worktree=$wt" \
     "project=$repo" "harness=codex" "kind=ship" "mode=no-mistakes" \
-    "pr=$pr" "spawn_gen=fixture-$pr_id"
+    "spawn_gen=fixture-$pr_id"
+  record_pr "$home" "$pr_id" "$pr" "$wt"
   run_captain "$home" hold "$pr_id" --reason "captain merge approval pending" >/dev/null \
     || fail "could not hold the PR entrypoint fixture"
 
@@ -3596,6 +3609,10 @@ test_pr_merge_entrypoint_separates_an_unreadable_record_from_an_absent_one() {
   id=sample-missing-pr-authority
   pr=https://github.com/sample/sample/pull/43
   write_origin_meta "$home" "$id" ship
+  # The merge binds to the head it records and runs the content guard in the
+  # task's worktree, so this task needs a real copy.
+  fm_git_worktree "$home/projects/sample" "$home/projects/missing-$id" "fm/$id"
+  git -C "$home/projects/missing-$id" rev-parse HEAD > "$home/gh-head"
 
   # A backlog that exists but cannot be read may hide a live captain hold, so
   # the merge must refuse without reaching the forge.
@@ -3939,6 +3956,9 @@ test_merge_entrypoints_serialize_forced_teardown_before_task_reads() {
   repo="$home/projects/sample-pr-race"
   wt="$home/projects/$id"
   fm_git_worktree "$repo" "$wt" "fm/$id"
+  # The merge binds to the head the forge reports and runs the content guard on
+  # it, so the mock reports this copy's real HEAD.
+  git -C "$wt" rev-parse HEAD > "$home/gh-head"
   tasks_in "$home" add "$id" "Ship the released pull request" --kind ship \
     --repo sample --start >/dev/null || fail "could not create the PR teardown-race fixture"
   fm_write_meta "$home/state/$id.meta" \
@@ -4113,7 +4133,8 @@ test_released_merge_passes_the_entrypoint_and_lands() {
   fm_write_meta "$home/state/$id.meta" \
     "window=firstmate:fm-$id" "endpoint_task_id=$id" "worktree=$wt" \
     "project=$repo" "harness=codex" "kind=ship" "mode=no-mistakes" \
-    "pr=$pr" "spawn_gen=fixture-$id"
+    "spawn_gen=fixture-$id"
+  record_pr "$home" "$id" "$pr" "$wt"
   printf 'done: merge ready\n' > "$home/state/$id.status"
   run_captain "$home" hold "$id" --reason "captain merge approval pending" >/dev/null \
     || fail "could not hold the released merge fixture"

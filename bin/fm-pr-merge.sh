@@ -14,7 +14,8 @@
 #
 # Usage:
 #   fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check>]
-#     [--allow-missing <check>] [--allow-no-pipeline] [-- <forge merge flags>]
+#     [--allow-missing <check>] [--allow-no-pipeline] [--allow-content <guard>]...
+#     [-- <forge merge flags>]
 #   fm-pr-merge.sh -h | --help
 #
 # Merge method on GitHub defaults to --squash when the caller passes none of
@@ -110,10 +111,9 @@
 # through detailed_merge_status. It is refused while the away-posture record
 # exists and on any forge other than GitLab. The verified head is then passed
 # to glab as --sha, so a push that lands between that read and the merge fails
-# the merge instead of landing commits nothing verified. A recorded pr_head that disagrees with the live head is
-# reported rather than trusted, because a rebase moves the head and leaves the
-# recorded value stale. Reading that state needs glab and jq, and either one
-# absent stops the merge before any state is recorded.
+# the merge instead of landing commits nothing verified. Reading that state
+# needs glab and jq, and either one absent stops the merge before any state is
+# recorded.
 #
 # A Forgejo merge is refused unless every pre-merge condition holds, each read
 # live at merge time: the pull request is open, not a draft, mergeable is
@@ -166,6 +166,29 @@
 # retains the lock until the accepted merge authority is persisted against the
 # still-matching task metadata.
 #
+# Merge authority is bound to the content that was recorded and presented.
+# bin/fm-pr-check.sh is the only writer of a task's binding (pr=, pr_head=, and
+# the integrity record bin/fm-pr-binding-lib.sh owns), so before anything is
+# recorded a metadata binding that disagrees with that record, or one with no
+# record at all, is refused as hand-edited. A GitHub or Forgejo merge is then
+# bound to the recorded head: a live head that differs, a tree that differs from
+# the recorded tree, or a binding with no recorded head is refused until
+# bin/fm-pr-check.sh records the pull request again and the changed pull
+# request, with its diff stat, is presented to the captain again. A first
+# merge-time record binds the head the forge reports at that moment, which for
+# Forgejo is always the first merge attempt, because a Forgejo registration
+# records no head. GitLab has no recorded head at all, so a GitLab merge is bound
+# by identity only.
+#
+# A GitHub or Forgejo merge also passes the content guard
+# bin/fm-merge-guard-lib.sh owns: it prints the diff stat against a freshly
+# fetched origin/<base>, records it in state/<task-id>.merge-guard, and refuses
+# on any guard that lib names - a stale tree, deleted migrations or tests, mass
+# deletion, or a guard that could not run. An attended --allow-content <guard>
+# waives exactly that named guard, may be repeated once per guard, is refused
+# while the away-posture record exists like --allow-red, and is passed only when
+# the captain names the guard. It never waives the head binding.
+#
 # Extra args must not include --repo or -R in any form, including a bundled
 # short-option cluster such as -yR, because the repository comes only from the
 # URL, nor --sha or --match-head-commit because the head comes only from the
@@ -181,7 +204,7 @@
 # explicit captain instruction and never skips the live green check, the
 # away-record read, or a captain hold.
 #
-# Usage: fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check-name>] [--allow-missing <check-name>] [--allow-no-pipeline] [-- <extra forge merge args>]
+# Usage: fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check-name>] [--allow-missing <check-name>] [--allow-no-pipeline] [--allow-content <guard>]... [-- <extra forge merge args>]
 #
 # On GitLab, this script confirms the MR is actually merged before reporting it;
 # an auto-merge-queued or unconfirmed request leaves the poll armed and records
@@ -217,6 +240,10 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-merge-authority-lib.sh"
 # shellcheck source=bin/fm-afk-contract.sh
 . "$SCRIPT_DIR/fm-afk-contract.sh"
+# shellcheck source=bin/fm-pr-binding-lib.sh
+. "$SCRIPT_DIR/fm-pr-binding-lib.sh"
+# shellcheck source=bin/fm-merge-guard-lib.sh
+. "$SCRIPT_DIR/fm-merge-guard-lib.sh"
 
 if [ "$#" -lt 2 ]; then
   echo "error: invalid PR merge request" >&2
@@ -262,6 +289,7 @@ ATTENDED_OVERRIDE=false
 ALLOW_NO_PIPELINE=false
 ALLOW_RED=()
 ALLOW_MISSING=()
+ALLOW_CONTENT=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --attended-override)
@@ -300,6 +328,19 @@ while [ "$#" -gt 0 ]; do
       echo "error: --allow-no-pipeline takes no value" >&2
       exit 2
       ;;
+    --allow-content)
+      fm_merge_guard_name_valid "${2:-}" \
+        || { echo "error: --allow-content requires one guard name: $FM_MERGE_GUARD_NAMES" >&2; exit 2; }
+      case " ${ALLOW_CONTENT[*]-} " in
+        *" $2 "*) echo "error: --allow-content $2 may be specified only once" >&2; exit 2 ;;
+      esac
+      ALLOW_CONTENT+=("$2")
+      shift 2
+      ;;
+    --allow-content=*)
+      echo "error: --allow-content requires a separate guard name argument" >&2
+      exit 2
+      ;;
     --) shift; break ;;
     *) break ;;
   esac
@@ -322,6 +363,10 @@ if [ "${#ALLOW_RED[@]}" -gt 0 ]; then
       exit 2
       ;;
   esac
+fi
+if [ "${#ALLOW_CONTENT[@]}" -gt 0 ] && [ "$PROVIDER" = gitlab ]; then
+  echo "error: --allow-content does not apply to GitLab, where the content guard does not run" >&2
+  exit 2
 fi
 # --allow-no-pipeline waives only GitLab's own reading of a merge request that
 # has no head pipeline at all. GitHub's per-check waivers and Forgejo's
@@ -565,13 +610,6 @@ if [ "$PROVIDER" = forgejo ]; then
   }
 fi
 
-# The recorded head is read before bin/fm-pr-check.sh rewrites the metadata,
-# because that script re-records pr= and drops a pr_head= it cannot resolve.
-RECORDED_HEAD=
-if [ "$PROVIDER" = gitlab ] || [ "$PROVIDER" = forgejo ]; then
-  RECORDED_HEAD=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2- || true)
-fi
-
 # Pre-merge conditions for a GitLab merge request, read from one live view of
 # the merge request. Sets FM_PR_MERGE_HEAD to the verified head on success and
 # returns non-zero after reporting every condition that failed.
@@ -642,13 +680,6 @@ FIELDS
     echo "error: could not read the GitLab merge request head commit before merging" >&2
     return 1
   fi
-  # A rebase moves the head and leaves the recorded value behind, so the
-  # disagreement is reported and the live head is what gets verified and merged.
-  if [ -n "$RECORDED_HEAD" ] && [ "$RECORDED_HEAD" != "$live_head" ]; then
-    printf 'notice: recorded head %s disagrees with the live head %s; verifying the live head\n' \
-      "$RECORDED_HEAD" "$live_head" >&2
-  fi
-
   [ "$state" = opened ] \
     || refusals="$refusals  - state is \"${state:-unreadable}\", not open
 "
@@ -701,10 +732,11 @@ FIELDS
 # Forgejo has no merge-queue or scheduled-merge concept to detect, so unlike
 # GitHub and GitLab this never sets an async/queued signal: every accepted
 # Forgejo merge here is immediate. Shares FM_PR_MERGE_HEAD, declared above.
+FORGEJO_BASE=
 forgejo_verify_mergeable() {
   local pr_json status_json fields line
   local total=0 named=0 refusals=''
-  local state='' mergeable='' draft='' live_head='' ci_state='' page_state='' page_count='' page=1
+  local state='' mergeable='' draft='' live_head='' base='' ci_state='' page_state='' page_count='' page=1
 
   if ! pr_json=$(tea api --login "$FORGEJO_LOGIN" --repo "$PR_OWNER/$PR_REPO" \
       "/repos/{owner}/{repo}/pulls/$PR_NUMBER" 2>/dev/null) || [ -z "$pr_json" ]; then
@@ -716,7 +748,8 @@ forgejo_verify_mergeable() {
         "state=" + ((.state // "") | tostring),
         "mergeable=" + (.mergeable | tostring),
         "draft=" + (.draft | tostring),
-        "head=" + ((.head.sha // "") | tostring)
+        "head=" + ((.head.sha // "") | tostring),
+        "base=" + ((.base.ref // "") | tostring)
       else
         error("pull request payload is not an object")
       end' 2>/dev/null); then
@@ -730,13 +763,14 @@ forgejo_verify_mergeable() {
       mergeable=*) mergeable=${line#mergeable=} ;;
       draft=*) draft=${line#draft=} ;;
       head=*) live_head=${line#head=} ;;
+      base=*) base=${line#base=} ;;
       *) continue ;;
     esac
     named=$((named + 1))
   done <<FIELDS
 $fields
 FIELDS
-  if [ "$named" -ne 4 ] || [ "$total" -ne 4 ]; then
+  if [ "$named" -ne 5 ] || [ "$total" -ne 5 ] || [ -z "$base" ]; then
     echo "error: could not read the Forgejo pull request state before merging" >&2
     return 1
   fi
@@ -745,11 +779,6 @@ FIELDS
     echo "error: could not read the Forgejo pull request head commit before merging" >&2
     return 1
   fi
-  if [ -n "$RECORDED_HEAD" ] && [ "$RECORDED_HEAD" != "$live_head" ]; then
-    printf 'notice: recorded head %s disagrees with the live head %s; verifying the live head\n' \
-      "$RECORDED_HEAD" "$live_head" >&2
-  fi
-
   # An absent combined status (no statuses on any page, as a repo with no
   # configured Actions reports) is a real "none" here rather than nothing to
   # check, the same reading GitLab's null head_pipeline gets above. The
@@ -818,6 +847,7 @@ FIELDS
   printf 'verified: %s is open and mergeable, with a successful combined status at head %s\n' \
     "$URL" "$live_head" >&2
   FM_PR_MERGE_HEAD=$live_head
+  FORGEJO_BASE=$base
 }
 
 # The caller's own extra arguments may only name a merge method, in the same
@@ -1458,6 +1488,10 @@ require_current_away_authority() {
     echo "error: --allow-no-pipeline is attended-only; while the away-posture record exists a GitLab merge requires a successful head pipeline" >&2
     return 2
   fi
+  if [ "$FM_PR_AWAY_POSTURE" = true ] && [ "${#ALLOW_CONTENT[@]}" -gt 0 ]; then
+    echo "error: --allow-content is attended-only; while the away-posture record exists the content guard is absolute" >&2
+    return 2
+  fi
 }
 
 persist_accepted_merge_authority() {
@@ -1497,6 +1531,91 @@ refuse_github_queue_while_away() {
   [ "$FM_PR_GITHUB_QUEUE_STATUS" = none ] && return 0
   echo "error: GitHub merge refused while away because the base branch's merge-queue state does not prove an immediate merge; nothing was handed to the forge" >&2
   return 2
+}
+
+# The binding in the task metadata must be exactly the one bin/fm-pr-check.sh
+# recorded (bin/fm-pr-binding-lib.sh); a hand-edited binding is refused before
+# anything is recorded or read from the forge.
+require_intact_pr_binding() {
+  fm_pr_binding_meta_check "$STATE" "$ID" "$META" && return 0
+  printf 'error: refusing to merge %s: %s; record the pull request with bin/fm-pr-check.sh, present it and its diff stat to the captain, and merge only on fresh approval\n' \
+    "$URL" "$FM_PR_BINDING_ERROR" >&2
+  return 1
+}
+
+BOUND_HEAD=
+BOUND_TREE=
+read_merge_binding() {
+  if ! fm_pr_binding_read "$STATE" "$ID" || [ "$FM_PR_BINDING_PRESENT" -ne 1 ] \
+    || [ "$FM_PR_BINDING_URL" != "$URL" ]; then
+    echo "error: refusing to merge $URL: its PR binding could not be read back after recording" >&2
+    return 1
+  fi
+  BOUND_HEAD=$FM_PR_BINDING_HEAD
+  BOUND_TREE=$FM_PR_BINDING_TREE
+}
+
+# The live head must be the recorded head the captain was shown.
+require_bound_head() {
+  if [ -z "$BOUND_HEAD" ]; then
+    printf 'error: refusing to merge %s: no head was recorded for it, so there is no approved content to bind the merge to; record it with bin/fm-pr-check.sh where its head is readable, present it and its diff stat to the captain, and merge only on fresh approval\n' \
+      "$URL" >&2
+    return 1
+  fi
+  [ "$BOUND_HEAD" = "$FM_PR_MERGE_HEAD" ] && return 0
+  printf 'error: refusing to merge %s: its head is %s, but the head recorded for approval is %s; record it again with bin/fm-pr-check.sh, present the changed pull request and its diff stat (bin/fm-review-diff.sh %s --stat) to the captain, and merge only on fresh approval\n' \
+    "$URL" "$FM_PR_MERGE_HEAD" "$BOUND_HEAD" "$ID" >&2
+  return 1
+}
+
+# The content guard (bin/fm-merge-guard-lib.sh) on the verified head. Prints
+# and records the diff stat, then refuses on every guard that fired and was not
+# waived by name.
+run_content_guard() {  # <base> <forge-head-ref>
+  local base=$1 forge_ref=$2
+  local wt branch hint hits='' line name waived='' unwaived='' verdict=pass
+  wt=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
+  branch=$(grep '^branch=' "$META" | tail -1 | cut -d= -f2- || true)
+  [ -n "$branch" ] || branch="fm/$ID"
+  if fm_merge_guard_fetch "$wt" "$base" "$FM_PR_MERGE_HEAD" \
+      "$forge_ref" "refs/fm-merge-guard/$ID/head"; then
+    hint=$(fm_merge_guard_branch_origin "$wt" "$branch")
+    fm_merge_guard_analyze "$wt" "$base" "$FM_PR_MERGE_HEAD" "$hint" || true
+  fi
+  if [ -n "$FM_MERGE_GUARD_ERROR" ]; then
+    hits="unavailable: $FM_MERGE_GUARD_ERROR"
+  else
+    hits=$FM_MERGE_GUARD_HITS
+    if [ -n "$BOUND_TREE" ] && [ "$BOUND_TREE" != "$FM_MERGE_GUARD_TREE" ]; then
+      printf 'error: refusing to merge %s: head %s has tree %s, but the tree recorded for approval is %s\n' \
+        "$URL" "$FM_PR_MERGE_HEAD" "$FM_MERGE_GUARD_TREE" "$BOUND_TREE" >&2
+      return 1
+    fi
+    printf 'content: %s against origin/%s at %s for head %s\n' \
+      "$FM_MERGE_GUARD_SHORTSTAT" "$base" "$FM_MERGE_GUARD_BASE_SHA" "$FM_PR_MERGE_HEAD" >&2
+    [ -z "$FM_MERGE_GUARD_STAT" ] || printf '%s\n' "$FM_MERGE_GUARD_STAT" | sed 's/^/content: /' >&2
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name=${line%%:*}
+    case " ${ALLOW_CONTENT[*]-} " in
+      *" $name "*) waived="${waived:+$waived }$name" ;;
+      *) unwaived="${unwaived:+$unwaived
+}$line" ;;
+    esac
+  done <<HITS
+$hits
+HITS
+  [ -z "$unwaived" ] || verdict=refused
+  fm_merge_guard_record "$STATE" "$ID" "$URL" "$FM_PR_MERGE_HEAD" "$base" \
+    "$verdict" "$hits" "$waived" \
+    || echo "warning: the content guard record for $URL could not be written" >&2
+  [ -z "$waived" ] || printf 'content: waived by the captain'"'"'s named override: %s\n' "$waived" >&2
+  [ -n "$unwaived" ] || return 0
+  printf 'error: refusing to merge %s: the content guard found\n' "$URL" >&2
+  printf '%s\n' "$unwaived" | sed 's/^/  - /' >&2
+  echo "error: present this diff stat and these findings to the captain; only the captain's explicit, attended instruction naming a guard permits --allow-content <guard>" >&2
+  return 1
 }
 
 require_recorded_pr_identity() {
@@ -1669,8 +1788,10 @@ forgejo_confirm_merged() {
 away_status=0
 require_current_away_authority || away_status=$?
 [ "$away_status" -eq 0 ] || exit "$away_status"
+require_intact_pr_binding || exit 1
 require_recorded_pr_identity || exit 1
 record_pr_metadata || exit 1
+read_merge_binding || exit 1
 require_released_captain_hold || exit 1
 
 # Accepted confused-agent-grade limitation, as in bin/fm-lease-lib.sh, not an
@@ -1714,6 +1835,8 @@ case "$PROVIDER" in
       fi
       exit 1
     fi
+    require_bound_head || exit 1
+    run_content_guard "$FM_PR_GITHUB_BASE" "refs/pull/$PR_NUMBER/head" || exit 1
     # The away record is locked first, so this last presence and authority read
     # and the forge command below share one live-owner critical section.
     hold_away_record_for_merge || exit 1
@@ -1801,6 +1924,10 @@ case "$PROVIDER" in
     forgejo_method=$(caller_merge_method "$@")
     [ -n "$forgejo_method" ] || forgejo_method=$(forgejo_default_merge_style) || exit 1
     forgejo_verify_mergeable || exit 1
+    require_bound_head || exit 1
+    # Forgejo serves a pull request's head at refs/pull/<n>/head, the same ref
+    # bin/fm-review-diff.sh and bin/fm-teardown.sh fetch.
+    run_content_guard "$FORGEJO_BASE" "refs/pull/$PR_NUMBER/head" || exit 1
     # The away record is locked first, so this last presence and authority
     # read and the forge command below share one live-owner critical section.
     hold_away_record_for_merge || exit 1

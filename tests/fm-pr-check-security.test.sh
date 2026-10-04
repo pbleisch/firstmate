@@ -130,7 +130,15 @@ make_case() {
   mkdir -p "$dir/home/state" "$dir/home/data" "$dir/home/config" "$dir/wt" "$fakebin" "$fake_root/bin"
   git -C "$dir/wt" init -q
   git -C "$dir/wt" commit -q --allow-empty -m init
-  git -C "$dir/wt" update-ref refs/remotes/origin/main "$(git -C "$dir/wt" rev-parse HEAD)"
+  # A real origin and a real pull-request head on it, so bin/fm-pr-merge.sh's
+  # content guard can fetch origin/main and the head the mock forge reports.
+  git init -q --bare "$dir/origin.git"
+  git -C "$dir/wt" remote add origin "$dir/origin.git"
+  git -C "$dir/wt" push -q origin HEAD:refs/heads/main
+  git -C "$dir/wt" fetch -q origin
+  git -C "$dir/wt" commit-tree "$(git -C "$dir/wt" rev-parse 'HEAD^{tree}')" -p HEAD -m 'pull request head' \
+    > "$dir/real-head"
+  git -C "$dir/wt" push -q origin "$(cat "$dir/real-head"):refs/heads/pr-head"
   cat > "$fake_root/bin/fm-guard.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'guard\n' >> "$FM_TEST_GUARD_LOG"
@@ -152,7 +160,7 @@ case "${1:-} ${2:-}" in
   "pr view")
     case " $* " in
       *statusCheckRollup*)
-        printf '%s\n' "{\"state\":\"OPEN\",\"isDraft\":false,\"mergeable\":\"MERGEABLE\",\"mergeStateStatus\":\"CLEAN\",\"headRefOid\":\"${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}\",\"baseRefName\":\"main\",\"statusCheckRollup\":[{\"__typename\":\"CheckRun\",\"name\":\"ci\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\"}]}"
+        printf '%s\n' "{\"state\":\"OPEN\",\"isDraft\":false,\"mergeable\":\"MERGEABLE\",\"mergeStateStatus\":\"CLEAN\",\"headRefOid\":\"${FM_TEST_GH_HEAD:-$(cat "$(dirname "$0")/../real-head")}\",\"baseRefName\":\"main\",\"statusCheckRollup\":[{\"__typename\":\"CheckRun\",\"name\":\"ci\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\"}]}"
         exit 0
         ;;
       *" --json isDraft "*)
@@ -161,7 +169,7 @@ case "${1:-} ${2:-}" in
         exit 0
         ;;
       *headRefOid,reviewDecision*)
-        printf '%s\n' "{\"headRefOid\":\"${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}\",\"reviewDecision\":\"APPROVED\"}"
+        printf '%s\n' "{\"headRefOid\":\"${FM_TEST_GH_HEAD:-$(cat "$(dirname "$0")/../real-head")}\",\"reviewDecision\":\"APPROVED\"}"
         exit 0
         ;;
     esac
@@ -190,12 +198,12 @@ case " $* " in
     printf '%s\n' '{"name":"main","protected":false}'
     ;;
   *" api repos/"*"/pulls/"*)
-    printf '%s\n' "{\"state\":\"open\",\"user\":{\"login\":\"author\"},\"head\":{\"sha\":\"${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}\"},\"draft\":false,\"mergeable\":true,\"merged_at\":null}"
+    printf '%s\n' "{\"state\":\"open\",\"user\":{\"login\":\"author\"},\"head\":{\"sha\":\"${FM_TEST_GH_HEAD:-$(cat "$(dirname "$0")/../real-head")}\"},\"draft\":false,\"mergeable\":true,\"merged_at\":null}"
     ;;
   *" api repos/"*)
     printf '%s\n' '{"permissions":{"push":false}}'
     ;;
-  *" headRefOid "*) printf '%s\n' "${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}" ;;
+  *" headRefOid "*) printf '%s\n' "${FM_TEST_GH_HEAD:-$(cat "$(dirname "$0")/../real-head")}" ;;
   *" state "*)
     [ "${FM_TEST_GH_FAIL:-0}" = 0 ] || exit 1
     [ -z "${FM_TEST_GH_STATE_STARTED:-}" ] || : > "$FM_TEST_GH_STATE_STARTED"
@@ -989,7 +997,7 @@ test_valid_recording_and_merge_derivation() {
   local dir expected sidecar count rc
   dir=$(make_case valid-recording)
   write_task_meta "$dir"
-  expected=0123456789abcdef0123456789abcdef01234567
+  expected=$(cat "$dir/real-head")
   FM_TEST_GH_HEAD=$expected run_check_entry "$dir" task-a https://github.com/my-org/repo_name.with-dots/pull/37 \
     > "$dir/stdout" 2> "$dir/stderr" || fail "valid direct check failed"
 
@@ -1239,7 +1247,7 @@ test_github_enterprise_hosts() {
   : > "$dir/gh.log"
   run_merge_entry "$dir" task-a "$url" > "$dir/stdout" 2> "$dir/stderr" \
     || fail "merge entrypoint refused a configured GitHub Enterprise URL: $(cat "$dir/stderr")"
-  grep -qxF 'pr merge 7 --repo Org/repo --match-head-commit 0123456789abcdef0123456789abcdef01234567 --squash' \
+  grep -qxF "pr merge 7 --repo Org/repo --match-head-commit $(cat "$dir/real-head") --squash" \
     "$dir/gh.log" || fail "merge wrapper did not derive owner and repository for a GitHub Enterprise pull request"
   grep -qxF 'host=leadsonline.ghe.com' "$dir/gh.log" \
     || fail "no merge read addressed the GitHub Enterprise host"
@@ -3535,7 +3543,7 @@ test_authority_persistence_refuses_rebound_metadata() {
     || fail "rebind: could not arm the original poll"
   cat > "$dir/rebind.sh" <<SH
 #!/usr/bin/env bash
-"$PR_CHECK" task-a "$url_b" >/dev/null
+"$PR_CHECK" task-a "$url_b" --rebind 'concurrent rebind under test' >/dev/null
 SH
   chmod +x "$dir/rebind.sh"
   set +e
@@ -4029,7 +4037,7 @@ test_device_rerecord_serializes_direct_rearm() {
   cp "$state/task-a.check.sh" "$dir/published.check.sh"
   start_poll_publish_holder "$dir" "$state" task-a
   FM_ROOT_OVERRIDE="$dir/root" FM_HOME="$dir/home" FM_TEST_GUARD_LOG="$dir/guard.log" \
-    PATH="$dir/fakebin:$BASE_PATH" "$PR_CHECK" task-a "$url_b" > "$dir/rearm.out" 2> "$dir/rearm.err" &
+    PATH="$dir/fakebin:$BASE_PATH" "$PR_CHECK" task-a "$url_b" --rebind 're-arm under test' > "$dir/rearm.out" 2> "$dir/rearm.err" &
   rearm_pid=$!
   for i in $(seq 1 100); do
     if fm_pr_metadata_identity_parse "$state/task-a.meta" && [ "$FM_PR_META_URL" = "$url_b" ]; then
