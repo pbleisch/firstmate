@@ -122,8 +122,8 @@
 # A GitHub or Gitea merge also passes the content guard bin/fm-merge-guard-lib.sh owns:
 # it prints the diff stat against a freshly fetched origin/<base>, records it in
 # state/<task-id>.merge-guard, and refuses on any guard that lib names - a
-# stale tree, deleted migrations or tests, mass deletion, a young unreviewed
-# pull request on a base that requires no check, or a guard that could not run.
+# stale tree (with the earlier base commits whose work it would revert),
+# deleted migrations or tests, mass deletion, or a guard that could not run.
 # An attended --allow-content <guard> waives exactly that named guard, may be
 # repeated once per guard, is refused while the away-posture record exists like
 # --allow-red, and is passed only when the captain names the guard. It never
@@ -682,36 +682,14 @@ github_checks_not_green() {
   ' 2>/dev/null || return 1
 }
 
-# How many status checks the base branch requires, from its classic branch
-# protection and its active ruleset rules. It feeds only the content guard's
-# young-unreviewed check, so any read that fails counts as none required, which
-# leaves that guard able to fire rather than silently quiet.
-github_required_check_count() {  # <base>
-  local base=$1 branch_path classic=0 rules=0
-  branch_path=$(github_urlencode_path_segment "$base")
-  classic=$(gh api "repos/$PR_OWNER/$PR_REPO/branches/$branch_path" 2>/dev/null | jq -r '
-      if type == "object" and .protected == true
-        and (.protection.required_status_checks | type) == "object" then
-        [((.protection.required_status_checks.contexts // [])[]),
-         ((.protection.required_status_checks.checks // [])[] | .context)] | unique | length
-      else 0 end' 2>/dev/null) || classic=0
-  rules=$(gh api --paginate "repos/$PR_OWNER/$PR_REPO/rules/branches/$branch_path" 2>/dev/null | jq -rs '
-      [ .[] | if type == "array" then .[] else empty end
-        | select(type == "object" and .type == "required_status_checks")
-        | (.parameters.required_status_checks // [])[] | .context ] | unique | length' 2>/dev/null) || rules=0
-  case "$classic" in ''|*[!0-9]*) classic=0 ;; esac
-  case "$rules" in ''|*[!0-9]*) rules=0 ;; esac
-  printf '%s' "$((classic + rules))"
-}
-
 # Pre-merge conditions for a GitHub pull request, read from one live view.
 # Sets FM_PR_MERGE_HEAD to the verified head on success.
 github_verify_mergeable() {
   local json fields line red name covered
   local total=0 named=0 refusals=''
-  local state='' draft='' mergeable='' merge_state='' live_head='' base='' created='' reviews=''
+  local state='' draft='' mergeable='' merge_state='' live_head='' base=''
 
-  if ! json=$(gh pr view "$URL" --json state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefName,createdAt,reviews,statusCheckRollup 2>/dev/null) \
+  if ! json=$(gh pr view "$URL" --json state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefName,statusCheckRollup 2>/dev/null) \
     || [ -z "$json" ]; then
     echo "error: could not read the GitHub pull request state before merging" >&2
     return 1
@@ -722,9 +700,7 @@ github_verify_mergeable() {
         "mergeable=" + ((.mergeable // "") | tostring),
         "merge_state=" + ((.mergeStateStatus // "") | tostring),
         "head=" + ((.headRefOid // "") | tostring),
-        "base=" + ((.baseRefName // "") | tostring),
-        "created=" + ((.createdAt // "") | (try fromdateiso8601 catch "") | tostring),
-        "reviews=" + (if (.reviews | type) == "array" then (.reviews | length | tostring) else "" end)
+        "base=" + ((.baseRefName // "") | tostring)
       else
         error("pull request payload is not an object")
       end' 2>/dev/null); then
@@ -739,15 +715,13 @@ github_verify_mergeable() {
       merge_state=*) merge_state=${line#merge_state=} ;;
       head=*) live_head=${line#head=} ;;
       base=*) base=${line#base=} ;;
-      created=*) created=${line#created=} ;;
-      reviews=*) reviews=${line#reviews=} ;;
       *) continue ;;
     esac
     named=$((named + 1))
   done <<FIELDS
 $fields
 FIELDS
-  if [ "$named" -ne 7 ] || [ "$total" -ne 7 ] || [ -z "$base" ]; then
+  if [ "$named" -ne 5 ] || [ "$total" -ne 5 ] || [ -z "$base" ]; then
     echo "error: could not read the GitHub pull request state before merging" >&2
     return 1
   fi
@@ -807,9 +781,6 @@ EOF
     "$URL" "$live_head" >&2
   FM_PR_MERGE_HEAD=$live_head
   FM_PR_GITHUB_BASE=$base
-  FM_PR_GITHUB_CREATED_EPOCH=$created
-  FM_PR_GITHUB_REVIEWS=$reviews
-  FM_PR_GITHUB_REQUIRED_COUNT=$(github_required_check_count "$base")
 }
 
 # Read one live GitHub pull request view after gh returns. The selected
@@ -822,9 +793,6 @@ FM_PR_GITHUB_MERGED=
 FM_PR_GITHUB_QUEUED=
 FM_PR_GITHUB_BASE=
 FM_PR_GITHUB_QUEUE_OBSERVED=false
-FM_PR_GITHUB_CREATED_EPOCH=
-FM_PR_GITHUB_REVIEWS=
-FM_PR_GITHUB_REQUIRED_COUNT=
 github_read_outcome_with_gh() {
   local fields line
   local total=0 named=0
@@ -1165,9 +1133,9 @@ require_bound_head() {
 # The content guard (bin/fm-merge-guard-lib.sh) on the verified head. Prints
 # and records the diff stat, then refuses on every guard that fired and was not
 # waived by name.
-run_content_guard() {  # <base> <forge-head-ref> <created-epoch> <review-count> <required-check-count>
-  local base=$1 forge_ref=$2 created=$3 reviews=$4 required=$5
-  local wt branch hint hits='' young line name waived='' unwaived='' verdict=pass
+run_content_guard() {  # <base> <forge-head-ref>
+  local base=$1 forge_ref=$2
+  local wt branch hint hits='' line name waived='' unwaived='' verdict=pass
   wt=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
   branch=$(grep '^branch=' "$META" | tail -1 | cut -d= -f2- || true)
   [ -n "$branch" ] || branch="fm/$ID"
@@ -1188,10 +1156,8 @@ run_content_guard() {  # <base> <forge-head-ref> <created-epoch> <review-count> 
     printf 'content: %s against origin/%s at %s for head %s\n' \
       "$FM_MERGE_GUARD_SHORTSTAT" "$base" "$FM_MERGE_GUARD_BASE_SHA" "$FM_PR_MERGE_HEAD" >&2
     [ -z "$FM_MERGE_GUARD_STAT" ] || printf '%s\n' "$FM_MERGE_GUARD_STAT" | sed 's/^/content: /' >&2
+    [ -z "$FM_MERGE_GUARD_REVERTED" ] || printf '%s\n' "$FM_MERGE_GUARD_REVERTED" | sed 's/^/content: reverts work from /' >&2
   fi
-  young=$(fm_merge_guard_young_unreviewed "$created" "${reviews:-0}" "${required:-0}" "$(date +%s)")
-  [ -z "$young" ] || hits="${hits:+$hits
-}young-unreviewed: $young"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     name=${line%%:*}
@@ -1382,7 +1348,7 @@ gitea_api() {  # <endpoint> [<raw JSON body to POST>]
 GITEA_MERGE_STYLE=
 gitea_verify_mergeable() {
   local fields line total=0 named=0 refusals=''
-  local url='' state='' merged='' draft='' mergeable='' live_head='' base='' created=''
+  local url='' state='' merged='' draft='' mergeable='' live_head='' base=''
   local statuses status_sha='' red='' context name waived
 
   if ! gitea_api "/repos/$PR_OWNER/$PR_REPO/pulls/$PR_NUMBER" || [ "$GITEA_HTTP_STATUS" != 200 ]; then
@@ -1397,14 +1363,7 @@ gitea_verify_mergeable() {
         "draft=" + (.draft | tostring),
         "mergeable=" + (.mergeable | tostring),
         "head=" + ((.head.sha // "") | tostring),
-        "base=" + ((.base.ref // "") | tostring),
-        "created=" + ((.created_at // "") | tostring
-          | (try (if test("Z$") then sub("\\.[0-9]+"; "") | fromdateiso8601
-                  else capture("^(?<t>[^.+-]*-[^.+-]*-[^.+-]*)(\\.[0-9]+)?(?<s>[+-])(?<h>[0-9]{2}):(?<m>[0-9]{2})$")
-                    | ((.t + "Z") | fromdateiso8601)
-                      - ((if .s == "+" then 1 else -1 end) * ((.h | tonumber) * 3600 + (.m | tonumber) * 60))
-                  end) catch "")
-          | tostring)
+        "base=" + ((.base.ref // "") | tostring)
       else
         error("pull request payload is not an object")
       end' 2>/dev/null); then
@@ -1421,14 +1380,13 @@ gitea_verify_mergeable() {
       mergeable=*) mergeable=${line#mergeable=} ;;
       head=*) live_head=${line#head=} ;;
       base=*) base=${line#base=} ;;
-      created=*) created=${line#created=} ;;
       *) continue ;;
     esac
     named=$((named + 1))
   done <<FIELDS
 $fields
 FIELDS
-  if [ "$named" -ne 8 ] || [ "$total" -ne 8 ] || [ -z "$base" ]; then
+  if [ "$named" -ne 7 ] || [ "$total" -ne 7 ] || [ -z "$base" ]; then
     echo "error: could not read the Gitea pull request state before merging" >&2
     return 1
   fi
@@ -1527,33 +1485,10 @@ STATUSES
     "$URL" "$live_head" >&2
   FM_PR_MERGE_HEAD=$live_head
   GITEA_BASE=$base
-  GITEA_CREATED_EPOCH=$created
 }
 
-# The review count and required status-check count the content guard's
-# young-unreviewed check reads. A failed read counts as none, which leaves that
-# guard able to fire rather than silently quiet.
+# The base branch gitea_verify_mergeable read, for the content guard.
 GITEA_BASE=
-GITEA_CREATED_EPOCH=
-GITEA_REVIEWS=0
-GITEA_REQUIRED=0
-gitea_read_review_and_required_counts() {
-  local value branch_path
-  GITEA_REVIEWS=0
-  GITEA_REQUIRED=0
-  if gitea_api "/repos/$PR_OWNER/$PR_REPO/pulls/$PR_NUMBER/reviews" && [ "$GITEA_HTTP_STATUS" = 200 ]; then
-    value=$(printf '%s' "$GITEA_BODY" | jq -r 'if type == "array" then length else empty end' 2>/dev/null) || value=
-    case "$value" in ''|*[!0-9]*) ;; *) GITEA_REVIEWS=$value ;; esac
-  fi
-  branch_path=$(github_urlencode_path_segment "$GITEA_BASE")
-  if gitea_api "/repos/$PR_OWNER/$PR_REPO/branch_protections/$branch_path" && [ "$GITEA_HTTP_STATUS" = 200 ]; then
-    value=$(printf '%s' "$GITEA_BODY" | jq -r '
-        if type == "object" and .enable_status_check == true then
-          ([(.status_check_contexts // [])[]] | length) as $n | if $n > 0 then $n else 1 end
-        else 0 end' 2>/dev/null) || value=
-    case "$value" in ''|*[!0-9]*) ;; *) GITEA_REQUIRED=$value ;; esac
-  fi
-}
 
 # Read the pull request back after the forge accepted the merge. Returns 0 when
 # it reports merged, 1 when it reads back unmerged, and 2 when it is unreadable.
@@ -1594,8 +1529,7 @@ case "$PROVIDER" in
     FM_PR_GITHUB_CALLER_METHOD=$(caller_merge_method "$@")
     github_verify_mergeable || exit 1
     require_bound_head || exit 1
-    run_content_guard "$FM_PR_GITHUB_BASE" "refs/pull/$PR_NUMBER/head" "$FM_PR_GITHUB_CREATED_EPOCH" \
-      "$FM_PR_GITHUB_REVIEWS" "$FM_PR_GITHUB_REQUIRED_COUNT" || exit 1
+    run_content_guard "$FM_PR_GITHUB_BASE" "refs/pull/$PR_NUMBER/head" || exit 1
     # The away record is locked first, so this last presence and authority read
     # and the forge command below share one live-owner critical section.
     hold_away_record_for_merge || exit 1
@@ -1681,9 +1615,7 @@ case "$PROVIDER" in
   gitea)
     gitea_verify_mergeable || exit 1
     require_bound_head || exit 1
-    gitea_read_review_and_required_counts
-    run_content_guard "$GITEA_BASE" "refs/pull/$PR_NUMBER/head" "$GITEA_CREATED_EPOCH" \
-      "$GITEA_REVIEWS" "$GITEA_REQUIRED" || exit 1
+    run_content_guard "$GITEA_BASE" "refs/pull/$PR_NUMBER/head" || exit 1
     # head_commit_id binds the merge to the head this run verified, so Gitea
     # refuses a merge whose head moved after that read. The body never asks
     # Gitea to wait for checks, force past branch protection, or delete the

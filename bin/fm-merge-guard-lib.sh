@@ -21,25 +21,23 @@
 #                       oldest of the merge base, the task branch's fork point
 #                       read from its reflog, and 50 first-parent commits back,
 #                       because a stale tree grafted onto the current base makes
-#                       the merge base the base itself.
+#                       the merge base the base itself. FM_MERGE_GUARD_REVERTED
+#                       then lists the base commits whose changes to those files
+#                       merging would undo (_fm_merge_guard_reverted).
 #   deleted-migrations  the diff deletes a file under a migrations directory.
 #   deleted-tests       the diff deletes a test file.
 #   mass-deletion       the diff deletes at least 50 lines and more than twice
 #                       the lines the pull request's own non-merge commits
 #                       delete, excluding commits equivalent to ones already on
 #                       the base, so the extra deletions came from somewhere else.
-#   young-unreviewed    the pull request is younger than 10 minutes, has no
-#                       review, and its base branch requires no check
-#                       (fm_merge_guard_young_unreviewed; an unreadable age
-#                       counts as young).
 #   unavailable         the guard could not run, so nothing above was checked.
 # fm_merge_guard_record writes state/<task-id>.merge-guard: what was checked,
-# the verdict, and the full diff stat.
+# the verdict, the reverted commits, and the full diff stat.
 #
-# Sourced by bin/fm-pr-merge.sh and by tests. No side effects on source.
+# Sourced by bin/fm-pr-merge.sh, by bin/fm-review-diff.sh to present the same
+# findings before a merge is asked for, and by tests. No side effects on source.
 
-FM_MERGE_GUARD_NAMES="stale-tree deleted-migrations deleted-tests mass-deletion young-unreviewed unavailable"
-FM_MERGE_GUARD_MIN_AGE=600
+FM_MERGE_GUARD_NAMES="stale-tree deleted-migrations deleted-tests mass-deletion unavailable"
 FM_MERGE_GUARD_LOOKBACK=50
 FM_MERGE_GUARD_MASS_FLOOR=50
 
@@ -50,6 +48,7 @@ FM_MERGE_GUARD_TREE=
 FM_MERGE_GUARD_SHORTSTAT=
 FM_MERGE_GUARD_STAT=
 FM_MERGE_GUARD_HITS=
+FM_MERGE_GUARD_REVERTED=
 
 fm_merge_guard_name_valid() {  # <name>
   case " $FM_MERGE_GUARD_NAMES " in
@@ -121,6 +120,50 @@ _fm_merge_guard_add_hit() {  # <name> <detail>
 }$1: $2"
 }
 
+# The base commits whose work on the stale <paths> merging <head> would undo.
+# Walking <start>..<base-sha> newest first, a path's walk stops at the newest
+# commit whose result for it is the head's content (or absence); every
+# non-merge commit that changed the path after that point is undone. Prints one
+# line per commit, newest first: "<short> <author-date> <subject> (<paths>)".
+_fm_merge_guard_reverted() {  # <wt> <start> <base-sha> <head> <paths>
+  local wt=$1 start=$2 base_sha=$3 head=$4 paths=$5 path sha files line
+  local -a args=()
+  while IFS= read -r path; do
+    [ -z "$path" ] || args+=("$path")
+  done <<PATHS
+$paths
+PATHS
+  [ "${#args[@]}" -gt 0 ] || return 0
+  {
+    _fm_merge_guard_git "$wt" ls-tree -r --full-tree "$head" 2>/dev/null \
+      | awk -F'\t' '{ split($1, m, " "); print "H\t" $2 "\t" m[3] }'
+    _fm_merge_guard_git "$wt" --literal-pathspecs log -m --no-renames --raw --no-abbrev \
+      --format='C%x09%H%x09%P' "$start..$base_sha" -- "${args[@]}" 2>/dev/null
+  } | awk -F'\t' '
+    $1 == "H" { h[$2] = $3; next }
+    $1 == "C" {
+      c = $2
+      merge = (split($3, parents, " ") > 1)
+      if (!(c in seen)) { seen[c] = 1; order[++n] = c }
+      next
+    }
+    /^:/ {
+      split($1, m, " ")
+      p = $2
+      if (p in done) next
+      blob = (m[4] ~ /^0+$/) ? "-" : m[4]
+      if (blob == ((p in h) ? h[p] : "-")) { done[p] = 1; next }
+      if (merge || ((c SUBSEP p) in got)) next
+      got[c SUBSEP p] = 1
+      files[c] = files[c] (files[c] == "" ? "" : ", ") p
+    }
+    END { for (i = 1; i <= n; i++) if (files[order[i]] != "") print order[i] "\t" files[order[i]] }
+  ' | while IFS=$'\t' read -r sha files; do
+    line=$(_fm_merge_guard_git "$wt" show -s --format='%h %as %s' "$sha" -- 2>/dev/null) || line=$sha
+    printf '%s (%s)\n' "$line" "$files"
+  done
+}
+
 # Analyse <head> against origin/<base>. Returns 1 with FM_MERGE_GUARD_ERROR set
 # when the analysis itself cannot run; hits are reported in FM_MERGE_GUARD_HITS.
 fm_merge_guard_analyze() {  # <wt> <base> <head> [<fork-point-hint>]
@@ -134,6 +177,7 @@ fm_merge_guard_analyze() {  # <wt> <base> <head> [<fork-point-hint>]
   FM_MERGE_GUARD_SHORTSTAT=
   FM_MERGE_GUARD_STAT=
   FM_MERGE_GUARD_HITS=
+  FM_MERGE_GUARD_REVERTED=
   if ! base_sha=$(_fm_merge_guard_git "$wt" rev-parse --verify --quiet "refs/remotes/origin/$base^{commit}" 2>/dev/null) \
     || ! tree=$(_fm_merge_guard_git "$wt" rev-parse --verify --quiet "$head^{tree}" 2>/dev/null); then
     FM_MERGE_GUARD_ERROR="origin/$base or the head could not be read after the fetch"
@@ -205,7 +249,10 @@ fm_merge_guard_analyze() {  # <wt> <base> <head> [<fork-point-hint>]
           }
         }')
     if [ -n "$stale" ]; then
-      _fm_merge_guard_add_hit stale-tree "$(_fm_merge_guard_list "$stale") would return to bytes origin/$base already replaced"
+      FM_MERGE_GUARD_REVERTED=$(_fm_merge_guard_reverted "$wt" "$start" "$base_sha" "$head" "$stale")
+      _fm_merge_guard_add_hit stale-tree "$(_fm_merge_guard_list "$stale") would return to bytes origin/$base already replaced$(
+        [ -z "$FM_MERGE_GUARD_REVERTED" ] || printf '%s' "$FM_MERGE_GUARD_REVERTED" \
+          | awk '{ n++; list = list (n > 1 ? ", " : "") $1 } END { printf ", reverting work from %d commit(s): %s", n, list }')"
     fi
   fi
 
@@ -230,23 +277,6 @@ fm_merge_guard_analyze() {  # <wt> <base> <head> [<fork-point-hint>]
   fi
 }
 
-# Prints the young-unreviewed detail when that guard fires, nothing otherwise.
-fm_merge_guard_young_unreviewed() {  # <created-epoch> <review-count> <required-check-count> <now>
-  local created=$1 reviews=$2 required=$3 now=$4 age
-  [ "$required" = 0 ] || return 0
-  [ "$reviews" = 0 ] || return 0
-  case "$created" in
-    ''|*[!0-9]*)
-      printf 'its age could not be read, it has no review, and its base branch requires no check'
-      return 0
-      ;;
-  esac
-  age=$((now - created))
-  [ "$age" -lt "$FM_MERGE_GUARD_MIN_AGE" ] || return 0
-  printf 'it is %ss old (minimum %ss), has no review, and its base branch requires no check' \
-    "$age" "$FM_MERGE_GUARD_MIN_AGE"
-}
-
 # Record what was checked. Fields are one line each; the stat follows "stat:".
 fm_merge_guard_record() {  # <state> <task-id> <url> <head> <base> <verdict> <hits> <waived>
   local state=$1 id=$2 url=$3 head=$4 base=$5 verdict=$6 hits=$7 waived=$8 record tmp line status=0
@@ -267,6 +297,11 @@ HITS
     for line in $waived; do
       printf 'waived=%s\n' "$line"
     done
+    while IFS= read -r line; do
+      [ -z "$line" ] || printf 'reverted=%s\n' "$line"
+    done <<REVERTED
+$FM_MERGE_GUARD_REVERTED
+REVERTED
     printf 'verdict=%s\nchecked_epoch=%s\nstat:\n%s\n' "$verdict" "$(date +%s)" "$FM_MERGE_GUARD_STAT"
   } > "$tmp" || status=1
   if [ "$status" -eq 0 ]; then

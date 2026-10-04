@@ -10,8 +10,19 @@
 # only a fallback when fetch fails (stale recorded SHAs must never win over a
 # reachable remote PR head). If neither PR head can be resolved, fall back to
 # the local branch with a warning. Without pr=, compare the local branch.
+#
+# --stat prints the stat summary and then the PR state block firstmate presents
+# with every merge ask: the compared head, the content guard's findings from
+# bin/fm-merge-guard-lib.sh against origin/<default> with the earlier base
+# commits whose work the head would revert (or "none"), and, for a recorded
+# GitHub or Gitea pull request, its state, draft flag, mergeability, forge head,
+# reported checks, and reviews read live from the forge. Each part that cannot
+# be read says so instead of being left out. The block is read-only: it never
+# records, waives, or merges anything, and bin/fm-pr-merge.sh still runs the
+# guard itself at merge time.
 # Usage: fm-review-diff.sh <task-id> [--stat]
-#   --stat prints only the stat summary; default prints stat summary plus full diff.
+#   --stat prints the stat summary and the PR state block; default prints the
+#   stat summary plus the full diff.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,6 +30,10 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 "$FM_ROOT/bin/fm-guard.sh" || true
+# shellcheck source=bin/fm-pr-lib.sh
+. "$FM_ROOT/bin/fm-pr-lib.sh"
+# shellcheck source=bin/fm-merge-guard-lib.sh
+. "$FM_ROOT/bin/fm-merge-guard-lib.sh"
 
 usage() {
   echo "usage: fm-review-diff.sh <task-id> [--stat]" >&2
@@ -157,8 +172,151 @@ if git -C "$WT" diff --quiet "$BASE...$COMPARE_REF" --; then
   exit 0
 fi
 
+# The content guard's findings against origin/<default>, which is what
+# bin/fm-pr-merge.sh compares a GitHub or Gitea merge against.
+print_guard_findings() {  # <head>
+  local head=$1 hint
+  if [ "$BASE" != "origin/$DEFAULT" ]; then
+    echo "  guard findings: not run (the project has no origin remote)"
+    return 0
+  fi
+  hint=$(fm_merge_guard_branch_origin "$WT" "$BRANCH")
+  if ! fm_merge_guard_analyze "$WT" "$DEFAULT" "$head" "$hint"; then
+    echo "  guard findings: could not run: $FM_MERGE_GUARD_ERROR"
+    return 0
+  fi
+  if [ -z "$FM_MERGE_GUARD_HITS" ]; then
+    echo "  guard findings: none"
+  else
+    echo "  guard findings:"
+    printf '%s\n' "$FM_MERGE_GUARD_HITS" | sed 's/^/    - /'
+  fi
+  if [ -z "$FM_MERGE_GUARD_REVERTED" ]; then
+    echo "  reverts work from: none"
+  else
+    echo "  reverts work from:"
+    printf '%s\n' "$FM_MERGE_GUARD_REVERTED" | sed 's/^/    - /'
+  fi
+}
+
+# Checks and reviews as "<label>: <summary>" lines from one GitHub view. A
+# check name reported more than once counts only its newest run.
+github_state_lines() {
+  local json
+  json=$(gh pr view "$FM_PR_URL" \
+    --json state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefName,reviewDecision,latestReviews,statusCheckRollup \
+    2>/dev/null) || return 1
+  printf '%s' "$json" | jq -r '
+    def count($v): [.[] | select(.verdict == $v)] | length;
+    if type != "object" then error("not a pull request") else . end
+    | ([(.statusCheckRollup // [])[]
+        | { name: ((.name // .context // "") | tostring),
+            at: ((.completedAt // .startedAt // "") | tostring),
+            verdict: (if .__typename == "StatusContext" then
+                        (if .state == "SUCCESS" then "passing"
+                         elif .state == "PENDING" or .state == "EXPECTED" then "pending"
+                         else "failing" end)
+                      elif .status != "COMPLETED" then "pending"
+                      elif (.conclusion // "") as $c | ["SUCCESS", "NEUTRAL", "SKIPPED"] | index($c) then "passing"
+                      else "failing" end) }]
+       | group_by(.name) | map(max_by(.at))) as $checks
+    | "head=\(.headRefOid // "")",
+      "base: \(.baseRefName // "unknown")",
+      "state: \((.state // "unknown") | ascii_downcase), \(if .isDraft == true then "draft" elif .isDraft == false then "not a draft" else "draft unknown" end)",
+      "mergeable: \(.mergeable // "unknown") (merge state \(.mergeStateStatus // "unknown"))",
+      "checks: " + (if ($checks | length) == 0 then "none reported"
+        else "\($checks | count("passing")) passing, \($checks | count("failing")) failing, \($checks | count("pending")) pending"
+          + ([$checks[] | select(.verdict != "passing") | "\(.name) \(.verdict)"]
+             | if length > 0 then " (" + join(", ") + ")" else "" end) end),
+      "reviews: " + (if (.reviewDecision // "") == "" then "no review decision" else .reviewDecision end)
+        + ([(.latestReviews // [])[] | "\(.author.login // "unknown") \((.state // "") | ascii_downcase)"]
+           | if length > 0 then "; " + join(", ") else "; no reviews" end)' 2>/dev/null
+}
+
+# The same lines from Gitea's pull request, combined commit status, and review
+# list, read through the one tea login that serves the pull request's host.
+gitea_state_lines() {
+  local login pr head statuses reviews
+  login=$(fm_pr_gitea_login "$FM_PR_HOST") || login=
+  [ -n "$login" ] || return 1
+  pr=$(tea api --login "$login" "/repos/$FM_PR_OWNER/$FM_PR_REPO/pulls/$FM_PR_NUMBER" 2>/dev/null \
+    | jq -c --arg url "$FM_PR_URL" 'if type == "object" and .html_url == $url then . else error("wrong pull request") end' \
+      2>/dev/null) || return 1
+  head=$(printf '%s' "$pr" | jq -r '.head.sha // ""')
+  fm_pr_head_valid "$head" || return 1
+  statuses=$(tea api --login "$login" "/repos/$FM_PR_OWNER/$FM_PR_REPO/commits/$head/status?limit=50" 2>/dev/null \
+    | jq -c 'if type == "object" and .statuses == null and .total_count == 0 then .statuses = [] else . end
+      | if type == "object" and (.statuses | type == "array") and ((.total_count // 0) == (.statuses | length))
+        then .statuses else error("incomplete") end' 2>/dev/null) || statuses=null
+  reviews=$(tea api --login "$login" "/repos/$FM_PR_OWNER/$FM_PR_REPO/pulls/$FM_PR_NUMBER/reviews" 2>/dev/null \
+    | jq -c 'if type == "array" then . else error("unreadable") end' 2>/dev/null) || reviews=null
+  jq -rn --argjson pr "$pr" --argjson statuses "$statuses" --argjson reviews "$reviews" '
+    def count($v): [.[] | select(.verdict == $v)] | length;
+    "head=\($pr.head.sha)",
+    "base: \($pr.base.ref // "unknown")",
+    "state: \(if $pr.merged == true then "merged" else ($pr.state // "unknown") end), \(if $pr.draft == true then "draft" elif $pr.draft == false then "not a draft" else "draft unknown" end)",
+    "mergeable: \(if $pr.mergeable == null then "unknown" else $pr.mergeable end)",
+    "checks: " + (if $statuses == null then "could not be read"
+      else [$statuses[] | { name: ((.context // "") | tostring),
+                            verdict: (if .status == "success" then "passing" elif .status == "pending" then "pending" else "failing" end) }]
+        | if length == 0 then "none reported"
+          else "\(count("passing")) passing, \(count("failing")) failing, \(count("pending")) pending"
+            + ([.[] | select(.verdict != "passing") | "\(.name) \(.verdict)"]
+               | if length > 0 then " (" + join(", ") + ")" else "" end) end end),
+    "reviews: " + (if $reviews == null then "could not be read"
+      else [$reviews[] | select(.state != "PENDING" and .state != "REQUEST_REVIEW" and .dismissed != true)]
+        | group_by(.user.login) | map(max_by(.submitted_at // ""))
+        | map("\(.user.login // "unknown") \((.state // "") | ascii_downcase)")
+        | if length > 0 then join(", ") else "no reviews" end end)' 2>/dev/null
+}
+
+# The PR state block firstmate presents with every merge ask.
+print_pr_state() {
+  local head lines forge_head forge_base line
+  head=$(git -C "$WT" rev-parse --verify "$COMPARE_REF^{commit}")
+  echo
+  echo "pr state:"
+  echo "  pr: ${PR_URL:-none recorded}"
+  echo "  head: $head"
+  print_guard_findings "$head"
+  [ -n "$PR_URL" ] || return 0
+  if ! fm_pr_url_parse "$PR_URL"; then
+    echo "  forge state: not read (pr= is not a full pull request URL)"
+    return 0
+  fi
+  case "$FM_PR_PROVIDER" in
+    github) lines=$(github_state_lines) || lines= ;;
+    gitea) lines=$(gitea_state_lines) || lines= ;;
+    *)
+      echo "  forge state: not read for $FM_PR_PROVIDER, where the content guard does not run"
+      return 0
+      ;;
+  esac
+  if [ -z "$lines" ]; then
+    echo "  forge state: could not be read from $FM_PR_HOST"
+    return 0
+  fi
+  forge_head=$(printf '%s\n' "$lines" | sed -n 's/^head=//p' | head -1)
+  forge_base=$(printf '%s\n' "$lines" | sed -n 's/^base: //p' | head -1)
+  printf '%s\n' "$lines" | while IFS= read -r line; do
+    case "$line" in
+      head=*) ;;
+      *) printf '  %s\n' "$line" ;;
+    esac
+  done
+  if [ "$forge_head" != "$head" ]; then
+    echo "  warning: the forge reports head ${forge_head:-unknown}, not the $head shown here; fetch again before asking"
+  fi
+  case "$forge_base" in
+    unknown|"$DEFAULT") ;;
+    *) echo "  warning: the pull request targets $forge_base, but the diff and guard findings above compare against $BASE" ;;
+  esac
+}
+
 git -C "$WT" diff --stat "$BASE...$COMPARE_REF" --
-if ! "$STAT_ONLY"; then
+if "$STAT_ONLY"; then
+  print_pr_state
+else
   echo
   git -C "$WT" diff "$BASE...$COMPARE_REF" --
 fi

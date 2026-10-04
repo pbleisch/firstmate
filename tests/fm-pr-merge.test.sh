@@ -89,10 +89,6 @@ real_head() {
   printf '%s\n' "$commit"
 }
 
-# The PR's age and reviews in every live view: old enough and unreviewed, so the
-# young-unreviewed guard stays quiet unless a case says otherwise.
-GH_VIEW_AGE='"createdAt":"2020-01-01T00:00:00Z","reviews":[]'
-
 # Live GitHub JSON for the pre-merge verify, plus gh-axi for the
 # post-merge fallback view. Merge itself is `gh pr merge --match-head-commit`.
 # Args: case_dir head_sha
@@ -101,7 +97,7 @@ write_github_live_json() {
   head=$(real_head "$case_dir" "$2")
   printf '%s\n' "$head" > "$case_dir/github-head"
   cat > "$case_dir/github-view.json" <<JSON
-{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"$head","baseRefName":"main",$GH_VIEW_AGE,"statusCheckRollup":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}
+{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"$head","baseRefName":"main","statusCheckRollup":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}
 JSON
 }
 
@@ -110,7 +106,7 @@ write_github_red_json() {
   head=$(real_head "$case_dir" "$2")
   printf '%s\n' "$head" > "$case_dir/github-head"
   cat > "$case_dir/github-view.json" <<JSON
-{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"$head","baseRefName":"main",$GH_VIEW_AGE,"statusCheckRollup":[{"__typename":"CheckRun","name":"$name","status":"COMPLETED","conclusion":"FAILURE"}]}
+{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"$head","baseRefName":"main","statusCheckRollup":[{"__typename":"CheckRun","name":"$name","status":"COMPLETED","conclusion":"FAILURE"}]}
 JSON
 }
 
@@ -146,7 +142,7 @@ write_github_rollup_json() {
   done
   printf '%s\n' "$head" > "$case_dir/github-head"
   cat > "$case_dir/github-view.json" <<JSON
-{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"$head","baseRefName":"main",$GH_VIEW_AGE,"statusCheckRollup":[$rollup]}
+{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"$head","baseRefName":"main","statusCheckRollup":[$rollup]}
 JSON
 }
 
@@ -236,15 +232,6 @@ case "${1:-} ${2:-}" in
     exit 0
     ;;
   api\ *)
-    # The base branch's protection, served only when a case writes one.
-    case "$*" in
-      "api repos/"*"/branches/"*)
-        if [ -f "${FM_TEST_GH_BRANCH:-}" ]; then
-          cat "$FM_TEST_GH_BRANCH"
-          exit 0
-        fi
-        ;;
-    esac
     if [ -f "${FM_TEST_GH_RULES_FAIL_BODY:-}" ]; then
       cat "$FM_TEST_GH_RULES_FAIL_BODY" >&2
       exit 1
@@ -436,7 +423,6 @@ run_pr_merge() {
   FM_TEST_GH_RULES="$case_dir/github-rules" \
   FM_TEST_GH_VIEW_JSON="$case_dir/github-view.json" \
   FM_TEST_GH_HEAD="$case_dir/github-head" \
-  FM_TEST_GH_BRANCH="$case_dir/github-branch.json" \
   FM_TEST_GH_MERGE_RC_FILE="$case_dir/github-merge-rc" \
   FM_TEST_GH_MERGE_OUTPUT="$(cat "$case_dir/github-merge-output" 2>/dev/null || true)" \
   FM_TEST_GH_GRAPHQL_FAIL="$case_dir/github-graphql-fail" \
@@ -2246,15 +2232,6 @@ case "$endpoint" in
     printf '{"message":"head out of date"}' > "$case_dir/gitea-merge-error"
     answer "$code" "$case_dir/gitea-merge-error"
     ;;
-  */pulls/*/reviews)
-    if [ -f "$case_dir/gitea-reviews.json" ]; then answer 200 "$case_dir/gitea-reviews.json"; fi
-    printf '[]' > "$case_dir/gitea-no-reviews.json"
-    answer 200 "$case_dir/gitea-no-reviews.json"
-    ;;
-  */branch_protections/*)
-    if [ -f "$case_dir/gitea-protection.json" ]; then answer 200 "$case_dir/gitea-protection.json"; fi
-    answer 404 "$case_dir/gitea-404.json"
-    ;;
   */pulls/*)
     [ ! -e "$case_dir/gitea-pr-404" ] || answer 404 "$case_dir/gitea-404.json"
     if [ -e "$case_dir/gitea-merge-called" ]; then answer 200 "$case_dir/gitea-pr-post.json"; fi
@@ -2273,7 +2250,6 @@ SH
 # satisfies every pre-merge condition, with named fields overridden.
 write_gitea_pr_json() {
   local file=$1 kv url=$GT_URL state=open merged=false draft=false mergeable=true head
-  local created=2020-01-01T00:00:00Z
   head=$(gitea_case_head "$(dirname "$file")")
   shift
   for kv in "$@"; do
@@ -2284,12 +2260,11 @@ write_gitea_pr_json() {
       draft) draft=${kv#*=} ;;
       mergeable) mergeable=${kv#*=} ;;
       head) head=${kv#*=} ;;
-      created) created=${kv#*=} ;;
       *) fail "write_gitea_pr_json: unknown field '${kv%%=*}'" ;;
     esac
   done
-  printf '{"number":5,"html_url":"%s","state":"%s","merged":%s,"draft":%s,"mergeable":%s,"head":{"sha":"%s"},"base":{"ref":"main"},"created_at":"%s"}\n' \
-    "$url" "$state" "$merged" "$draft" "$mergeable" "$head" "$created" > "$file"
+  printf '{"number":5,"html_url":"%s","state":"%s","merged":%s,"draft":%s,"mergeable":%s,"head":{"sha":"%s"},"base":{"ref":"main"}}\n' \
+    "$url" "$state" "$merged" "$draft" "$mergeable" "$head" > "$file"
 }
 
 # write_gitea_status_json <file> [<state>:<context> ...]: the combined status at
@@ -2485,20 +2460,14 @@ test_gitea_first_merge_attempt_binds_the_head() {
 }
 
 test_gitea_merge_passes_the_content_guard() {
-  local case_dir rc now
-  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local case_dir rc
   case_dir=$(make_gitea_case gitea-content-guard)
-  write_gitea_pr_json "$case_dir/gitea-pr.json" "created=$now"
   rc=$(run_gitea_merge "$case_dir")
-  expect_code 1 "$rc" "gitea-content-guard: a fresh unreviewed pull request with no required check must refuse"
-  assert_grep 'young-unreviewed: it is' "$case_dir/stderr" "gitea-content-guard: the guard was not named"
+  expect_code 0 "$rc" "gitea-content-guard: a clean, unreviewed pull request must merge ($(cat "$case_dir/stderr"))"
   assert_grep 'content: 1 file changed, 1 insertion(+) against origin/main' "$case_dir/stderr" \
     "gitea-content-guard: the diff stat against origin/main was not printed"
-  assert_absent "$case_dir/gitea-merge-body" "gitea-content-guard: a merge request was sent"
-  printf '%s\n' '{"enable_status_check":true,"status_check_contexts":["CI / build"]}' \
-    > "$case_dir/gitea-protection.json"
-  rc=$(run_gitea_merge "$case_dir")
-  expect_code 0 "$rc" "gitea-content-guard: a required check must quiet the young-unreviewed guard ($(cat "$case_dir/stderr"))"
+  assert_grep 'verdict=pass' "$case_dir/state/task-x1.merge-guard" "gitea-content-guard: the pass was not recorded"
+  assert_no_grep 'reverts work from' "$case_dir/stderr" "gitea-content-guard: a clean pull request listed reverted commits"
   pass "fm-pr-merge runs the content guard on a Gitea pull request"
 }
 
@@ -2738,35 +2707,71 @@ test_mass_deletion_from_a_merge_resolution_refuses() {
   pass "fm-pr-merge refuses a PR deleting far more than its own commits delete"
 }
 
-test_young_unreviewed_pr_refuses_without_required_checks() {
-  local case_dir now variant filter
+# A fresh pull request with no review and no required check merges: the content
+# guard judges what a pull request changes, not how old it is.
+test_young_unreviewed_pr_merges() {
+  local case_dir now
   now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  for variant in young reviewed required; do
-    case_dir=$(make_case "young-$variant")
-    add_gh_mocks "$case_dir" b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8
-    case "$variant" in
-      young) filter=".createdAt = \"$now\"" ;;
-      reviewed) filter=".createdAt = \"$now\" | .reviews = [{\"state\":\"COMMENTED\"}]" ;;
-      required)
-        filter=".createdAt = \"$now\""
-        printf '%s\n' '{"name":"main","protected":true,"protection":{"required_status_checks":{"contexts":["ci"],"checks":[]}}}' \
-          > "$case_dir/github-branch.json"
-        ;;
-    esac
-    jq -c "$filter" "$case_dir/github-view.json" > "$case_dir/github-view.tmp"
-    mv "$case_dir/github-view.tmp" "$case_dir/github-view.json"
-    run_merge_case "$case_dir" 160
-    if [ "$variant" = young ]; then
-      expect_code 1 "$RC" "young-$variant: a fresh unreviewed PR on an unprotected base must refuse"
-      assert_grep 'young-unreviewed: it is' "$case_dir/stderr" "young-$variant: the guard was not named"
-      assert_no_grep 'pr merge' "$case_dir/gh.log" "young-$variant: the forge merge ran"
-      run_merge_case "$case_dir" 160 --allow-content young-unreviewed
-      expect_code 0 "$RC" "young-$variant: the named waiver must merge: $(cat "$case_dir/stderr")"
-    else
-      expect_code 0 "$RC" "young-$variant: a reviewed or required-checked PR must merge: $(cat "$case_dir/stderr")"
-    fi
-  done
-  pass "fm-pr-merge refuses a young unreviewed PR only when its base requires no check"
+  case_dir=$(make_case young-unreviewed)
+  add_gh_mocks "$case_dir" b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8
+  jq -c ".createdAt = \"$now\" | .reviews = []" "$case_dir/github-view.json" > "$case_dir/github-view.tmp"
+  mv "$case_dir/github-view.tmp" "$case_dir/github-view.json"
+  run_merge_case "$case_dir" 160
+  expect_code 0 "$RC" "young-unreviewed: a fresh unreviewed PR must merge: $(cat "$case_dir/stderr")"
+  assert_logged_gh_merge "$case_dir" 160 example/repo --squash
+  run_merge_case "$case_dir" 160 --allow-content young-unreviewed
+  expect_code 2 "$RC" "young-unreviewed: the removed guard must not be a waivable name"
+  pass "fm-pr-merge merges a young unreviewed PR; there is no age guard"
+}
+
+# main: A -> C1 (a=2) -> C2 (a=3) -> C3 (b=2); the task forks at C1 and its tree
+# is grafted onto C3, so merging would revert C2 and C3 but keep C1.
+build_two_commit_revert() {  # <case_dir>; echoes the graft commit
+  local case_dir=$1 wt fork task_tree base
+  wt="$case_dir/wt"
+  printf '1\n' > "$wt/a.txt"
+  printf '1\n' > "$wt/b.txt"
+  case_git "$case_dir" add -A
+  case_git "$case_dir" commit -q -m 'add a and b'
+  printf '2\n' > "$wt/a.txt"
+  case_git "$case_dir" commit -q -am 'kept change to a'
+  case_git "$case_dir" push -q origin HEAD:refs/heads/main
+  fork=$(case_git "$case_dir" rev-parse HEAD)
+  case_git "$case_dir" checkout -q -b fm/task-x1
+  printf 'task\n' > "$wt/task.txt"
+  case_git "$case_dir" add -A
+  case_git "$case_dir" commit -q -m 'task work'
+  task_tree=$(case_git "$case_dir" rev-parse 'HEAD^{tree}')
+  case_git "$case_dir" checkout -q --detach "$fork"
+  printf '3\n' > "$wt/a.txt"
+  case_git "$case_dir" commit -q -am 'reverted change to a'
+  printf '2\n' > "$wt/b.txt"
+  case_git "$case_dir" commit -q -am 'reverted change to b'
+  case_git "$case_dir" push -q origin HEAD:refs/heads/main
+  base=$(case_git "$case_dir" rev-parse HEAD)
+  case_git "$case_dir" checkout -q fm/task-x1
+  case_git "$case_dir" commit-tree "$task_tree" -p "$base" -m 'task work'
+}
+
+test_stale_tree_lists_the_commits_it_reverts() {
+  local case_dir graft
+  case_dir=$(make_case reverted-commits)
+  add_gh_mocks "$case_dir" bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc
+  graft=$(build_two_commit_revert "$case_dir")
+  use_real_head "$case_dir" graft "$graft"
+  run_merge_case "$case_dir" 190
+  expect_code 1 "$RC" "reverted-commits: the stale tree must refuse"
+  assert_grep 'stale-tree: 2 file(s): a.txt, b.txt would return to bytes origin/main already replaced, reverting work from 2 commit(s)' \
+    "$case_dir/stderr" "reverted-commits: the finding did not count the reverted commits"
+  grep -q '^content: reverts work from [0-9a-f]\{7,\} [0-9-]\{10\} reverted change to b (b.txt)$' "$case_dir/stderr" \
+    || fail "reverted-commits: the change to b was not listed with its date and file"
+  grep -q '^content: reverts work from [0-9a-f]\{7,\} [0-9-]\{10\} reverted change to a (a.txt)$' "$case_dir/stderr" \
+    || fail "reverted-commits: the change to a was not listed with its date and file"
+  assert_no_grep 'kept change to a' "$case_dir/stderr" "reverted-commits: a change the head keeps was listed"
+  [ "$(grep -c '^reverted=' "$case_dir/state/task-x1.merge-guard")" -eq 2 ] \
+    || fail "reverted-commits: the record did not hold exactly the two reverted commits"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "reverted-commits: the forge merge ran"
+  pass "fm-pr-merge lists the earlier base commits whose work a stale tree would revert"
 }
 
 test_content_guard_that_cannot_run_refuses() {
@@ -3922,7 +3927,8 @@ test_moved_head_refuses_until_recorded_again
 test_rebind_needs_a_reason_and_a_present_captain
 test_pr134_graft_is_refused
 test_mass_deletion_from_a_merge_resolution_refuses
-test_young_unreviewed_pr_refuses_without_required_checks
+test_young_unreviewed_pr_merges
+test_stale_tree_lists_the_commits_it_reverts
 test_content_guard_that_cannot_run_refuses
 test_allow_content_arguments_are_strict
 test_gitea_first_merge_attempt_binds_the_head
