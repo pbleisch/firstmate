@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC1091,SC2016
-# Behavior tests for the cd-guard PreToolUse seatbelt (docs/cd-guard.md).
+# Behavior tests for the cd-guard PreToolUse seatbelt (docs/cd-guard.md) and the
+# history-surgery seatbelt its transport also carries (docs/history-guard.md).
 #
 # bin/fm-cd-command-policy.mjs is the single owner of the block/allow decision;
 # it reuses the shell classifier owned by bin/fm-arm-command-policy.mjs.
@@ -29,8 +30,10 @@ install_cd_scripts() {
   cp "$ROOT/bin/fm-cd-pretool-check.sh" "$dir/bin/fm-cd-pretool-check.sh"
   cp "$ROOT/bin/fm-hook-host-lib.sh" "$dir/bin/fm-hook-host-lib.sh"
   cp "$ROOT/bin/fm-cd-command-policy.mjs" "$dir/bin/fm-cd-command-policy.mjs"
+  cp "$ROOT/bin/fm-history-command-policy.mjs" "$dir/bin/fm-history-command-policy.mjs"
   cp "$ROOT/bin/fm-arm-command-policy.mjs" "$dir/bin/fm-arm-command-policy.mjs"
-  chmod +x "$dir/bin/fm-cd-pretool-check.sh" "$dir/bin/fm-cd-command-policy.mjs"
+  chmod +x "$dir/bin/fm-cd-pretool-check.sh" "$dir/bin/fm-cd-command-policy.mjs" \
+    "$dir/bin/fm-history-command-policy.mjs"
 }
 
 make_primary_fixture() {
@@ -143,11 +146,41 @@ matrix_case A34 allow 'command -V cd'
 matrix_case A35 allow 'command -pv cd'
 matrix_case A36 allow 'command -vp cd'
 
+# History surgery (docs/history-guard.md): denied wherever it is nested.
+HISTORY_IDS=()
+HISTORY_EXPECTED=()
+HISTORY_COMMANDS=()
+history_case() {
+  HISTORY_IDS+=("$1")
+  HISTORY_EXPECTED+=("$2")
+  HISTORY_COMMANDS+=("$3")
+}
+history_case H01 deny 'git -C projects/app commit-tree 924654f1 -p 47d49d6d -m WIP'
+history_case H02 deny 'git -C projects/app reset --hard main'
+history_case H03 deny '(cd projects/app && git reset --hard origin/main)'
+history_case H04 deny 'git -C projects/app checkout --ours .'
+history_case H05 deny 'git -C projects/app checkout --theirs -- src'
+history_case H06 deny 'git -C projects/app restore --theirs src/a.ts'
+history_case H07 deny 'git -C projects/app merge -X ours origin/main'
+history_case H08 deny 'git -C projects/app rebase -Xtheirs origin/main'
+history_case H09 deny 'git -C projects/app merge --strategy-option=theirs origin/main'
+history_case H10 deny 'git -C projects/app merge -s ours origin/main'
+history_case H11 deny "bash -c 'git -C projects/app reset --hard'"
+history_case H12 deny 'echo "$(git -C projects/app commit-tree abc -p def -m x)"'
+history_case H13 deny 'git -c core.pager=cat -C projects/app reset --hard HEAD'
+history_case H14 deny 'git fetch origin main && git -C projects/app reset --hard origin/main'
+history_case H15 allow 'git -C projects/app reset --soft HEAD~1'
+history_case H16 allow 'git -C projects/app log --oneline origin/main..HEAD'
+history_case H17 allow 'echo "git reset --hard"'
+history_case H18 allow 'git -C projects/app merge --no-edit origin/main'
+history_case H19 allow 'git -C projects/app diff --stat origin/main...HEAD'
+history_case H20 allow 'grep -rn theirs docs'
+
 MATRIX_TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-cd-policy-matrix.XXXXXX")
 FM_TEST_CLEANUP_DIRS+=("$MATRIX_TMP")
 
 run_matrix_entry() {
-  local id=$1 expected=$2 entry=$3 cmd=$4 payload out_file err_file rc
+  local id=$1 expected=$2 entry=$3 cmd=$4 code=${5:-persistent-cd} payload out_file err_file rc
   out_file="$MATRIX_TMP/$id-$entry.out"
   err_file="$MATRIX_TMP/$id-$entry.err"
 
@@ -184,8 +217,8 @@ run_matrix_entry() {
   fi
 
   [ "$rc" -eq 2 ] || fail "$id via $entry must deny, got exit $rc"
-  jq -e '.hookSpecificOutput.permissionDecision == "deny" and (.systemMessage | test("\\[persistent-cd\\]"))' "$err_file" >/dev/null 2>&1 \
-    || fail "$id via $entry deny must carry the persistent-cd reason code on stderr: $(cat "$err_file")"
+  jq -e --arg code "[$code]" '.hookSpecificOutput.permissionDecision == "deny" and (.systemMessage | contains($code))' "$err_file" >/dev/null 2>&1 \
+    || fail "$id via $entry deny must carry the $code reason code on stderr: $(cat "$err_file")"
   if [ "$entry" = claude ]; then
     [ ! -s "$out_file" ] || fail "$id via claude deny must leave stdout empty: $(cat "$out_file")"
   elif [ "$entry" = grok ]; then
@@ -202,6 +235,39 @@ test_full_acceptance_matrix() {
     done
   done
   pass "cd-guard acceptance matrix: ${#MATRIX_IDS[@]} cases x 5 harness entry forms, block/allow all correct"
+}
+
+test_history_surgery_matrix() {
+  local i entry
+  for ((i = 0; i < ${#HISTORY_IDS[@]}; i++)); do
+    for entry in codex claude grok opencode pi; do
+      run_matrix_entry "${HISTORY_IDS[$i]}" "${HISTORY_EXPECTED[$i]}" "$entry" "${HISTORY_COMMANDS[$i]}" history-surgery
+    done
+  done
+  pass "history-surgery matrix: ${#HISTORY_IDS[@]} cases x 5 harness entry forms, block/allow all correct"
+}
+
+test_history_surgery_inert_in_child_worktree() {
+  local base dir out rc
+  base="$TMP_ROOT/history-child-base"
+  dir="$TMP_ROOT/history-child-wt"
+  make_child_worktree_fixture "$base" "$dir" >/dev/null
+  out=$("$dir/bin/fm-cd-pretool-check.sh" --claude --command 'git reset --hard origin/main' 2>&1); rc=$?
+  expect_code 0 "$rc" "the history seatbelt must be inert in a worker's linked worktree"
+  [ -z "$out" ] || fail "the history seatbelt produced output in a child worktree: $out"
+  pass "history-surgery: inert in a worker's task worktree, where conflict resolution belongs"
+}
+
+test_history_policy_cli_direct() {
+  local policy
+  policy="$ROOT/bin/fm-history-command-policy.mjs"
+  [ "$(node "$policy" --command 'git commit-tree t -p p -m m' | cut -f1,2)" = "deny	history-surgery" ] \
+    || fail "history policy CLI must deny commit-tree"
+  [ "$(node "$policy" --command 'git status')" = allow ] \
+    || fail "history policy CLI must allow git status"
+  [ "$(node "$policy")" = allow ] \
+    || fail "history policy CLI must allow when no command is supplied"
+  pass "history-surgery: fm-history-command-policy.mjs CLI honors the deny/allow output contract"
 }
 
 # --- primary-checkout scoping ----------------------------------------------
@@ -398,3 +464,6 @@ test_fail_open_missing_jq_on_stdin
 test_prefilter_skips_node_without_cd_substring
 test_policy_cli_direct
 test_scripts_are_shellcheck_clean
+test_history_surgery_matrix
+test_history_surgery_inert_in_child_worktree
+test_history_policy_cli_direct

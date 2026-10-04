@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# Stable PreToolUse transport for the cd-guard command policy.
+# Stable PreToolUse transport for the primary-shell command policies: the
+# cd-guard and the history-surgery seatbelt.
 #
 # A stray persistent top-level `cd projects/<clone>` in the PRIMARY firstmate
 # shell silently relocates the shell, so a later firstmate-owned command (a
 # backlog write, an fm-* lifecycle call, tasks-axi) runs inside a project clone
 # instead of the home. This seatbelt denies such a command before it runs.
-# bin/fm-cd-command-policy.mjs is the sole owner of the block/allow decision; it
-# reuses the shell classifier owned by bin/fm-arm-command-policy.mjs. This
-# wrapper only scopes the guard to the real primary checkout, acquires the
-# harness payload, invokes that policy, and renders the established harness
-# responses. It never executes, sources, evaluates, or expands the command.
+# bin/fm-cd-command-policy.mjs is the sole owner of the cd block/allow decision;
+# it reuses the shell classifier owned by bin/fm-arm-command-policy.mjs. The same
+# transport also carries bin/fm-history-command-policy.mjs, the sole owner of the
+# history-surgery decision (docs/history-guard.md), so every harness that already
+# routes its shell commands here gets that seatbelt without a new registration.
+# This wrapper only scopes the guards to the real primary checkout, acquires the
+# harness payload, invokes the policies whose prefilter matches, and renders the
+# established harness responses; the first deny wins. It never executes,
+# sources, evaluates, or expands the command.
 # See docs/cd-guard.md for the complete contract and validation record.
 #
 # Usage:
@@ -53,7 +58,9 @@ With no --command, reads a PreToolUse-style JSON payload on stdin (Grok
 toolInput.command, or Claude/Codex tool_input.command).
 Fires only in the real primary firstmate checkout; it is a silent no-op in a
 crewmate/scout task worktree or any non-firstmate repo.
-Exits 0 to allow and 2 to deny a persistent top-level cwd change.
+Exits 0 to allow and 2 to deny a persistent top-level cwd change or a git
+history-surgery command (commit-tree, reset --hard, one-side conflict
+resolution).
 The deny reason is written to stderr, with a Grok decision object on stdout
 unless --claude is supplied.
 With --cursor, a deny is Cursor's own decision object on stdout and exit 0,
@@ -130,15 +137,27 @@ PREFILTER=${PREFILTER//\"/}
 PREFILTER=${PREFILTER//\'/}
 PREFILTER=${PREFILTER//$'\n'/}
 PREFILTER=${PREFILTER//$'\r'/}
+# The history prefilter is the same kind of strict superset for
+# bin/fm-history-command-policy.mjs: a git command word plus one of the
+# operations that policy can deny.
+RUN_CD=0
+RUN_HISTORY=0
 case "$CMD" in
-  *"\$'"*|*'$"'*) ;;
+  *"\$'"*|*'$"'*) RUN_CD=1; RUN_HISTORY=1 ;;
   *)
     case "$PREFILTER" in
-      *cd*|*pushd*|*popd*) ;;
-      *) exit 0 ;;
+      *cd*|*pushd*|*popd*) RUN_CD=1 ;;
+    esac
+    case "$PREFILTER" in
+      *git*)
+        case "$PREFILTER" in
+          *commit-tree*|*reset*|*ours*|*theirs*) RUN_HISTORY=1 ;;
+        esac
+        ;;
     esac
     ;;
 esac
+[ "$RUN_CD" -eq 1 ] || [ "$RUN_HISTORY" -eq 1 ] || exit 0
 
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || exit 0
 FM_ROOT=${FM_ROOT_OVERRIDE:-$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd -P)} || exit 0
@@ -159,11 +178,21 @@ GIT_DIR=$(git -C "$FM_ROOT" rev-parse --git-dir 2>/dev/null) || exit 0
 GIT_COMMON_DIR=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null) || exit 0
 [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || exit 0
 
-POLICY="$FM_ROOT/bin/fm-cd-command-policy.mjs"
 command -v node >/dev/null 2>&1 || exit 0
-[ -f "$POLICY" ] || exit 0
-
-POLICY_OUTPUT=$(node "$POLICY" --command "$CMD" 2>/dev/null) || exit 0
+POLICY_OUTPUT=
+for POLICY_NAME in cd history; do
+  if [ "$POLICY_NAME" = cd ]; then
+    [ "$RUN_CD" -eq 1 ] || continue
+  else
+    [ "$RUN_HISTORY" -eq 1 ] || continue
+  fi
+  POLICY="$FM_ROOT/bin/fm-$POLICY_NAME-command-policy.mjs"
+  [ -f "$POLICY" ] || continue
+  POLICY_OUTPUT=$(node "$POLICY" --command "$CMD" 2>/dev/null) || POLICY_OUTPUT=
+  case "$POLICY_OUTPUT" in
+    deny*) break ;;
+  esac
+done
 [ -n "$POLICY_OUTPUT" ] || exit 0
 
 TAB=$(printf '\t')
