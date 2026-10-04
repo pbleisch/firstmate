@@ -2376,6 +2376,22 @@ test_gitea_refusals_report_every_condition_and_send_nothing() {
   pass "a Gitea merge reports every failed condition and sends no merge request"
 }
 
+test_gitea_null_statuses_with_zero_total_merge() {
+  local case_dir rc
+  case_dir=$(make_gitea_case gitea-null-statuses)
+  printf '{"state":"pending","sha":"%s","total_count":0,"statuses":null}\n' "$(gitea_case_head "$case_dir")" > "$case_dir/gitea-status.json"
+  rc=$(run_gitea_merge "$case_dir")
+  expect_code 0 "$rc" "gitea-null-statuses: a head with no statuses should merge ($(cat "$case_dir/stderr"))"
+
+  case_dir=$(make_gitea_case gitea-null-statuses-nonzero)
+  printf '{"state":"pending","sha":"%s","total_count":2,"statuses":null}\n' "$(gitea_case_head "$case_dir")" > "$case_dir/gitea-status.json"
+  rc=$(run_gitea_merge "$case_dir")
+  expect_code 1 "$rc" "gitea-null-statuses-nonzero: null statuses with a nonzero total must refuse"
+  assert_grep 'could not be read completely' "$case_dir/stderr" "gitea-null-statuses-nonzero: the unreadable statuses were not reported"
+  assert_absent "$case_dir/gitea-merge-body" "gitea-null-statuses-nonzero: the merge reached the forge"
+  pass "Gitea 1.27 null statuses merge only when total_count is zero"
+}
+
 test_gitea_allow_red_waives_only_the_named_context() {
   local case_dir rc
   case_dir=$(make_gitea_case gitea-allow-red)
@@ -3896,6 +3912,7 @@ test_allow_red_refused_on_gitlab
 test_gitea_merge_binds_the_verified_head
 test_gitea_caller_style_overrides_the_repository_default
 test_gitea_refusals_report_every_condition_and_send_nothing
+test_gitea_null_statuses_with_zero_total_merge
 test_gitea_allow_red_waives_only_the_named_context
 test_gitea_answer_for_another_pull_request_refuses
 test_gitea_forge_refusal_fails_the_merge

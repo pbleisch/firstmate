@@ -1458,11 +1458,13 @@ FIELDS
 
   # Gitea's combined status lists the latest status per context. A page that
   # holds fewer entries than total_count is refused as unreadable rather than
-  # judged on part of the set.
+  # judged on part of the set. Gitea 1.27 answers a head with no statuses as
+  # statuses null with total_count 0, which is read as an empty list.
   if ! gitea_api "/repos/$PR_OWNER/$PR_REPO/commits/$live_head/status?limit=50" \
     || [ "$GITEA_HTTP_STATUS" != 200 ] \
     || ! statuses=$(printf '%s' "$GITEA_BODY" | jq -r '
-        if type == "object" and (.statuses | type == "array")
+        if type == "object" and .statuses == null and .total_count == 0 then .statuses = [] else . end
+        | if type == "object" and (.statuses | type == "array")
           and ((.total_count // 0) == (.statuses | length)) then
           "sha=" + ((.sha // "") | tostring),
           (.statuses[] | ((.status // "") | tostring) + "\t" + ((.context // "") | tostring | gsub("[\t\n]"; " ")))
