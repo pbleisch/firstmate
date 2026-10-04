@@ -517,8 +517,10 @@ The task is complete only when committed on your branch.
 When you believe it is complete, append \`done [at=<epoch>]: {summary}\` to the status file and stop.
 Firstmate will then instruct you to run /no-mistakes to validate and push.
 That first \`done:\` is the handoff that starts the pipeline, which owns the push; it is not a request to push from this copy.
-${nm_base}
+${nm_base}Before that handoff, and before any later pipeline run that updates the PR, apply these integration rules to your branch:
 EOF
+  fm_dod_integration_block
+  printf '\n'
   fm_nm_driving_block no-ci
   cat <<EOF
 
@@ -532,6 +534,18 @@ A draft cannot be merged, so a done report on one leaves the merge unasked.
 Then append \`done [at=<epoch>]: PR {url} checks green\` and stop. You are finished.
 That CI-ready \`done:\` is accepted only when this copy's HEAD - your latest commit - is one the /no-mistakes run pushed, so commit nothing after the last run; the check tests that commit, not merely that a branch moved.
 If you deliberately keep the PR a draft, append \`paused [at=<epoch>]: {why the draft is held}\` instead of done.
+EOF
+}
+
+# Integration rules for a PR-based ship: the branch is brought up to a freshly
+# fetched origin/<base> by merging, conflicts are resolved on their merits, and
+# the PR body carries the diff stat against origin/<base>, so the content
+# presented for merge is what the branch really changes.
+fm_dod_integration_block() {
+  cat <<'EOF'
+Before you open or update the PR, run `git fetch origin` and merge `origin/<base>` (the PR's base branch, normally the default branch) into your branch; never integrate a local base branch or any other ref that was not just fetched, and never rebuild the branch from an older snapshot (`git commit-tree`, or `reset --hard` onto the base followed by cherry-picks).
+Resolve each conflict hunk on its merits: never take one side wholesale (`checkout --ours/--theirs`, `-X ours/theirs`, `-s ours`) or rewrite conflict markers with a script, and list each conflicted file and how you resolved it in the PR body.
+Put the diff stat against `origin/<base>` (`git diff --stat origin/<base>...HEAD`, after the fetch) in the PR body, and update it whenever you push again.
 EOF
 }
 
@@ -645,6 +659,9 @@ Delivery contract: mode=direct-PR$contract_forge$contract_consent
 Ship branch: $branch
 This task ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
+EOF
+      fm_dod_integration_block
+      cat <<EOF
 When it is implemented and committed, push your branch and open a PR with \`$forge_cli\` that is ready for review, not a draft$pr_base.
 Before you report done, read the PR back from the forge and confirm it is not a draft $draft_check
 A draft cannot be merged, so a done report on one leaves the merge unasked.
@@ -682,12 +699,14 @@ The task is complete only when committed on your branch.
 When you believe it is complete, append \`done [at=<epoch>]: {summary}\` to the status file and stop.
 Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
 That first \`done:\` is the handoff that starts the pipeline, which owns the push; it is not a request to push from this copy.
-${nm_base}
+${nm_base}Before that handoff, and before any later pipeline run that updates the PR, apply these integration rules to your branch:
 EOF
+      fm_dod_integration_block
+      printf '\n'
       fm_nm_driving_block "$forge"
       cat <<EOF
 
-After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), read the PR back from the forge and confirm it is not a draft $draft_check
+After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), make sure the PR body carries the diff stat and conflict list above (add them with \`$forge_cli\` if the pipeline's body lacks them), then read the PR back from the forge and confirm it is not a draft $draft_check
 A draft cannot be merged, so a done report on one leaves the merge unasked.
 Then append \`done [at=<epoch>]: PR {url} checks green\` and stop. You are finished.
 That CI-ready \`done:\` is accepted only when this copy's HEAD - your latest commit - is one the /no-mistakes run pushed, so commit nothing after the run; the check tests that commit, not merely that a branch moved.
