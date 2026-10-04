@@ -562,16 +562,33 @@ fm_backlog_start() {  # <data-dir> <id>
   fm_backlog_mutate "$1" start "$2"
 }
 
+# tasks-axi takes a --pr link only as an http(s) URL ending in /pull/<number>
+# and refuses anything else, so a Gitea or Forgejo /pulls/<number> URL is
+# recorded on the row as a note instead.
+fm_backlog_pr_link_accepted() {  # <url>
+  [[ "$1" =~ ^https?://[^/]+/.+/pull/[0-9]+$ ]]
+}
+
 fm_backlog_done() {  # <data-dir> <id> [flag...]
-  local data=$1 id=$2
+  local data=$1 id=$2 arg previous_arg=''
+  local -a done_args=()
   shift 2
-  fm_backlog_mutate "$data" "done" "$id" "$@"
+  for arg in "$@"; do
+    if [ "$previous_arg" = --pr ] && ! fm_backlog_pr_link_accepted "$arg"; then
+      done_args[${#done_args[@]}-1]=--note
+      done_args+=("PR $arg")
+    else
+      done_args+=("$arg")
+    fi
+    previous_arg=$arg
+  done
+  fm_backlog_mutate "$data" "done" "$id" "${done_args[@]+"${done_args[@]}"}"
 }
 
 fm_backlog_row_artifact_supported() {
   local id=$1 flag=${2:-} value=${3:-}
   case "$flag" in
-    --pr) return 0 ;;
+    --pr) fm_backlog_pr_link_accepted "$value" ;;
     --report) [ "$value" = "data/$id/report.md" ] ;;
     *) return 1 ;;
   esac
@@ -604,7 +621,9 @@ fm_backlog_retain() {  # <data-dir> <id> [flag...]
         ;;
       --pr)
         deliverable="${deliverable:+$deliverable; }PR $arg"
-        row_args=(--pr "$arg")
+        if fm_backlog_row_artifact_supported "$id" --pr "$arg"; then
+          row_args=(--pr "$arg")
+        fi
         ;;
       --note) deliverable="${deliverable:+$deliverable; }$arg" ;;
     esac

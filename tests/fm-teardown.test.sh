@@ -727,6 +727,23 @@ test_teardown_closes_the_backlog_item_itself() {
   pass "teardown closes its own backlog item before reporting success"
 }
 
+test_teardown_closes_a_gitea_task_with_its_pr_url_as_a_note() {
+  local case_dir out gitea_url=https://git.example.com/owner/repo/pulls/48
+  case_dir=$(make_case tasks-axi-close-gitea)
+  write_meta "$case_dir" no-mistakes ship
+  printf 'pr=%s\n' "$gitea_url" >> "$case_dir/state/task-x1.meta"
+  seed_backlog_in_flight "$case_dir"
+
+  out=$(run_teardown "$case_dir" 2>&1) || fail "teardown of a landed Gitea task failed: $out"
+  [ "$(backlog_row_state "$case_dir")" = "done" ] \
+    || fail "teardown left a landed Gitea task's backlog item at $(backlog_row_state "$case_dir"): $out"
+  assert_grep "PR $gitea_url" "$case_dir/data/backlog.md" \
+    "closed Gitea backlog item did not record its PR URL as a note"
+  assert_absent "$case_dir/state/task-x1.backlog-close" \
+    "a landed Gitea close left its pending-close record behind"
+  pass "teardown closes a landed Gitea task with its PR URL as a note"
+}
+
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator() {
   local case_dir out backlog_path
   case_dir=$(make_case tasks-axi-manual-optout)
@@ -3668,6 +3685,7 @@ EOF
 
 test_local_only_fork_remote_allows
 test_teardown_closes_the_backlog_item_itself
+test_teardown_closes_a_gitea_task_with_its_pr_url_as_a_note
 test_teardown_manual_backend_leaves_the_backlog_to_the_operator
 test_local_only_truly_unpushed_refuses
 test_local_only_merged_to_local_main_allows
