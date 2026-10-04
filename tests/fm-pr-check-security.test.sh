@@ -759,14 +759,19 @@ SH
       --carry-count 0 --carry-ts 1700000000 --carry-platform x --carry-max 280 \
       > "$dir/x-link.out" 2> "$dir/x-link.err" \
       || fail "path-safe legacy task ID could not link an X request"
+    # The merge records the head it binds from the task's worktree and runs the
+    # content guard there, so it needs the case's real copy.
+    sed "s#^worktree=.*#worktree=$dir/wt#" "$dir/home/state/$id.meta" > "$dir/meta.wt"
+    cat "$dir/meta.wt" > "$dir/home/state/$id.meta"
     run_merge_entry "$dir" "$id" https://github.com/o/r/pull/4 \
       > "$dir/merge.out" 2> "$dir/merge.err" \
-      || fail "path-safe legacy task ID could not use the PR merge flow"
+      || fail "path-safe legacy task ID could not use the PR merge flow: $(cat "$dir/merge.err")"
     fm_pr_poll_artifacts_valid "$dir/home/state" "$id" "$POLL" \
       || fail "path-safe legacy task ID did not publish an authenticated poll"
+    rm -rf "$dir/wt"
     FM_HOME="$dir/home" FM_ROOT_OVERRIDE="$ROOT" PATH="$dir/fakebin:$BASE_PATH" \
       "$TEARDOWN" "$id" --force > "$dir/teardown.out" 2> "$dir/teardown.err" \
-      || fail "legacy path-safe task ID could not be torn down"
+      || fail "legacy path-safe task ID could not be torn down: $(cat "$dir/teardown.err")"
     [ ! -e "$dir/home/state/$id.meta" ] || fail "legacy task teardown retained metadata"
   done
   pass "valid direct and merge flows record exact metadata and reject multiline head metadata"

@@ -2107,11 +2107,12 @@ test_distinct_merged_prs_keep_distinct_wakes() {
   rm -f "$case_dir/state/task-x1.check.sh" \
     "$case_dir/state/task-x1.pr-poll" \
     "$case_dir/state/task-x1.pr-poll-registration"
-  # Reused tasks re-bind through fm-pr-check before the next merge. Merge
-  # refuses a URL that is not the recorded pr=, so drop the first PR identity.
-  grep -vE '^(pr|pr_head)=' "$case_dir/state/task-x1.meta" \
-    > "$case_dir/state/task-x1.meta.rebind"
-  mv "$case_dir/state/task-x1.meta.rebind" "$case_dir/state/task-x1.meta"
+  # Reused tasks re-bind through fm-pr-check before the next merge, because
+  # merge refuses a URL that is not the recorded pr=; the first PR's proven
+  # merge is what lets the task take its next PR.
+  FM_TEST_HOME="$case_dir/home" run_pr_check "$case_dir" task-x1 "$second_url" \
+    >"$case_dir/rebind.out" 2>"$case_dir/rebind.err" \
+    || fail "distinct-merge-wakes: the second PR could not be recorded: $(cat "$case_dir/rebind.err")"
   FM_TEST_HOME="$case_dir/home" run_pr_merge "$case_dir" task-x1 "$second_url" \
     >"$case_dir/stdout-2" 2>"$case_dir/stderr-2" \
     || fail "distinct-merge-wakes: second merge failed"
@@ -2439,6 +2440,50 @@ test_gitea_prerequisites_and_extra_args_refuse_before_recording() {
   assert_no_grep "pr=" "$case_dir/state/task-x1.meta" "gitea-extra-arg: pr= was recorded for a refused merge"
   [ ! -s "$case_dir/tea.log" ] || fail "gitea-extra-arg: tea was invoked for a refused merge"
   pass "a Gitea merge without a unique login or with an unusable argument refuses before recording"
+}
+
+# A Gitea registration records no head, so the first merge attempt binds the
+# head it sees, and a later attempt at a different head is refused until the
+# pull request is recorded and presented again.
+test_gitea_first_merge_attempt_binds_the_head() {
+  local case_dir rc first moved
+  case_dir=$(make_gitea_case gitea-binds-first-head)
+  first=$(cat "$case_dir/gitea-head")
+  write_gitea_status_json "$case_dir/gitea-status.json" 'failure:CI / build'
+  rc=$(run_gitea_merge "$case_dir")
+  expect_code 1 "$rc" "gitea-binds-first-head: a red status must refuse the first attempt"
+  assert_grep "pr_head=$first" "$case_dir/state/task-x1.meta" \
+    "gitea-binds-first-head: the first attempt did not bind the head it saw"
+  assert_grep "pr_head=$first" "$case_dir/state/task-x1.pr-binding" \
+    "gitea-binds-first-head: the binding record does not hold the first head"
+  moved=$(real_head "$case_dir" eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee)
+  printf '%s\n' "$moved" > "$case_dir/gitea-head"
+  write_gitea_pr_json "$case_dir/gitea-pr.json"
+  write_gitea_status_json "$case_dir/gitea-status.json" 'success:CI / build'
+  rc=$(run_gitea_merge "$case_dir")
+  expect_code 1 "$rc" "gitea-binds-first-head: a moved head must refuse"
+  assert_grep "its head is $moved, but the head recorded for approval is $first" "$case_dir/stderr" \
+    "gitea-binds-first-head: the refusal did not name both heads"
+  assert_absent "$case_dir/gitea-merge-body" "gitea-binds-first-head: a merge request was sent"
+  pass "fm-pr-merge binds a Gitea merge to the head its first attempt saw"
+}
+
+test_gitea_merge_passes_the_content_guard() {
+  local case_dir rc now
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  case_dir=$(make_gitea_case gitea-content-guard)
+  write_gitea_pr_json "$case_dir/gitea-pr.json" "created=$now"
+  rc=$(run_gitea_merge "$case_dir")
+  expect_code 1 "$rc" "gitea-content-guard: a fresh unreviewed pull request with no required check must refuse"
+  assert_grep 'young-unreviewed: it is' "$case_dir/stderr" "gitea-content-guard: the guard was not named"
+  assert_grep 'content: 1 file changed, 1 insertion(+) against origin/main' "$case_dir/stderr" \
+    "gitea-content-guard: the diff stat against origin/main was not printed"
+  assert_absent "$case_dir/gitea-merge-body" "gitea-content-guard: a merge request was sent"
+  printf '%s\n' '{"enable_status_check":true,"status_check_contexts":["CI / build"]}' \
+    > "$case_dir/gitea-protection.json"
+  rc=$(run_gitea_merge "$case_dir")
+  expect_code 0 "$rc" "gitea-content-guard: a required check must quiet the young-unreviewed guard ($(cat "$case_dir/stderr"))"
+  pass "fm-pr-merge runs the content guard on a Gitea pull request"
 }
 
 # --- Binding to the recorded content and the content guard -----------------
@@ -3598,7 +3643,8 @@ test_away_record_does_not_bypass_red_or_identity() {
   case_dir=$(make_case pr-identity-mismatch)
   mkdir -p "$case_dir/wt"
   add_gh_mocks "$case_dir" "$head"
-  printf '\npr=https://github.com/example/repo/pull/99\n' >> "$case_dir/state/task-x1.meta"
+  run_pr_check "$case_dir" task-x1 https://github.com/example/repo/pull/99 >/dev/null 2>&1 \
+    || fail "pr-identity: the first PR could not be recorded"
   set +e
   run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/85 \
     > "$case_dir/stdout" 2> "$case_dir/stderr"
@@ -3862,3 +3908,5 @@ test_mass_deletion_from_a_merge_resolution_refuses
 test_young_unreviewed_pr_refuses_without_required_checks
 test_content_guard_that_cannot_run_refuses
 test_allow_content_arguments_are_strict
+test_gitea_first_merge_attempt_binds_the_head
+test_gitea_merge_passes_the_content_guard
