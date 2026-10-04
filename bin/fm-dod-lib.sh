@@ -244,6 +244,18 @@ fm_ask_user_escalation_block() {  # <data-dir> <task-id>
 EOF
 }
 
+# Integration rules for a PR-based ship: the branch is brought up to a freshly
+# fetched origin/<base> by merging, conflicts are resolved on their merits, and
+# the PR body carries the diff stat against origin/<base>, so the content
+# presented for merge is what the branch really changes.
+fm_dod_integration_block() {
+  cat <<'EOF'
+Before you open or update the PR, run `git fetch origin` and merge `origin/<base>` (the PR's base branch, normally the default branch) into your branch; never integrate a local base branch or any other ref that was not just fetched, and never rebuild the branch from an older snapshot (`git commit-tree`, or `reset --hard` onto the base followed by cherry-picks).
+Resolve each conflict hunk on its merits: never take one side wholesale (`checkout --ours/--theirs`, `-X ours/theirs`, `-s ours`) or rewrite conflict markers with a script, and list each conflicted file and how you resolved it in the PR body.
+Put the diff stat against `origin/<base>` (`git diff --stat origin/<base>...HEAD`, after the fetch) in the PR body, and update it whenever you push again.
+EOF
+}
+
 fm_dod_block() {  # <mode> <task-id>
   local mode=$1 id=$2
   case "$mode" in
@@ -253,6 +265,9 @@ fm_dod_block() {  # <mode> <task-id>
 Delivery contract: mode=direct-PR
 This task ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
+EOF
+      fm_dod_integration_block
+      cat <<EOF
 When it is implemented and committed, push your branch and open a PR with \`gh-axi\` that is ready for review, not a draft.
 Before you report done, read the PR back from the forge and confirm it is not a draft (\`gh pr view <url> --json isDraft\` must print false); if it is a draft, mark it ready with \`gh-axi pr ready\`.
 A draft cannot be merged, so a done report on one leaves the merge unasked.
@@ -279,6 +294,10 @@ Delivery contract: mode=no-mistakes
 The task is complete only when committed on your branch.
 When you believe it is complete, append \`done [at=<epoch>]: {summary}\` to the status file and stop.
 Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
+Before that handoff, and before any later pipeline run that updates the PR, apply these integration rules to your branch:
+EOF
+      fm_dod_integration_block
+      cat <<EOF
 
 You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
@@ -305,7 +324,7 @@ Two firstmate-specific rules layer on top of that guidance:
 - NEVER pass \`--yes\` (or \`-y\`) to \`no-mistakes axi run\` or \`no-mistakes axi respond\`. It is banned fleet-wide.
   It auto-resolves every gate including ask-user findings with no escalation, and answering your own ask-user finding is a hard rule violation.
 
-After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), read the PR back from the forge and confirm it is not a draft (\`gh pr view <url> --json isDraft\` must print false); if it is a draft, mark it ready with \`gh-axi pr ready\`.
+After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), make sure the PR body carries the diff stat and conflict list above (add them with \`gh-axi\` if the pipeline's body lacks them), then read the PR back from the forge and confirm it is not a draft (\`gh pr view <url> --json isDraft\` must print false); if it is a draft, mark it ready with \`gh-axi pr ready\`.
 A draft cannot be merged, so a done report on one leaves the merge unasked.
 Then append \`done [at=<epoch>]: PR {url} checks green\` and stop. You are finished.
 If you deliberately keep the PR a draft, append \`paused [at=<epoch>]: {why the draft is held}\` instead of done.

@@ -221,6 +221,33 @@ test_ship_modes_generate_clean_briefs() {
   pass "fm-brief.sh: no-mistakes/direct-PR/local-only briefs generate cleanly"
 }
 
+# A PR-based ship integrates a freshly fetched origin/<base>, never takes one
+# side of a conflict wholesale, and carries its diff stat in the PR body; a
+# local-only ship lands on local main and opens no PR.
+test_pr_based_briefs_require_fresh_base_integration() {
+  local home id mode brief status
+  home="$TMP_ROOT/integration-home"
+  write_registry "$home"
+  for id_mode in "brief-integrate-b1:no-mistakes" "brief-integrate-b2:direct-PR" "brief-integrate-b3:local-only"; do
+    id=${id_mode%%:*}
+    mode=${id_mode##*:}
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$mode" >/dev/null 2>&1; status=$?
+    expect_code 0 "$status" "fm-brief.sh $id --mode $mode should exit 0"
+    brief="$home/data/$id/brief.md"
+    if [ "$mode" = local-only ]; then
+      # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+      assert_no_grep 'merge `origin/<base>`' "$brief" "$id: a local-only brief must not ask for a PR integration"
+      continue
+    fi
+    # shellcheck disable=SC2016
+    assert_grep 'run `git fetch origin` and merge `origin/<base>`' "$brief" "$id: brief must require merging a fetched origin/<base>"
+    assert_grep 'never take one side wholesale' "$brief" "$id: brief must forbid one-side conflict resolution"
+    # shellcheck disable=SC2016
+    assert_grep 'Put the diff stat against `origin/<base>`' "$brief" "$id: brief must require the diff stat in the PR body"
+  done
+  pass "fm-brief.sh: PR-based briefs require a fresh origin/<base> merge, per-hunk conflict resolution, and a diff stat in the PR body"
+}
+
 # A ship task's delivery mode is firstmate's per-task decision, so a missing or
 # unusable value must stop the scaffold instead of silently defaulting. The
 # no-mistakes-prod-only row is the conditional registry policy: it is never a task
@@ -1087,3 +1114,4 @@ test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
 test_scout_lavish_line_follows_presentation_floor
 test_home_brief_include_is_appended_last
+test_pr_based_briefs_require_fresh_base_integration
