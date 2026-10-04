@@ -442,6 +442,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/history-guard.md",
+      "audience": "maintainer-architecture"
+    },
+    {
       "path": "docs/jev-guards.md",
       "audience": "maintainer-architecture"
     },
