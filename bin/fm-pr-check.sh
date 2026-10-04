@@ -14,7 +14,25 @@
 # draft state does not refuse, matching how the head read below is optional.
 # bin/fm-pr-merge.sh records through this script with FM_PR_CHECK_MERGE=1 and
 # skips this refusal, because its own merge-time draft refusal is authoritative.
-# Usage: fm-pr-check.sh <task-id> <pr-url>
+#
+# This script is the only writer of a task's PR binding: pr=, pr_head=, and the
+# integrity record bin/fm-pr-binding-lib.sh owns, which also keeps the head's
+# tree when the worktree has it. A binding is what merge authority applies to,
+# so it changes only here and never by hand.
+# Re-recording the same PR at a moved head is allowed and prints a notice that
+# the changed PR has to be presented to the captain again, with its diff stat
+# (bin/fm-review-diff.sh <id> --stat), before any merge.
+# Replacing a bound PR with a different one is refused unless the bound PR's
+# merge is proven, or --rebind "<reason>" is passed; --rebind records that
+# reason and is attended-only, refused while the away-posture record exists,
+# because a different PR needs the captain's fresh approval. An unreadable
+# binding record is replaced only under --rebind as well.
+# At merge time (FM_PR_CHECK_MERGE=1) an existing binding for the same PR is
+# kept exactly as recorded, never refreshed to the live head, so the merge
+# stays bound to the content that was presented; with no binding yet, the
+# merge-time record binds the head the forge reports now. A merge-time record
+# never rebinds.
+# Usage: fm-pr-check.sh <task-id> <pr-url> [--rebind <reason>]
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,11 +46,26 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-parent-channel-lib.sh
 . "$SCRIPT_DIR/fm-parent-channel-lib.sh"
+# shellcheck source=bin/fm-pr-binding-lib.sh
+. "$SCRIPT_DIR/fm-pr-binding-lib.sh"
+# shellcheck source=bin/fm-afk-contract.sh
+. "$SCRIPT_DIR/fm-afk-contract.sh"
 
-if [ "$#" -ne 2 ]; then
-  echo "error: invalid PR check request" >&2
-  exit 2
-fi
+REBIND_REASON=
+case "$#" in
+  2) ;;
+  4)
+    if [ "$3" != --rebind ] || [ -z "$(fm_pr_binding_clean_reason "$4" | tr -d ' ')" ]; then
+      echo "error: invalid PR check request; --rebind requires a non-empty reason" >&2
+      exit 2
+    fi
+    REBIND_REASON=$(fm_pr_binding_clean_reason "$4")
+    ;;
+  *)
+    echo "error: invalid PR check request" >&2
+    exit 2
+    ;;
+esac
 ID=$1
 RAW_URL=$2
 if ! fm_pr_task_id_valid "$ID" || ! fm_pr_url_parse "$RAW_URL"; then
@@ -59,6 +92,67 @@ fm_pr_poll_retirement_recover_one "$STATE" "$ID" "$SCRIPT_DIR/fm-pr-poll.sh" || 
   echo "error: pending PR poll retirement could not be validated" >&2
   exit 1
 }
+
+# The binding this record would replace, from the integrity record when there
+# is one and from a legacy pr= line otherwise. The header owns when a different
+# PR may replace it.
+BINDING_READABLE=1
+fm_pr_binding_read "$STATE" "$ID" || BINDING_READABLE=0
+PRIOR_BINDING_PRESENT=$FM_PR_BINDING_PRESENT
+PRIOR_URL=$FM_PR_BINDING_URL
+PRIOR_HEAD=$FM_PR_BINDING_HEAD
+PRIOR_TREE=$FM_PR_BINDING_TREE
+if [ "$BINDING_READABLE" -eq 1 ] && [ "$PRIOR_BINDING_PRESENT" -eq 0 ]; then
+  PRIOR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
+  PRIOR_HEAD=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2- || true)
+fi
+BINDING_REASON=ready
+[ "${FM_PR_CHECK_MERGE:-}" != 1 ] || BINDING_REASON=merge
+binding_prior_merged() {
+  ( fm_pr_url_parse "$PRIOR_URL" \
+    && fm_pr_poll_merge_already_notified "$STATE" "$ID" \
+      "$FM_PR_PROVIDER" "$FM_PR_HOST" "$FM_PR_PATH" "$FM_PR_NUMBER" )
+}
+if [ "$BINDING_READABLE" -eq 0 ] || { [ -n "$PRIOR_URL" ] && [ "$PRIOR_URL" != "$URL" ] && ! binding_prior_merged; }; then
+  if [ "$BINDING_READABLE" -eq 0 ]; then
+    PRIOR_DESC="an unreadable binding record"
+  else
+    PRIOR_DESC=$PRIOR_URL
+  fi
+  if [ "${FM_PR_CHECK_MERGE:-}" = 1 ]; then
+    echo "error: task $ID is bound to $PRIOR_DESC, not $URL; a merge never rebinds a task" >&2
+    exit 1
+  fi
+  if [ -z "$REBIND_REASON" ]; then
+    echo "error: task $ID is bound to $PRIOR_DESC, which has not merged; binding it to $URL changes the content the captain approves - present $URL and its diff stat to the captain, then pass --rebind \"<reason>\"" >&2
+    exit 1
+  fi
+  if fm_afk_contract_present "$STATE"; then
+    echo "error: --rebind is attended-only; while the away-posture record exists a task is never bound to a different PR" >&2
+    exit 2
+  fi
+  BINDING_REASON="rebind from $PRIOR_DESC: $REBIND_REASON"
+elif [ -n "$PRIOR_URL" ] && [ "$PRIOR_URL" != "$URL" ]; then
+  BINDING_REASON="next PR after $PRIOR_URL merged"
+elif [ -n "$REBIND_REASON" ]; then
+  echo "error: --rebind applies only when replacing a different, unmerged PR binding" >&2
+  exit 2
+elif [ "$PRIOR_BINDING_PRESENT" -eq 1 ] && [ "${FM_PR_CHECK_MERGE:-}" != 1 ]; then
+  BINDING_REASON=re-recorded
+fi
+# A merge-time record keeps an existing binding for the same PR exactly as it
+# was recorded and presented.
+# A Gitea binding records no head when the PR is registered (see below), so its
+# first merge-time record binds the head the forge reports then, and later
+# merge attempts are held to that head.
+KEEP_BINDING=0
+if [ "${FM_PR_CHECK_MERGE:-}" = 1 ] && [ "$PRIOR_BINDING_PRESENT" -eq 1 ] && [ "$PRIOR_URL" = "$URL" ]; then
+  if [ "$PROVIDER" = gitea ] && [ -z "$PRIOR_HEAD" ]; then
+    BINDING_REASON="merge-time head for $URL"
+  else
+    KEEP_BINDING=1
+  fi
+fi
 
 # Refuse to arm a GitLab watch with no glab on PATH. The poll is silent on
 # every error by design, so a missing CLI would be indistinguishable from a
@@ -106,18 +200,39 @@ fi
 # firstmate does not require, so a GitLab task records no pr_head. tea does
 # expose it, but only over the network, which would make arming a Gitea watch
 # wait on a self-hosted instance that is routinely unreachable, so a Gitea task
-# records none either. Both consumers already treat it as optional:
+# records none either at registration; a merge-time record, which already needs
+# the instance, reads it through the host's one tea login instead. Both
+# consumers already treat it as optional:
 # bin/fm-teardown.sh reads the head from the forge at teardown rather than from
 # metadata and falls back to its provider-agnostic content check, and
 # bin/fm-review-diff.sh resolves the head from the remote when none is recorded.
-# bin/fm-pr-merge.sh reads a GitLab head live at merge time for the same reason,
-# and treats a recorded value that disagrees as stale rather than authoritative.
+# bin/fm-pr-merge.sh reads a GitLab head live at merge time and binds a GitLab
+# merge by identity only.
 WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
 PR_HEAD=
-if [ "$PROVIDER" = github ] && [ -n "$WT" ] && [ -d "$WT" ] && command -v gh >/dev/null 2>&1; then
+PR_TREE=
+if [ "$KEEP_BINDING" -eq 1 ]; then
+  PR_HEAD=$PRIOR_HEAD
+  PR_TREE=$PRIOR_TREE
+elif [ "$PROVIDER" = github ] && [ -n "$WT" ] && [ -d "$WT" ] && command -v gh >/dev/null 2>&1; then
   if REMOTE_HEAD=$(cd "$WT" && gh pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null) \
     && fm_pr_head_valid "$REMOTE_HEAD"; then
     PR_HEAD=$REMOTE_HEAD
+    # The tree is recorded only when this copy already has the head; a binding
+    # without one is still bound by its head.
+    PR_TREE=$(git -C "$WT" rev-parse --verify --quiet "$PR_HEAD^{tree}" 2>/dev/null || true)
+    fm_pr_head_valid "$PR_TREE" || PR_TREE=
+  fi
+elif [ "$PROVIDER" = gitea ] && [ "${FM_PR_CHECK_MERGE:-}" = 1 ] && command -v jq >/dev/null 2>&1; then
+  # Honored only when the answer describes exactly this pull request, because
+  # tea resolves the instance from its login rather than from the URL.
+  if REMOTE_HEAD=$(tea api --login "$GITEA_LOGIN" "/repos/$FM_PR_OWNER/$FM_PR_REPO/pulls/$NUMBER" 2>/dev/null       | jq -r --arg url "$URL" 'if type == "object" and .html_url == $url then (.head.sha // "") else empty end' 2>/dev/null) \
+    && fm_pr_head_valid "$REMOTE_HEAD"; then
+    PR_HEAD=$REMOTE_HEAD
+    if [ -n "$WT" ] && [ -d "$WT" ]; then
+      PR_TREE=$(git -C "$WT" rev-parse --verify --quiet "$PR_HEAD^{tree}" 2>/dev/null || true)
+      fm_pr_head_valid "$PR_TREE" || PR_TREE=
+    fi
   fi
 fi
 
@@ -174,8 +289,17 @@ fm_pr_metadata_identity_parse "$META" || exit 1
 [ "$FM_PR_META_PROVIDER" = "$PROVIDER" ] && [ "$FM_PR_META_URL" = "$URL" ] \
   && [ "$FM_PR_META_HOST" = "$HOST" ] && [ "$FM_PR_META_PATH" = "$PROJECT_PATH" ] \
   && [ "$FM_PR_META_NUMBER" = "$NUMBER" ] || exit 1
+if [ "$KEEP_BINDING" -eq 0 ]; then
+  fm_pr_binding_write "$STATE" "$ID" "$URL" "$PR_HEAD" "$PR_TREE" "$BINDING_REASON" \
+    || { echo "error: could not record the PR binding for task $ID" >&2; exit 1; }
+fi
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
+if [ "$KEEP_BINDING" -eq 0 ] && [ -n "$PRIOR_URL" ] \
+  && { [ "$PRIOR_URL" != "$URL" ] || [ "$PRIOR_HEAD" != "$PR_HEAD" ]; }; then
+  printf 'notice: task %s is now bound to %s at head %s (was %s at head %s); present the changed PR and its diff stat (bin/fm-review-diff.sh %s --stat) to the captain before any merge\n' \
+    "$ID" "$URL" "${PR_HEAD:-<unrecorded>}" "$PRIOR_URL" "${PRIOR_HEAD:-<unrecorded>}" "$ID" >&2
+fi
 
 PR_POLL_PUBLISH_LOCK="$STATE/.pr-poll-publish-$ID.lock"
 fm_lock_acquire_wait "$PR_POLL_PUBLISH_LOCK"

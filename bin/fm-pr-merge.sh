@@ -61,9 +61,7 @@
 # exact current head commit. Every failing condition is reported, not just the
 # first. The verified head is then passed to glab as --sha, so a push that lands
 # between that read and the merge fails the merge instead of landing commits
-# nothing verified. A recorded pr_head that disagrees with the live head is
-# reported rather than trusted, because a rebase moves the head and leaves the
-# recorded value stale. Reading that state needs glab and jq, and either one
+# nothing verified. Reading that state needs glab and jq, and either one
 # absent stops the merge before any state is recorded.
 #
 # A Gitea pull request is merged through tea's authenticated API, because tea
@@ -107,6 +105,30 @@
 # retains the lock until the accepted merge authority is persisted against the
 # still-matching task metadata.
 #
+# Merge authority is bound to the content that was recorded and presented.
+# bin/fm-pr-check.sh is the only writer of a task's binding (pr=, pr_head=, and
+# the integrity record bin/fm-pr-binding-lib.sh owns), so before anything is
+# recorded a metadata binding that disagrees with that record, or one with no
+# record at all, is refused as hand-edited. A GitHub or Gitea merge is then
+# bound to the recorded head: a live head that differs, a tree that differs from
+# the recorded tree, or a binding with no recorded head is refused until
+# bin/fm-pr-check.sh records the pull request again and the changed pull
+# request, with its diff stat, is presented to the captain again. A first
+# merge-time record binds the head the forge reports at that moment, which for
+# Gitea is always the first merge attempt, because a Gitea registration records
+# no head. GitLab has no recorded head at all, so a GitLab merge is bound by
+# identity only.
+#
+# A GitHub or Gitea merge also passes the content guard bin/fm-merge-guard-lib.sh owns:
+# it prints the diff stat against a freshly fetched origin/<base>, records it in
+# state/<task-id>.merge-guard, and refuses on any guard that lib names - a
+# stale tree, deleted migrations or tests, mass deletion, a young unreviewed
+# pull request on a base that requires no check, or a guard that could not run.
+# An attended --allow-content <guard> waives exactly that named guard, may be
+# repeated once per guard, is refused while the away-posture record exists like
+# --allow-red, and is passed only when the captain names the guard. It never
+# waives the head binding.
+#
 # Extra args must not include --repo or -R in any form, including a bundled
 # short-option cluster such as -yR, because the repository comes only from the
 # URL, nor --sha or --match-head-commit because the head comes only from the
@@ -119,7 +141,7 @@
 # explicit captain instruction and never skips the live green check, the
 # away-record read, or a captain hold.
 #
-# Usage: fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check-name>] [-- <extra forge merge args>]
+# Usage: fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check-name>] [--allow-content <guard>]... [-- <extra forge merge args>]
 #
 # On GitLab, this script confirms the MR is actually merged before reporting it;
 # an auto-merge-queued or unconfirmed request leaves the poll armed and records
@@ -144,6 +166,10 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-merge-authority-lib.sh"
 # shellcheck source=bin/fm-afk-contract.sh
 . "$SCRIPT_DIR/fm-afk-contract.sh"
+# shellcheck source=bin/fm-pr-binding-lib.sh
+. "$SCRIPT_DIR/fm-pr-binding-lib.sh"
+# shellcheck source=bin/fm-merge-guard-lib.sh
+. "$SCRIPT_DIR/fm-merge-guard-lib.sh"
 
 if [ "$#" -lt 2 ]; then
   echo "error: invalid PR merge request" >&2
@@ -177,6 +203,7 @@ PROJECT_URL="https://$FM_PR_HOST/$FM_PR_PATH"
 shift 2
 ATTENDED_OVERRIDE=false
 ALLOW_RED=()
+ALLOW_CONTENT=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --attended-override)
@@ -197,12 +224,29 @@ while [ "$#" -gt 0 ]; do
       echo "error: --allow-red requires a separate check name argument" >&2
       exit 2
       ;;
+    --allow-content)
+      fm_merge_guard_name_valid "${2:-}" \
+        || { echo "error: --allow-content requires one guard name: $FM_MERGE_GUARD_NAMES" >&2; exit 2; }
+      case " ${ALLOW_CONTENT[*]-} " in
+        *" $2 "*) echo "error: --allow-content $2 may be specified only once" >&2; exit 2 ;;
+      esac
+      ALLOW_CONTENT+=("$2")
+      shift 2
+      ;;
+    --allow-content=*)
+      echo "error: --allow-content requires a separate guard name argument" >&2
+      exit 2
+      ;;
     --) shift; break ;;
     *) break ;;
   esac
 done
 if [ "${#ALLOW_RED[@]}" -gt 0 ] && [ "$PROVIDER" = gitlab ]; then
   echo "error: --allow-red does not apply to GitLab, where a merge already requires the head pipeline to have succeeded" >&2
+  exit 2
+fi
+if [ "${#ALLOW_CONTENT[@]}" -gt 0 ] && [ "$PROVIDER" = gitlab ]; then
+  echo "error: --allow-content does not apply to GitLab, where the content guard does not run" >&2
   exit 2
 fi
 
@@ -462,13 +506,6 @@ if [ "$PROVIDER" = gitea ]; then
   fi
 fi
 
-# The recorded head is read before bin/fm-pr-check.sh rewrites the metadata,
-# because that script re-records pr= and drops a pr_head= it cannot resolve.
-RECORDED_HEAD=
-if [ "$PROVIDER" = gitlab ]; then
-  RECORDED_HEAD=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2- || true)
-fi
-
 # Pre-merge conditions for a GitLab merge request, read from one live view of
 # the merge request. Sets FM_PR_MERGE_HEAD to the verified head on success and
 # returns non-zero after reporting every condition that failed.
@@ -537,13 +574,6 @@ FIELDS
     echo "error: could not read the GitLab merge request head commit before merging" >&2
     return 1
   fi
-  # A rebase moves the head and leaves the recorded value behind, so the
-  # disagreement is reported and the live head is what gets verified and merged.
-  if [ -n "$RECORDED_HEAD" ] && [ "$RECORDED_HEAD" != "$live_head" ]; then
-    printf 'notice: recorded head %s disagrees with the live head %s; verifying the live head\n' \
-      "$RECORDED_HEAD" "$live_head" >&2
-  fi
-
   [ "$state" = opened ] \
     || refusals="$refusals  - state is \"${state:-unreadable}\", not open
 "
@@ -652,14 +682,36 @@ github_checks_not_green() {
   ' 2>/dev/null || return 1
 }
 
+# How many status checks the base branch requires, from its classic branch
+# protection and its active ruleset rules. It feeds only the content guard's
+# young-unreviewed check, so any read that fails counts as none required, which
+# leaves that guard able to fire rather than silently quiet.
+github_required_check_count() {  # <base>
+  local base=$1 branch_path classic=0 rules=0
+  branch_path=$(github_urlencode_path_segment "$base")
+  classic=$(gh api "repos/$PR_OWNER/$PR_REPO/branches/$branch_path" 2>/dev/null | jq -r '
+      if type == "object" and .protected == true
+        and (.protection.required_status_checks | type) == "object" then
+        [((.protection.required_status_checks.contexts // [])[]),
+         ((.protection.required_status_checks.checks // [])[] | .context)] | unique | length
+      else 0 end' 2>/dev/null) || classic=0
+  rules=$(gh api --paginate "repos/$PR_OWNER/$PR_REPO/rules/branches/$branch_path" 2>/dev/null | jq -rs '
+      [ .[] | if type == "array" then .[] else empty end
+        | select(type == "object" and .type == "required_status_checks")
+        | (.parameters.required_status_checks // [])[] | .context ] | unique | length' 2>/dev/null) || rules=0
+  case "$classic" in ''|*[!0-9]*) classic=0 ;; esac
+  case "$rules" in ''|*[!0-9]*) rules=0 ;; esac
+  printf '%s' "$((classic + rules))"
+}
+
 # Pre-merge conditions for a GitHub pull request, read from one live view.
 # Sets FM_PR_MERGE_HEAD to the verified head on success.
 github_verify_mergeable() {
   local json fields line red name covered
   local total=0 named=0 refusals=''
-  local state='' draft='' mergeable='' merge_state='' live_head='' base=''
+  local state='' draft='' mergeable='' merge_state='' live_head='' base='' created='' reviews=''
 
-  if ! json=$(gh pr view "$URL" --json state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefName,statusCheckRollup 2>/dev/null) \
+  if ! json=$(gh pr view "$URL" --json state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefName,createdAt,reviews,statusCheckRollup 2>/dev/null) \
     || [ -z "$json" ]; then
     echo "error: could not read the GitHub pull request state before merging" >&2
     return 1
@@ -670,7 +722,9 @@ github_verify_mergeable() {
         "mergeable=" + ((.mergeable // "") | tostring),
         "merge_state=" + ((.mergeStateStatus // "") | tostring),
         "head=" + ((.headRefOid // "") | tostring),
-        "base=" + ((.baseRefName // "") | tostring)
+        "base=" + ((.baseRefName // "") | tostring),
+        "created=" + ((.createdAt // "") | (try fromdateiso8601 catch "") | tostring),
+        "reviews=" + (if (.reviews | type) == "array" then (.reviews | length | tostring) else "" end)
       else
         error("pull request payload is not an object")
       end' 2>/dev/null); then
@@ -685,13 +739,15 @@ github_verify_mergeable() {
       merge_state=*) merge_state=${line#merge_state=} ;;
       head=*) live_head=${line#head=} ;;
       base=*) base=${line#base=} ;;
+      created=*) created=${line#created=} ;;
+      reviews=*) reviews=${line#reviews=} ;;
       *) continue ;;
     esac
     named=$((named + 1))
   done <<FIELDS
 $fields
 FIELDS
-  if [ "$named" -ne 5 ] || [ "$total" -ne 5 ] || [ -z "$base" ]; then
+  if [ "$named" -ne 7 ] || [ "$total" -ne 7 ] || [ -z "$base" ]; then
     echo "error: could not read the GitHub pull request state before merging" >&2
     return 1
   fi
@@ -751,6 +807,9 @@ EOF
     "$URL" "$live_head" >&2
   FM_PR_MERGE_HEAD=$live_head
   FM_PR_GITHUB_BASE=$base
+  FM_PR_GITHUB_CREATED_EPOCH=$created
+  FM_PR_GITHUB_REVIEWS=$reviews
+  FM_PR_GITHUB_REQUIRED_COUNT=$(github_required_check_count "$base")
 }
 
 # Read one live GitHub pull request view after gh returns. The selected
@@ -763,6 +822,9 @@ FM_PR_GITHUB_MERGED=
 FM_PR_GITHUB_QUEUED=
 FM_PR_GITHUB_BASE=
 FM_PR_GITHUB_QUEUE_OBSERVED=false
+FM_PR_GITHUB_CREATED_EPOCH=
+FM_PR_GITHUB_REVIEWS=
+FM_PR_GITHUB_REQUIRED_COUNT=
 github_read_outcome_with_gh() {
   local fields line
   local total=0 named=0
@@ -1020,6 +1082,10 @@ require_current_away_authority() {
     echo "error: --allow-red is attended-only; while the away-posture record exists the green check is absolute" >&2
     return 2
   fi
+  if [ "$FM_PR_AWAY_POSTURE" = true ] && [ "${#ALLOW_CONTENT[@]}" -gt 0 ]; then
+    echo "error: --allow-content is attended-only; while the away-posture record exists the content guard is absolute" >&2
+    return 2
+  fi
 }
 
 persist_accepted_merge_authority() {
@@ -1059,6 +1125,94 @@ refuse_github_queue_while_away() {
   [ "$FM_PR_GITHUB_QUEUE_STATUS" = none ] && return 0
   echo "error: GitHub merge refused while away because the base branch's merge-queue state does not prove an immediate merge; nothing was handed to the forge" >&2
   return 2
+}
+
+# The binding in the task metadata must be exactly the one bin/fm-pr-check.sh
+# recorded (bin/fm-pr-binding-lib.sh); a hand-edited binding is refused before
+# anything is recorded or read from the forge.
+require_intact_pr_binding() {
+  fm_pr_binding_meta_check "$STATE" "$ID" "$META" && return 0
+  printf 'error: refusing to merge %s: %s; record the pull request with bin/fm-pr-check.sh, present it and its diff stat to the captain, and merge only on fresh approval\n' \
+    "$URL" "$FM_PR_BINDING_ERROR" >&2
+  return 1
+}
+
+BOUND_HEAD=
+BOUND_TREE=
+read_merge_binding() {
+  if ! fm_pr_binding_read "$STATE" "$ID" || [ "$FM_PR_BINDING_PRESENT" -ne 1 ] \
+    || [ "$FM_PR_BINDING_URL" != "$URL" ]; then
+    echo "error: refusing to merge $URL: its PR binding could not be read back after recording" >&2
+    return 1
+  fi
+  BOUND_HEAD=$FM_PR_BINDING_HEAD
+  BOUND_TREE=$FM_PR_BINDING_TREE
+}
+
+# The live head must be the recorded head the captain was shown.
+require_bound_head() {
+  if [ -z "$BOUND_HEAD" ]; then
+    printf 'error: refusing to merge %s: no head was recorded for it, so there is no approved content to bind the merge to; record it with bin/fm-pr-check.sh where its head is readable, present it and its diff stat to the captain, and merge only on fresh approval\n' \
+      "$URL" >&2
+    return 1
+  fi
+  [ "$BOUND_HEAD" = "$FM_PR_MERGE_HEAD" ] && return 0
+  printf 'error: refusing to merge %s: its head is %s, but the head recorded for approval is %s; record it again with bin/fm-pr-check.sh, present the changed pull request and its diff stat (bin/fm-review-diff.sh %s --stat) to the captain, and merge only on fresh approval\n' \
+    "$URL" "$FM_PR_MERGE_HEAD" "$BOUND_HEAD" "$ID" >&2
+  return 1
+}
+
+# The content guard (bin/fm-merge-guard-lib.sh) on the verified head. Prints
+# and records the diff stat, then refuses on every guard that fired and was not
+# waived by name.
+run_content_guard() {  # <base> <forge-head-ref> <created-epoch> <review-count> <required-check-count>
+  local base=$1 forge_ref=$2 created=$3 reviews=$4 required=$5
+  local wt branch hint hits='' young line name waived='' unwaived='' verdict=pass
+  wt=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
+  branch=$(grep '^branch=' "$META" | tail -1 | cut -d= -f2- || true)
+  [ -n "$branch" ] || branch="fm/$ID"
+  if fm_merge_guard_fetch "$wt" "$base" "$FM_PR_MERGE_HEAD" \
+      "$forge_ref" "refs/fm-merge-guard/$ID/head"; then
+    hint=$(fm_merge_guard_branch_origin "$wt" "$branch")
+    fm_merge_guard_analyze "$wt" "$base" "$FM_PR_MERGE_HEAD" "$hint" || true
+  fi
+  if [ -n "$FM_MERGE_GUARD_ERROR" ]; then
+    hits="unavailable: $FM_MERGE_GUARD_ERROR"
+  else
+    hits=$FM_MERGE_GUARD_HITS
+    if [ -n "$BOUND_TREE" ] && [ "$BOUND_TREE" != "$FM_MERGE_GUARD_TREE" ]; then
+      printf 'error: refusing to merge %s: head %s has tree %s, but the tree recorded for approval is %s\n' \
+        "$URL" "$FM_PR_MERGE_HEAD" "$FM_MERGE_GUARD_TREE" "$BOUND_TREE" >&2
+      return 1
+    fi
+    printf 'content: %s against origin/%s at %s for head %s\n' \
+      "$FM_MERGE_GUARD_SHORTSTAT" "$base" "$FM_MERGE_GUARD_BASE_SHA" "$FM_PR_MERGE_HEAD" >&2
+    [ -z "$FM_MERGE_GUARD_STAT" ] || printf '%s\n' "$FM_MERGE_GUARD_STAT" | sed 's/^/content: /' >&2
+  fi
+  young=$(fm_merge_guard_young_unreviewed "$created" "${reviews:-0}" "${required:-0}" "$(date +%s)")
+  [ -z "$young" ] || hits="${hits:+$hits
+}young-unreviewed: $young"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name=${line%%:*}
+    case " ${ALLOW_CONTENT[*]-} " in
+      *" $name "*) waived="${waived:+$waived }$name" ;;
+      *) unwaived="${unwaived:+$unwaived
+}$line" ;;
+    esac
+  done <<HITS
+$hits
+HITS
+  [ -z "$unwaived" ] || verdict=refused
+  fm_merge_guard_record "$STATE" "$ID" "$URL" "$FM_PR_MERGE_HEAD" "$base" \
+    "$verdict" "$hits" "$waived" \
+    || echo "warning: the content guard record for $URL could not be written" >&2
+  [ -z "$waived" ] || printf 'content: waived by the captain'"'"'s named override: %s\n' "$waived" >&2
+  [ -n "$unwaived" ] || return 0
+  printf 'error: refusing to merge %s: the content guard found\n' "$URL" >&2
+  printf '%s\n' "$unwaived" | sed 's/^/  - /' >&2
+  echo "error: present this diff stat and these findings to the captain; only the captain's explicit, attended instruction naming a guard permits --allow-content <guard>" >&2
+  return 1
 }
 
 require_recorded_pr_identity() {
@@ -1228,7 +1382,7 @@ gitea_api() {  # <endpoint> [<raw JSON body to POST>]
 GITEA_MERGE_STYLE=
 gitea_verify_mergeable() {
   local fields line total=0 named=0 refusals=''
-  local url='' state='' merged='' draft='' mergeable='' live_head=''
+  local url='' state='' merged='' draft='' mergeable='' live_head='' base='' created=''
   local statuses status_sha='' red='' context name waived
 
   if ! gitea_api "/repos/$PR_OWNER/$PR_REPO/pulls/$PR_NUMBER" || [ "$GITEA_HTTP_STATUS" != 200 ]; then
@@ -1242,7 +1396,15 @@ gitea_verify_mergeable() {
         "merged=" + (.merged | tostring),
         "draft=" + (.draft | tostring),
         "mergeable=" + (.mergeable | tostring),
-        "head=" + ((.head.sha // "") | tostring)
+        "head=" + ((.head.sha // "") | tostring),
+        "base=" + ((.base.ref // "") | tostring),
+        "created=" + ((.created_at // "") | tostring
+          | (try (if test("Z$") then sub("\\.[0-9]+"; "") | fromdateiso8601
+                  else capture("^(?<t>[^.+-]*-[^.+-]*-[^.+-]*)(\\.[0-9]+)?(?<s>[+-])(?<h>[0-9]{2}):(?<m>[0-9]{2})$")
+                    | ((.t + "Z") | fromdateiso8601)
+                      - ((if .s == "+" then 1 else -1 end) * ((.h | tonumber) * 3600 + (.m | tonumber) * 60))
+                  end) catch "")
+          | tostring)
       else
         error("pull request payload is not an object")
       end' 2>/dev/null); then
@@ -1258,13 +1420,15 @@ gitea_verify_mergeable() {
       draft=*) draft=${line#draft=} ;;
       mergeable=*) mergeable=${line#mergeable=} ;;
       head=*) live_head=${line#head=} ;;
+      base=*) base=${line#base=} ;;
+      created=*) created=${line#created=} ;;
       *) continue ;;
     esac
     named=$((named + 1))
   done <<FIELDS
 $fields
 FIELDS
-  if [ "$named" -ne 6 ] || [ "$total" -ne 6 ]; then
+  if [ "$named" -ne 8 ] || [ "$total" -ne 8 ] || [ -z "$base" ]; then
     echo "error: could not read the Gitea pull request state before merging" >&2
     return 1
   fi
@@ -1360,6 +1524,33 @@ STATUSES
   printf 'verified: %s is open and mergeable, with every commit status green at head %s\n' \
     "$URL" "$live_head" >&2
   FM_PR_MERGE_HEAD=$live_head
+  GITEA_BASE=$base
+  GITEA_CREATED_EPOCH=$created
+}
+
+# The review count and required status-check count the content guard's
+# young-unreviewed check reads. A failed read counts as none, which leaves that
+# guard able to fire rather than silently quiet.
+GITEA_BASE=
+GITEA_CREATED_EPOCH=
+GITEA_REVIEWS=0
+GITEA_REQUIRED=0
+gitea_read_review_and_required_counts() {
+  local value branch_path
+  GITEA_REVIEWS=0
+  GITEA_REQUIRED=0
+  if gitea_api "/repos/$PR_OWNER/$PR_REPO/pulls/$PR_NUMBER/reviews" && [ "$GITEA_HTTP_STATUS" = 200 ]; then
+    value=$(printf '%s' "$GITEA_BODY" | jq -r 'if type == "array" then length else empty end' 2>/dev/null) || value=
+    case "$value" in ''|*[!0-9]*) ;; *) GITEA_REVIEWS=$value ;; esac
+  fi
+  branch_path=$(github_urlencode_path_segment "$GITEA_BASE")
+  if gitea_api "/repos/$PR_OWNER/$PR_REPO/branch_protections/$branch_path" && [ "$GITEA_HTTP_STATUS" = 200 ]; then
+    value=$(printf '%s' "$GITEA_BODY" | jq -r '
+        if type == "object" and .enable_status_check == true then
+          ([(.status_check_contexts // [])[]] | length) as $n | if $n > 0 then $n else 1 end
+        else 0 end' 2>/dev/null) || value=
+    case "$value" in ''|*[!0-9]*) ;; *) GITEA_REQUIRED=$value ;; esac
+  fi
 }
 
 # Read the pull request back after the forge accepted the merge. Returns 0 when
@@ -1381,8 +1572,10 @@ gitea_confirm_merged() {
 away_status=0
 require_current_away_authority || away_status=$?
 [ "$away_status" -eq 0 ] || exit "$away_status"
+require_intact_pr_binding || exit 1
 require_recorded_pr_identity || exit 1
 record_pr_metadata || exit 1
+read_merge_binding || exit 1
 require_released_captain_hold || exit 1
 
 # Accepted confused-agent-grade limitation, as in bin/fm-lease-lib.sh, not an
@@ -1398,6 +1591,9 @@ case "$PROVIDER" in
     fi
     FM_PR_GITHUB_CALLER_METHOD=$(caller_merge_method "$@")
     github_verify_mergeable || exit 1
+    require_bound_head || exit 1
+    run_content_guard "$FM_PR_GITHUB_BASE" "refs/pull/$PR_NUMBER/head" "$FM_PR_GITHUB_CREATED_EPOCH" \
+      "$FM_PR_GITHUB_REVIEWS" "$FM_PR_GITHUB_REQUIRED_COUNT" || exit 1
     # The away record is locked first, so this last presence and authority read
     # and the forge command below share one live-owner critical section.
     hold_away_record_for_merge || exit 1
@@ -1482,6 +1678,10 @@ case "$PROVIDER" in
     ;;
   gitea)
     gitea_verify_mergeable || exit 1
+    require_bound_head || exit 1
+    gitea_read_review_and_required_counts
+    run_content_guard "$GITEA_BASE" "refs/pull/$PR_NUMBER/head" "$GITEA_CREATED_EPOCH" \
+      "$GITEA_REVIEWS" "$GITEA_REQUIRED" || exit 1
     # head_commit_id binds the merge to the head this run verified, so Gitea
     # refuses a merge whose head moved after that read. The body never asks
     # Gitea to wait for checks, force past branch protection, or delete the

@@ -52,28 +52,65 @@ make_case() {
     'base=main' > "$case_dir/github-outcome"
   : > "$case_dir/github-rules"
   : > "$case_dir/gh.log"
-  # No worktree/project on disk; fm-pr-check.sh tolerates a worktree it cannot
-  # stat and simply skips the pr_head lookup via `gh` in that case, so give it
-  # one that resolves for cases that want pr_head recorded.
+  # A worktree with a real origin, so fm-pr-check.sh records the forge's head
+  # and the content guard can fetch origin/main and the PR head.
+  fm_git_init_commit "$case_dir/wt"
+  fm_git_add_origin "$case_dir/wt" "$case_dir/origin.git"
+  git -C "$case_dir/wt" fetch -q origin
   printf '%s\n' "$case_dir"
 }
+
+# The real commit a case's placeholder head stands for: one commit on top of
+# origin/main that adds a file named for the placeholder, pushed to the case's
+# origin so the content guard can fetch it. The same placeholder maps to the
+# same commit for the whole case. A case without an origin keeps the
+# placeholder. Args: case_dir placeholder
+real_head() {
+  local case_dir=$1 placeholder=$2 map wt blob tree commit
+  map="$case_dir/heads"
+  wt="$case_dir/wt"
+  if [ -f "$map/$placeholder" ]; then
+    cat "$map/$placeholder"
+    return 0
+  fi
+  if [ ! -d "$case_dir/origin.git" ] || ! git -C "$wt" rev-parse --verify -q refs/remotes/origin/main >/dev/null; then
+    printf '%s\n' "$placeholder"
+    return 0
+  fi
+  mkdir -p "$map"
+  blob=$(printf '%s\n' "$placeholder" | git -C "$wt" hash-object -w --stdin)
+  GIT_INDEX_FILE="$map/.index" git -C "$wt" read-tree refs/remotes/origin/main
+  GIT_INDEX_FILE="$map/.index" git -C "$wt" update-index --add --cacheinfo "100644,$blob,pr-$placeholder.txt"
+  tree=$(GIT_INDEX_FILE="$map/.index" git -C "$wt" write-tree)
+  commit=$(git -C "$wt" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit-tree "$tree" -p refs/remotes/origin/main -m "pr $placeholder")
+  git -C "$wt" push -q origin "$commit:refs/heads/pr/$placeholder"
+  printf '%s\n' "$commit" > "$map/$placeholder"
+  printf '%s\n' "$commit"
+}
+
+# The PR's age and reviews in every live view: old enough and unreviewed, so the
+# young-unreviewed guard stays quiet unless a case says otherwise.
+GH_VIEW_AGE='"createdAt":"2020-01-01T00:00:00Z","reviews":[]'
 
 # Live GitHub JSON for the pre-merge verify, plus gh-axi for the
 # post-merge fallback view. Merge itself is `gh pr merge --match-head-commit`.
 # Args: case_dir head_sha
 write_github_live_json() {
-  local case_dir=$1 head=$2
+  local case_dir=$1 head
+  head=$(real_head "$case_dir" "$2")
   printf '%s\n' "$head" > "$case_dir/github-head"
   cat > "$case_dir/github-view.json" <<JSON
-{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"$head","baseRefName":"main","statusCheckRollup":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}
+{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"$head","baseRefName":"main",$GH_VIEW_AGE,"statusCheckRollup":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}
 JSON
 }
 
 write_github_red_json() {
-  local case_dir=$1 head=$2 name=$3
+  local case_dir=$1 head name=$3
+  head=$(real_head "$case_dir" "$2")
   printf '%s\n' "$head" > "$case_dir/github-head"
   cat > "$case_dir/github-view.json" <<JSON
-{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"$head","baseRefName":"main","statusCheckRollup":[{"__typename":"CheckRun","name":"$name","status":"COMPLETED","conclusion":"FAILURE"}]}
+{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"$head","baseRefName":"main",$GH_VIEW_AGE,"statusCheckRollup":[{"__typename":"CheckRun","name":"$name","status":"COMPLETED","conclusion":"FAILURE"}]}
 JSON
 }
 
@@ -101,14 +138,15 @@ status_context() {
 # stays CLEAN because that is what GitHub reports for exactly this case.
 # Args: case_dir head_sha <rollup-entry-json>...
 write_github_rollup_json() {
-  local case_dir=$1 head=$2 entry rollup=''
+  local case_dir=$1 head entry rollup=''
+  head=$(real_head "$case_dir" "$2")
   shift 2
   for entry in "$@"; do
     rollup="${rollup:+$rollup,}$entry"
   done
   printf '%s\n' "$head" > "$case_dir/github-head"
   cat > "$case_dir/github-view.json" <<JSON
-{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"$head","baseRefName":"main","statusCheckRollup":[$rollup]}
+{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"$head","baseRefName":"main",$GH_VIEW_AGE,"statusCheckRollup":[$rollup]}
 JSON
 }
 
@@ -198,6 +236,15 @@ case "${1:-} ${2:-}" in
     exit 0
     ;;
   api\ *)
+    # The base branch's protection, served only when a case writes one.
+    case "$*" in
+      "api repos/"*"/branches/"*)
+        if [ -f "${FM_TEST_GH_BRANCH:-}" ]; then
+          cat "$FM_TEST_GH_BRANCH"
+          exit 0
+        fi
+        ;;
+    esac
     if [ -f "${FM_TEST_GH_RULES_FAIL_BODY:-}" ]; then
       cat "$FM_TEST_GH_RULES_FAIL_BODY" >&2
       exit 1
@@ -389,6 +436,7 @@ run_pr_merge() {
   FM_TEST_GH_RULES="$case_dir/github-rules" \
   FM_TEST_GH_VIEW_JSON="$case_dir/github-view.json" \
   FM_TEST_GH_HEAD="$case_dir/github-head" \
+  FM_TEST_GH_BRANCH="$case_dir/github-branch.json" \
   FM_TEST_GH_MERGE_RC_FILE="$case_dir/github-merge-rc" \
   FM_TEST_GH_MERGE_OUTPUT="$(cat "$case_dir/github-merge-output" 2>/dev/null || true)" \
   FM_TEST_GH_GRAPHQL_FAIL="$case_dir/github-graphql-fail" \
@@ -413,6 +461,12 @@ run_pr_merge() {
     return 1
   fi
   return "$rc"
+}
+
+# Record a PR binding the way firstmate does, through bin/fm-pr-check.sh, with
+# the same mocks a merge run sees. Args: case_dir task-id url [--rebind reason]
+run_pr_check() {
+  PR_MERGE="$ROOT/bin/fm-pr-check.sh" run_pr_merge "$@"
 }
 
 write_github_outcome() {
@@ -449,7 +503,7 @@ test_verified_merge_records_pr_and_head() {
   expect_code 0 "$rc" "records-before-merge: fm-pr-merge should succeed"
   assert_grep 'pr=https://github.com/example/repo/pull/9' "$case_dir/state/task-x1.meta" \
     "records-before-merge: pr= was not recorded"
-  assert_grep 'pr_head=deadbeefcafefeed0000000000000000deadbeef' "$case_dir/state/task-x1.meta" \
+  assert_grep "pr_head=$(cat "$case_dir/github-head")" "$case_dir/state/task-x1.meta" \
     "records-before-merge: pr_head= was not recorded"
   assert_logged_gh_merge "$case_dir" 9 example/repo --squash
   pass "fm-pr-merge records pr= and pr_head= for a verified GitHub merge"
@@ -1705,11 +1759,10 @@ test_gitlab_reports_every_failing_condition() {
 }
 
 test_gitlab_stale_recorded_head_is_reported() {
-  local case_dir rc merge_line
+  local case_dir rc
   case_dir=$(make_gitlab_case gitlab-stale-head)
-  # The recorded head is what a rebase leaves behind. It is read before
-  # fm-pr-check.sh rewrites the metadata, which drops a head it cannot resolve
-  # for a GitLab task, so reading it afterwards would find nothing at all.
+  # bin/fm-pr-check.sh records no head for a GitLab task, so a pr_head line in
+  # its metadata can only have been written by hand.
   printf 'pr_head=%s\n' "$MR_STALE_HEAD" >> "$case_dir/state/task-x1.meta"
 
   set +e
@@ -1718,17 +1771,11 @@ test_gitlab_stale_recorded_head_is_reported() {
   rc=$?
   set -e
 
-  expect_code 0 "$rc" "gitlab-stale-head: the live head satisfies every condition, so it should merge"
-  assert_grep "recorded head $MR_STALE_HEAD disagrees with the live head $MR_HEAD" \
-    "$case_dir/stderr" "gitlab-stale-head: the stale recorded head was trusted silently"
-  merge_line=$(glab_merge_line "$case_dir/glab.log")
-  case "$merge_line" in
-    *"--sha $MR_HEAD"*) : ;;
-    *) fail "gitlab-stale-head: the merge was not bound to the live head: '$merge_line'" ;;
-  esac
-  assert_no_grep "pr_head=$MR_STALE_HEAD" "$case_dir/state/task-x1.meta" \
-    "gitlab-stale-head: the recording step no longer drops an unresolvable GitLab head"
-  pass "fm-pr-merge reports a stale recorded head and verifies the live one"
+  expect_code 1 "$rc" "gitlab-stale-head: a hand-written head must refuse the merge"
+  assert_grep "pr_head=$MR_STALE_HEAD with no binding record" \
+    "$case_dir/stderr" "gitlab-stale-head: the refusal did not name the unrecorded binding"
+  [ ! -s "$case_dir/glab.log" ] || fail "gitlab-stale-head: glab ran despite the hand-written binding"
+  pass "fm-pr-merge refuses a GitLab merge whose metadata carries a hand-written head"
 }
 
 test_gitlab_unreadable_state_refuses() {
@@ -2198,6 +2245,15 @@ case "$endpoint" in
     printf '{"message":"head out of date"}' > "$case_dir/gitea-merge-error"
     answer "$code" "$case_dir/gitea-merge-error"
     ;;
+  */pulls/*/reviews)
+    if [ -f "$case_dir/gitea-reviews.json" ]; then answer 200 "$case_dir/gitea-reviews.json"; fi
+    printf '[]' > "$case_dir/gitea-no-reviews.json"
+    answer 200 "$case_dir/gitea-no-reviews.json"
+    ;;
+  */branch_protections/*)
+    if [ -f "$case_dir/gitea-protection.json" ]; then answer 200 "$case_dir/gitea-protection.json"; fi
+    answer 404 "$case_dir/gitea-404.json"
+    ;;
   */pulls/*)
     [ ! -e "$case_dir/gitea-pr-404" ] || answer 404 "$case_dir/gitea-404.json"
     if [ -e "$case_dir/gitea-merge-called" ]; then answer 200 "$case_dir/gitea-pr-post.json"; fi
@@ -2215,7 +2271,9 @@ SH
 # write_gitea_pr_json <file> [<field>=<value> ...]: a pull request payload that
 # satisfies every pre-merge condition, with named fields overridden.
 write_gitea_pr_json() {
-  local file=$1 kv url=$GT_URL state=open merged=false draft=false mergeable=true head=$GT_HEAD
+  local file=$1 kv url=$GT_URL state=open merged=false draft=false mergeable=true head
+  local created=2020-01-01T00:00:00Z
+  head=$(gitea_case_head "$(dirname "$file")")
   shift
   for kv in "$@"; do
     case "${kv%%=*}" in
@@ -2225,11 +2283,12 @@ write_gitea_pr_json() {
       draft) draft=${kv#*=} ;;
       mergeable) mergeable=${kv#*=} ;;
       head) head=${kv#*=} ;;
+      created) created=${kv#*=} ;;
       *) fail "write_gitea_pr_json: unknown field '${kv%%=*}'" ;;
     esac
   done
-  printf '{"number":5,"html_url":"%s","state":"%s","merged":%s,"draft":%s,"mergeable":%s,"head":{"sha":"%s"}}\n' \
-    "$url" "$state" "$merged" "$draft" "$mergeable" "$head" > "$file"
+  printf '{"number":5,"html_url":"%s","state":"%s","merged":%s,"draft":%s,"mergeable":%s,"head":{"sha":"%s"},"base":{"ref":"main"},"created_at":"%s"}\n' \
+    "$url" "$state" "$merged" "$draft" "$mergeable" "$head" "$created" > "$file"
 }
 
 # write_gitea_status_json <file> [<state>:<context> ...]: the combined status at
@@ -2241,12 +2300,19 @@ write_gitea_status_json() {
     list="$list${list:+,}{\"status\":\"${entry%%:*}\",\"context\":\"${entry#*:}\"}"
     n=$((n + 1))
   done
-  printf '{"sha":"%s","total_count":%s,"statuses":[%s]}\n' "$GT_HEAD" "$n" "$list" > "$file"
+  printf '{"sha":"%s","total_count":%s,"statuses":[%s]}\n' "$(gitea_case_head "$(dirname "$file")")" "$n" "$list" > "$file"
+}
+
+# The case's real Gitea head (see real_head), or the placeholder for a payload
+# written outside a case. Args: case_dir
+gitea_case_head() {
+  if [ -f "$1/gitea-head" ]; then cat "$1/gitea-head"; else printf '%s\n' "$GT_HEAD"; fi
 }
 
 make_gitea_case() {
   local name=$1 case_dir
   case_dir=$(make_case "$name")
+  real_head "$case_dir" "$GT_HEAD" > "$case_dir/gitea-head"
   add_tea_mock "$case_dir"
   : > "$case_dir/tea.log"
   write_gitea_pr_json "$case_dir/gitea-pr.json"
@@ -2275,11 +2341,11 @@ test_gitea_merge_binds_the_verified_head() {
   expect_code 0 "$rc" "gitea-merges: a green Gitea pull request should merge ($(cat "$case_dir/stderr"))"
   assert_grep "pr=$GT_URL" "$case_dir/state/task-x1.meta" "gitea-merges: pr= was not recorded"
   body=$(cat "$case_dir/gitea-merge-body")
-  [ "$body" = "{\"Do\":\"merge\",\"head_commit_id\":\"$GT_HEAD\"}" ] \
+  [ "$body" = "{\"Do\":\"merge\",\"head_commit_id\":\"$(cat "$case_dir/gitea-head")\"}" ] \
     || fail "gitea-merges: unexpected merge body '$body'"
   assert_grep "api -i --login gitea -X POST" "$case_dir/tea.log" \
     "gitea-merges: the merge was not sent through the resolved login"
-  assert_grep "every commit status green at head $GT_HEAD" "$case_dir/stderr" \
+  assert_grep "every commit status green at head $(cat "$case_dir/gitea-head")" "$case_dir/stderr" \
     "gitea-merges: the verified head was not reported"
   [ ! -s "$case_dir/gh.log" ] || fail "gitea-merges: a Gitea pull request reached the GitHub CLI"
   pass "fm-pr-merge merges a Gitea pull request through tea's API bound to the verified head"
@@ -2373,6 +2439,309 @@ test_gitea_prerequisites_and_extra_args_refuse_before_recording() {
   assert_no_grep "pr=" "$case_dir/state/task-x1.meta" "gitea-extra-arg: pr= was recorded for a refused merge"
   [ ! -s "$case_dir/tea.log" ] || fail "gitea-extra-arg: tea was invoked for a refused merge"
   pass "a Gitea merge without a unique login or with an unusable argument refuses before recording"
+}
+
+# --- Binding to the recorded content and the content guard -----------------
+
+# git in a case's worktree with a fixed identity.
+case_git() {
+  local case_dir=$1
+  shift
+  git -C "$case_dir/wt" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' "$@"
+}
+
+# Point a case's live PR view at a specific real commit, pushed to its origin.
+# Args: case_dir name sha
+use_real_head() {
+  local case_dir=$1 name=$2 sha=$3
+  case_git "$case_dir" push -q origin "+$sha:refs/heads/pr/$name"
+  mkdir -p "$case_dir/heads"
+  printf '%s\n' "$sha" > "$case_dir/heads/$name"
+  write_github_live_json "$case_dir" "$name"
+}
+
+run_merge_case() {  # <case_dir> <number> [args...]
+  local case_dir=$1 number=$2
+  shift 2
+  set +e
+  run_pr_merge "$case_dir" task-x1 "https://github.com/example/repo/pull/$number" "$@" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  RC=$?
+  set -e
+}
+
+run_check_case() {  # <case_dir> <number> [args...]
+  local case_dir=$1 number=$2
+  shift 2
+  set +e
+  run_pr_check "$case_dir" task-x1 "https://github.com/example/repo/pull/$number" "$@" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  RC=$?
+  set -e
+}
+
+test_hand_edited_binding_refuses() {
+  local case_dir meta
+  case_dir=$(make_case binding-hand-edited)
+  add_gh_mocks "$case_dir" b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1
+  run_check_case "$case_dir" 131
+  expect_code 0 "$RC" "binding-hand-edited: the first PR could not be recorded: $(cat "$case_dir/stderr")"
+  assert_present "$case_dir/state/task-x1.pr-binding" "binding-hand-edited: no binding record was written"
+  meta="$case_dir/state/task-x1.meta"
+  sed 's#/pull/131$#/pull/134#' "$meta" > "$meta.tmp" && cat "$meta.tmp" > "$meta" && rm -f "$meta.tmp"
+  assert_grep 'pr=https://github.com/example/repo/pull/134' "$meta" "binding-hand-edited: the fixture edit did not land"
+  : > "$case_dir/gh.log"
+  run_merge_case "$case_dir" 134
+  expect_code 1 "$RC" "binding-hand-edited: a hand-rebound PR must refuse"
+  assert_grep 'so the metadata was changed by hand' "$case_dir/stderr" \
+    "binding-hand-edited: the refusal did not name the hand edit"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "binding-hand-edited: the forge merge ran"
+
+  case_dir=$(make_case binding-unrecorded)
+  add_gh_mocks "$case_dir" b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2
+  printf 'pr=https://github.com/example/repo/pull/134\n' >> "$case_dir/state/task-x1.meta"
+  run_merge_case "$case_dir" 134
+  expect_code 1 "$RC" "binding-unrecorded: a pr= with no binding record must refuse"
+  assert_grep 'with no binding record' "$case_dir/stderr" \
+    "binding-unrecorded: the refusal did not name the missing record"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "binding-unrecorded: the forge merge ran"
+  pass "fm-pr-merge refuses a PR binding written by hand rather than by fm-pr-check.sh"
+}
+
+test_moved_head_refuses_until_recorded_again() {
+  local case_dir first
+  case_dir=$(make_case binding-moved-head)
+  add_gh_mocks "$case_dir" b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3
+  first=$(cat "$case_dir/github-head")
+  run_check_case "$case_dir" 140
+  expect_code 0 "$RC" "binding-moved-head: the PR could not be recorded: $(cat "$case_dir/stderr")"
+  write_github_live_json "$case_dir" b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4
+  run_merge_case "$case_dir" 140
+  expect_code 1 "$RC" "binding-moved-head: a moved head must refuse"
+  assert_grep "the head recorded for approval is $first" "$case_dir/stderr" \
+    "binding-moved-head: the refusal did not name the recorded head"
+  assert_grep "pr_head=$first" "$case_dir/state/task-x1.meta" \
+    "binding-moved-head: the merge refreshed the approved head"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "binding-moved-head: the forge merge ran"
+  run_check_case "$case_dir" 140
+  expect_code 0 "$RC" "binding-moved-head: re-recording failed: $(cat "$case_dir/stderr")"
+  assert_grep 'present the changed PR and its diff stat' "$case_dir/stderr" \
+    "binding-moved-head: re-recording a moved head gave no notice"
+  run_merge_case "$case_dir" 140
+  expect_code 0 "$RC" "binding-moved-head: the re-recorded head must merge: $(cat "$case_dir/stderr")"
+  assert_logged_gh_merge "$case_dir" 140 example/repo --squash
+  pass "fm-pr-merge refuses a head that moved after it was recorded until it is recorded again"
+}
+
+test_rebind_needs_a_reason_and_a_present_captain() {
+  local case_dir
+  case_dir=$(make_case binding-rebind)
+  add_gh_mocks "$case_dir" b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5
+  run_check_case "$case_dir" 131
+  expect_code 0 "$RC" "binding-rebind: the first PR could not be recorded"
+  run_check_case "$case_dir" 134
+  expect_code 1 "$RC" "binding-rebind: a different unmerged PR must not rebind silently"
+  assert_grep 'pass --rebind' "$case_dir/stderr" "binding-rebind: the refusal did not name --rebind"
+  assert_grep 'pr=https://github.com/example/repo/pull/131' "$case_dir/state/task-x1.meta" \
+    "binding-rebind: the refused rebind changed the metadata"
+  run_merge_case "$case_dir" 134
+  expect_code 1 "$RC" "binding-rebind: a merge of a different PR must refuse"
+  assert_grep 'is bound to https://github.com/example/repo/pull/131' "$case_dir/stderr" \
+    "binding-rebind: the merge refusal did not name the bound PR"
+  write_away_record "$case_dir" --words 'merge anything green'
+  run_check_case "$case_dir" 134 --rebind 'worker reopened the PR'
+  expect_code 2 "$RC" "binding-rebind: --rebind must refuse while away"
+  assert_grep '--rebind is attended-only' "$case_dir/stderr" "binding-rebind: the away refusal was not named"
+  rm -f "$case_dir/state/.afk-contract"
+  run_check_case "$case_dir" 134 --rebind 'worker reopened the PR'
+  expect_code 0 "$RC" "binding-rebind: an attended rebind must record: $(cat "$case_dir/stderr")"
+  assert_grep 'reason=rebind from https://github.com/example/repo/pull/131: worker reopened the PR' \
+    "$case_dir/state/task-x1.pr-binding" "binding-rebind: the reason was not recorded"
+  assert_grep 'present the changed PR and its diff stat' "$case_dir/stderr" \
+    "binding-rebind: the rebind gave no presentation notice"
+  pass "fm-pr-check.sh rebinds a task to a different PR only with a recorded reason and a present captain"
+}
+
+# The shape that reverted six merged commits: a task branch forked from an old
+# base, a stale tree grafted with commit-tree onto the current base, and the
+# task rebound to the new PR.
+build_pr134_graft() {  # <case_dir>; echoes the graft commit
+  local case_dir=$1 wt fork stage_tree base graft
+  wt="$case_dir/wt"
+  mkdir -p "$wt/app/drizzle" "$wt/app/tests" "$wt/src"
+  printf 'old\n' > "$wt/src/view.ts"
+  case_git "$case_dir" add -A
+  case_git "$case_dir" commit -q -m 'app before the main work'
+  case_git "$case_dir" push -q origin HEAD:refs/heads/main
+  fork=$(case_git "$case_dir" rev-parse HEAD)
+  case_git "$case_dir" checkout -q -b fm/task-x1
+  printf 'stage\n' > "$wt/src/stage.ts"
+  case_git "$case_dir" add -A
+  case_git "$case_dir" commit -q -m 'WIP: Stage direction build'
+  stage_tree=$(case_git "$case_dir" rev-parse 'HEAD^{tree}')
+  case_git "$case_dir" checkout -q --detach "$fork"
+  printf 'create table reactions;\n' > "$wt/app/drizzle/0152_reactions.sql"
+  printf 'reactions test\n' > "$wt/app/tests/reactions.test.ts"
+  printf 'new\n' > "$wt/src/view.ts"
+  case_git "$case_dir" add -A
+  case_git "$case_dir" commit -q -m 'main work that merged meanwhile'
+  case_git "$case_dir" push -q origin HEAD:refs/heads/main
+  base=$(case_git "$case_dir" rev-parse HEAD)
+  case_git "$case_dir" checkout -q fm/task-x1
+  graft=$(case_git "$case_dir" commit-tree "$stage_tree" -p "$base" -m 'WIP: Stage direction build')
+  printf '%s\n' "$graft"
+}
+
+test_pr134_graft_is_refused() {
+  local case_dir graft
+  case_dir=$(make_case pr134-graft)
+  add_gh_mocks "$case_dir" b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6
+  run_check_case "$case_dir" 131
+  expect_code 0 "$RC" "pr134-graft: PR 131 could not be recorded: $(cat "$case_dir/stderr")"
+  graft=$(build_pr134_graft "$case_dir")
+  use_real_head "$case_dir" graft "$graft"
+
+  # Rebinding by hand is refused outright.
+  cp "$case_dir/state/task-x1.meta" "$case_dir/meta.recorded"
+  sed 's#/pull/131$#/pull/134#' "$case_dir/meta.recorded" > "$case_dir/state/task-x1.meta"
+  run_merge_case "$case_dir" 134
+  expect_code 1 "$RC" "pr134-graft: the hand-rebound graft must refuse"
+  assert_grep 'changed by hand' "$case_dir/stderr" "pr134-graft: the hand edit was not named"
+  cat "$case_dir/meta.recorded" > "$case_dir/state/task-x1.meta"
+
+  # Rebinding properly still meets the content guard.
+  run_check_case "$case_dir" 134 --rebind 'conflicts fixed on a fresh PR'
+  expect_code 0 "$RC" "pr134-graft: the attended rebind failed: $(cat "$case_dir/stderr")"
+  run_merge_case "$case_dir" 134
+  expect_code 1 "$RC" "pr134-graft: the stale graft must refuse"
+  assert_grep 'content: 4 files changed, 2 insertions(+), 3 deletions(-) against origin/main' "$case_dir/stderr" "pr134-graft: the diff stat was not printed"
+  assert_grep 'stale-tree: 3 file(s)' "$case_dir/stderr" "pr134-graft: the stale tree was not found"
+  assert_grep 'deleted-migrations: deletes 1 file(s): app/drizzle/0152_reactions.sql' "$case_dir/stderr" \
+    "pr134-graft: the deleted migration was not named"
+  assert_grep 'deleted-tests: deletes 1 file(s): app/tests/reactions.test.ts' "$case_dir/stderr" \
+    "pr134-graft: the deleted test was not named"
+  assert_grep 'verdict=refused' "$case_dir/state/task-x1.merge-guard" "pr134-graft: the refusal was not recorded"
+  assert_grep 'app/drizzle/0152_reactions.sql' "$case_dir/state/task-x1.merge-guard" \
+    "pr134-graft: the recorded stat lost the deleted migration"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "pr134-graft: the forge merge ran"
+
+  # Only the captain's named, attended override passes it, and never while away.
+  write_away_record "$case_dir" --words 'merge anything green'
+  run_merge_case "$case_dir" 134 --allow-content stale-tree --allow-content deleted-migrations --allow-content deleted-tests
+  expect_code 2 "$RC" "pr134-graft: --allow-content must refuse while away"
+  assert_grep '--allow-content is attended-only' "$case_dir/stderr" "pr134-graft: the away refusal was not named"
+  rm -f "$case_dir/state/.afk-contract"
+  run_merge_case "$case_dir" 134 --allow-content stale-tree --allow-content deleted-tests
+  expect_code 1 "$RC" "pr134-graft: an unwaived guard must still refuse"
+  assert_grep 'deleted-migrations' "$case_dir/stderr" "pr134-graft: the unwaived guard was not named"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "pr134-graft: a partial waiver reached the forge"
+  run_merge_case "$case_dir" 134 --allow-content stale-tree --allow-content deleted-migrations --allow-content deleted-tests
+  expect_code 0 "$RC" "pr134-graft: a fully waived guard must merge: $(cat "$case_dir/stderr")"
+  assert_grep 'waived=deleted-migrations' "$case_dir/state/task-x1.merge-guard" "pr134-graft: the waiver was not recorded"
+  assert_logged_gh_merge "$case_dir" 134 example/repo --squash
+  pass "fm-pr-merge refuses the PR 134 shape: a hand rebind, and a commit-tree graft of a stale tree"
+}
+
+test_mass_deletion_from_a_merge_resolution_refuses() {
+  local case_dir wt head fork
+  case_dir=$(make_case mass-deletion)
+  add_gh_mocks "$case_dir" b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7
+  wt="$case_dir/wt"
+  seq 1 80 > "$wt/big.txt"
+  case_git "$case_dir" add -A
+  case_git "$case_dir" commit -q -m 'big file'
+  case_git "$case_dir" push -q origin HEAD:refs/heads/main
+  fork=$(case_git "$case_dir" rev-parse HEAD)
+  case_git "$case_dir" checkout -q -b fm/task-x1
+  printf 'stage\n' > "$wt/stage.txt"
+  case_git "$case_dir" add -A
+  case_git "$case_dir" commit -q -m 'task work'
+  case_git "$case_dir" checkout -q --detach "$fork"
+  printf 'other\n' > "$wt/other.txt"
+  case_git "$case_dir" add -A
+  case_git "$case_dir" commit -q -m 'main moves on'
+  case_git "$case_dir" push -q origin HEAD:refs/heads/main
+  case_git "$case_dir" checkout -q fm/task-x1
+  case_git "$case_dir" fetch -q origin
+  case_git "$case_dir" merge -q --no-commit refs/remotes/origin/main >/dev/null 2>&1 || true
+  head -n 10 "$wt/big.txt" > "$wt/big.tmp" && mv "$wt/big.tmp" "$wt/big.txt"
+  case_git "$case_dir" add -A
+  case_git "$case_dir" commit -q -m 'merge main, resolving by dropping lines'
+  head=$(case_git "$case_dir" rev-parse HEAD)
+  use_real_head "$case_dir" merged "$head"
+  run_merge_case "$case_dir" 150
+  expect_code 1 "$RC" "mass-deletion: deletions the task's own commits never made must refuse"
+  assert_grep 'mass-deletion: deletes 70 lines against origin/main, more than twice the 0 its own commits delete' \
+    "$case_dir/stderr" "mass-deletion: the excess deletion was not named"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "mass-deletion: the forge merge ran"
+  pass "fm-pr-merge refuses a PR deleting far more than its own commits delete"
+}
+
+test_young_unreviewed_pr_refuses_without_required_checks() {
+  local case_dir now variant filter
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  for variant in young reviewed required; do
+    case_dir=$(make_case "young-$variant")
+    add_gh_mocks "$case_dir" b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8
+    case "$variant" in
+      young) filter=".createdAt = \"$now\"" ;;
+      reviewed) filter=".createdAt = \"$now\" | .reviews = [{\"state\":\"COMMENTED\"}]" ;;
+      required)
+        filter=".createdAt = \"$now\""
+        printf '%s\n' '{"name":"main","protected":true,"protection":{"required_status_checks":{"contexts":["ci"],"checks":[]}}}' \
+          > "$case_dir/github-branch.json"
+        ;;
+    esac
+    jq -c "$filter" "$case_dir/github-view.json" > "$case_dir/github-view.tmp"
+    mv "$case_dir/github-view.tmp" "$case_dir/github-view.json"
+    run_merge_case "$case_dir" 160
+    if [ "$variant" = young ]; then
+      expect_code 1 "$RC" "young-$variant: a fresh unreviewed PR on an unprotected base must refuse"
+      assert_grep 'young-unreviewed: it is' "$case_dir/stderr" "young-$variant: the guard was not named"
+      assert_no_grep 'pr merge' "$case_dir/gh.log" "young-$variant: the forge merge ran"
+      run_merge_case "$case_dir" 160 --allow-content young-unreviewed
+      expect_code 0 "$RC" "young-$variant: the named waiver must merge: $(cat "$case_dir/stderr")"
+    else
+      expect_code 0 "$RC" "young-$variant: a reviewed or required-checked PR must merge: $(cat "$case_dir/stderr")"
+    fi
+  done
+  pass "fm-pr-merge refuses a young unreviewed PR only when its base requires no check"
+}
+
+test_content_guard_that_cannot_run_refuses() {
+  local case_dir
+  case_dir=$(make_case guard-unavailable)
+  add_gh_mocks "$case_dir" b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9
+  git -C "$case_dir/wt" remote remove origin
+  run_merge_case "$case_dir" 170
+  expect_code 1 "$RC" "guard-unavailable: a guard that cannot run must refuse"
+  assert_grep 'unavailable: the task' "$case_dir/stderr" "guard-unavailable: the reason was not named"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "guard-unavailable: the forge merge ran"
+  run_merge_case "$case_dir" 170 --allow-content unavailable
+  expect_code 0 "$RC" "guard-unavailable: the named waiver must merge: $(cat "$case_dir/stderr")"
+  pass "fm-pr-merge refuses when the content guard cannot run, unless that guard is waived by name"
+}
+
+test_allow_content_arguments_are_strict() {
+  local case_dir
+  case_dir=$(make_case allow-content-args)
+  add_gh_mocks "$case_dir" bababababababababababababababababababababa
+  run_merge_case "$case_dir" 180 --allow-content nonsense
+  expect_code 2 "$RC" "allow-content-args: an unknown guard must refuse"
+  assert_grep '--allow-content requires one guard name' "$case_dir/stderr" "allow-content-args: unknown guard not named"
+  run_merge_case "$case_dir" 180 --allow-content stale-tree --allow-content stale-tree
+  expect_code 2 "$RC" "allow-content-args: a repeated guard must refuse"
+  run_merge_case "$case_dir" 180 --allow-content=stale-tree
+  expect_code 2 "$RC" "allow-content-args: the = form must refuse"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "allow-content-args: the forge merge ran"
+  case_dir=$(make_gitlab_case allow-content-gitlab)
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$MR_URL" --allow-content stale-tree > "$case_dir/stdout" 2> "$case_dir/stderr"
+  RC=$?
+  set -e
+  expect_code 2 "$RC" "allow-content-gitlab: GitLab must refuse --allow-content"
+  assert_grep '--allow-content does not apply to GitLab' "$case_dir/stderr" "allow-content-gitlab: refusal not named"
+  pass "fm-pr-merge --allow-content takes exactly one known guard per flag and is GitHub-only"
 }
 
 test_github_zero_exit_queue_required_refuses_with_exact_retry
@@ -3485,3 +3854,11 @@ test_gitea_allow_red_waives_only_the_named_context
 test_gitea_answer_for_another_pull_request_refuses
 test_gitea_forge_refusal_fails_the_merge
 test_gitea_prerequisites_and_extra_args_refuse_before_recording
+test_hand_edited_binding_refuses
+test_moved_head_refuses_until_recorded_again
+test_rebind_needs_a_reason_and_a_present_captain
+test_pr134_graft_is_refused
+test_mass_deletion_from_a_merge_resolution_refuses
+test_young_unreviewed_pr_refuses_without_required_checks
+test_content_guard_that_cannot_run_refuses
+test_allow_content_arguments_are_strict
