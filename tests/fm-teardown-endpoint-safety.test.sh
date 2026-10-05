@@ -1183,6 +1183,23 @@ test_stale_record_on_claimed_slot_retires_then_claimant_tears_down() {
     "worktree=$dir/worktree" "project=$dir/project" "kind=scout"
   claim_pool_slot "$dir" "$other"
 
+  # Run in the wrong order, the claimant refuses without touching anything and
+  # names the stale record and the exact teardown that retires it first.
+  set +e
+  run_case "$dir" "$other" > "$dir/stdout" 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "claimant teardown returned a slot a stale record still names"
+  assert_present "$dir/worktree/sentinel" "claimant refusal reset the slot"
+  assert_present "$dir/home/state/$id.meta" "claimant refusal removed the stale record"
+  assert_present "$dir/home/state/$other.meta" "claimant refusal removed its own record"
+  [ ! -s "$dir/runtime.log" ] \
+    || fail "claimant refusal reached the runtime: $(cat "$dir/runtime.log")"
+  assert_contains "$(cat "$dir/stderr")" "$id's record is the stale one" \
+    "claimant refusal did not identify the stale record"
+  assert_contains "$(cat "$dir/stderr")" "FM_HOME=$dir/home bin/fm-teardown.sh $id" \
+    "claimant refusal did not name the teardown that retires the stale record"
+
   set +e
   run_case "$dir" "$id" > "$dir/stdout" 2> "$dir/stderr"
   rc=$?
@@ -1201,6 +1218,60 @@ test_stale_record_on_claimed_slot_retires_then_claimant_tears_down() {
     || fail "claimant teardown did not return its pool slot: $(cat "$dir/runtime.log")"
 
   pass "fm-teardown: a stale record on a claimed slot retires, then the claimant tears down"
+}
+
+# A ship's committed work never lived only in its slot: its branch is a ref in
+# the shared repository and survives the slot's reassignment. Records-only
+# cleanup therefore refuses while that branch still holds unlanded commits -
+# leaving the branch, the record, and the slot intact - and proceeds once the
+# branch has landed on the default branch.
+test_reassigned_ship_with_unlanded_branch_refuses_records_only_cleanup() {
+  local dir id=stale-ship other=reassigned-task rc
+
+  dir=$(make_case slot-reassigned-unlanded-ship)
+  mark_case_as_treehouse_pool "$dir"
+  git -C "$dir/project" branch -M main
+  git -C "$dir/project" branch "fm/$id" main
+  git -C "$dir/project" worktree add -q "$dir/branch-wt" "fm/$id"
+  printf 'unlanded\n' > "$dir/branch-wt/unlanded.txt"
+  git -C "$dir/branch-wt" add unlanded.txt
+  git -C "$dir/branch-wt" -c user.name=test -c user.email=test@example.invalid commit -qm unlanded-work
+  git -C "$dir/project" worktree remove "$dir/branch-wt"
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=firstmate:fm-$id" "endpoint_task_id=$id" \
+    "worktree=$dir/worktree" "project=$dir/project" "kind=ship" "mode=local-only"
+  claim_pool_slot "$dir" "$other" "$dir/other-home"
+
+  set +e
+  FM_HOME="$dir/home" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_RUNTIME_LOG="$dir/runtime.log" PATH="$dir/fakebin:$PATH" \
+    "$TEARDOWN" "$id" > "$dir/stdout" 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "records-only teardown closed a ship whose branch has not landed"
+  assert_contains "$(cat "$dir/stderr")" "branch fm/$id still holds commits that have not landed" \
+    "the refusal did not name the unlanded branch"
+  assert_present "$dir/home/state/$id.meta" "the unlanded-branch refusal removed the record"
+  git -C "$dir/project" show-ref --verify --quiet "refs/heads/fm/$id" \
+    || fail "the unlanded-branch refusal deleted the branch"
+  assert_present "$dir/worktree/sentinel" "the unlanded-branch refusal touched the reassigned slot"
+  [ ! -s "$dir/runtime.log" ] \
+    || fail "the unlanded-branch refusal reached the runtime: $(cat "$dir/runtime.log")"
+
+  git -C "$dir/project" merge -q --ff-only "fm/$id"
+  set +e
+  FM_HOME="$dir/home" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_RUNTIME_LOG="$dir/runtime.log" PATH="$dir/fakebin:$PATH" \
+    "$TEARDOWN" "$id" > "$dir/stdout" 2> "$dir/stderr"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "records-only teardown of a landed ship failed: $(cat "$dir/stderr")"
+  assert_reassigned_slot_left_alone "$dir" "$id" "$other" "landed ship on a reassigned slot"
+  assert_present "$dir/worktree/sentinel" "records-only teardown of a landed ship reset the slot"
+  git -C "$dir/project" show-ref --verify --quiet "refs/heads/fm/$id" \
+    || fail "records-only teardown deleted the landed branch"
+
+  pass "fm-teardown: a reassigned ship's unlanded branch refuses records-only cleanup until it lands"
 }
 
 # The two states that must never become a false refusal: the task's own claim,
@@ -1626,6 +1697,7 @@ test_sole_slot_record_still_tears_down
 test_reassigned_pool_slot_finishes_own_cleanup_without_touching_the_slot
 test_reassigned_pool_slot_keeps_claimant_codex_overlay_on_t3
 test_stale_record_on_claimed_slot_retires_then_claimant_tears_down
+test_reassigned_ship_with_unlanded_branch_refuses_records_only_cleanup
 test_own_and_absent_slot_claims_still_tear_down
 test_recorded_endpoint_that_changed_directory_still_tears_down
 test_project_lock_anchors_at_the_local_root_across_home_layouts

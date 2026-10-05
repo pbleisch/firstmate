@@ -130,7 +130,11 @@
 # collision itself, whichever record is stale. The one exception is a slot whose
 # owner claim (below) names another task: this teardown is then records-only and
 # touches nothing under the slot, so the scan is skipped rather than stranding
-# the stale record and, with it, the claimant's own teardown.
+# the stale record and, with it, the claimant's own teardown. The claimant's own
+# teardown still refuses while a stale record names its slot, and that refusal
+# names the stale record and the exact teardown that retires it first;
+# bin/fm-wake-lib.sh's fm_treehouse_slot_recorders owns the scan, which
+# bin/fm-spawn.sh also uses so it never takes a recorded slot in the first place.
 # That scan alone cannot prove THIS record is the current owner, because the task
 # that took the slot next may leave no record it can reach - its own worker may
 # have exited and its record been cleaned up, or it may live in a home this
@@ -146,7 +150,11 @@
 # inspection of it, no branch or hook removal in it, no Treehouse return, and
 # never the other task's claim. Skipping the inspection discards nothing of this
 # task's: whatever unlanded work it had in that slot was already destroyed when
-# the pool handed the slot on. Refusing instead would strand the record, because
+# the pool handed the slot on. A ship's committed branch is the exception: it is
+# a ref in the shared repository, not in the slot, so without --force a ship
+# whose recorded branch still holds unlanded commits refuses rather than closing
+# its backlog item over intact, unlanded work (require_reassigned_ship_branch_landed).
+# Refusing a landed record instead would strand it, because
 # bin/fm-backend.sh's endpoint validation refuses an empty or missing worktree=
 # unconditionally, so there is no line an operator could clear to get past it.
 # A claim that cannot be read proves nothing either way and refuses; inspect or
@@ -2565,20 +2573,9 @@ teardown_live_slot_path() {
   canonical_existing_dir "$WT"
 }
 
-# Every local Firstmate state directory whose records can name a pool slot this
-# task's slot might also be; bin/fm-wake-lib.sh's fm_local_firstmate_state_dirs
-# owns the walk and what it refuses.
-collect_local_firstmate_states() {
-  fm_local_firstmate_state_dirs "$1" || {
-    echo "REFUSED: $FM_LOCAL_FIRSTMATE_ERROR; nothing was changed" >&2
-    return 1
-  }
-  TREEHOUSE_OWNER_STATES=("${FM_LOCAL_FIRSTMATE_STATES[@]}")
-}
-
 require_exclusive_worktree_slot_record() {
   local record_meta=$1 record_id=$2 record_state=$3 worktree=$4
-  local slot state_dir other other_id field other_path other_slot
+  local slot recorder other_state other_id field other_home refused=0
   slot=$(canonical_existing_dir "$worktree") || return 0
   # A slot whose owner claim names another task was reassigned, so this record's
   # teardown is records-only and touches nothing under it; another record naming
@@ -2586,28 +2583,27 @@ require_exclusive_worktree_slot_record() {
   # block the claimant's own teardown behind it.
   fm_treehouse_slot_owner_state "$slot" "$record_id"
   [ "$FM_TREEHOUSE_SLOT_OWNER" != other ] || return 0
-  collect_local_firstmate_states "$record_state" || return 1
-  for state_dir in "${TREEHOUSE_OWNER_STATES[@]}"; do
-    for other in "$state_dir"/*.meta; do
-      [ -f "$other" ] && [ ! -L "$other" ] || continue
-      # Identity, not spelling: the same record reached through a differently
-      # resolved state dir (e.g. a symlinked $FM_HOME) is still this record. A
-      # differently named hardlink is another task's record, so the name must
-      # match too.
-      [ "${other##*/}" = "${record_meta##*/}" ] && [ "$other" -ef "$record_meta" ] && continue
-      other_id=$(basename "$other" .meta)
-      for field in worktree home; do
-        other_path=$(fm_meta_get "$other" "$field")
-        [ -n "$other_path" ] || continue
-        other_slot=$(canonical_existing_dir "$other_path") || continue
-        [ "$other_slot" = "$slot" ] || continue
-        echo "REFUSED: task $record_id's recorded worktree $slot is also task $other_id's recorded $field." >&2
-        echo "Returning that pool slot would kill $other_id's processes and reset its copy, so nothing was changed - not even with --force." >&2
-        echo "Reconcile whichever record is wrong (bin/fm-crew-state.sh $record_id; bin/fm-crew-state.sh $other_id), then re-run teardown." >&2
-        return 1
-      done
-    done
+  fm_treehouse_slot_recorders "$slot" "$record_state" "$record_meta" || {
+    echo "REFUSED: $FM_LOCAL_FIRSTMATE_ERROR; nothing was changed" >&2
+    return 1
+  }
+  for recorder in ${FM_TREEHOUSE_SLOT_RECORDERS[@]+"${FM_TREEHOUSE_SLOT_RECORDERS[@]}"}; do
+    IFS=$'\t' read -r other_state other_id field <<<"$recorder"
+    refused=1
+    other_home=${other_state%/state}
+    echo "REFUSED: task $record_id's recorded worktree $slot is also task $other_id's recorded $field." >&2
+    echo "Returning that pool slot would kill $other_id's processes and reset its copy, so nothing was changed - not even with --force." >&2
+    if [ "$FM_TREEHOUSE_SLOT_OWNER" = mine ]; then
+      # The claim names this task, so the slot was handed to it after the other
+      # record was written: the other record is the stale one, and its own
+      # teardown is records-only (see the script header), never touching the slot.
+      echo "The slot's owner claim names $record_id, so $other_id's record is the stale one: its teardown closes its endpoint and records and leaves this slot untouched." >&2
+      echo "Tear it down first (FM_HOME=$other_home bin/fm-teardown.sh $other_id), then re-run this teardown." >&2
+    else
+      echo "Reconcile whichever record is wrong (bin/fm-crew-state.sh $record_id; bin/fm-crew-state.sh $other_id), then re-run teardown." >&2
+    fi
   done
+  [ "$refused" = 0 ]
 }
 
 require_exclusive_task_worktree_slot() {
@@ -2680,6 +2676,44 @@ require_owned_task_worktree_slot() {
 
 teardown_owns_worktree() {
   [ "$TEARDOWN_SLOT_REASSIGNED" != 1 ]
+}
+
+# A reassigned slot skips every inspection of the copy, but a ship's committed
+# work never lived only in the slot: its branch is a ref in the shared project
+# repository and survives the reassignment. Records-only cleanup must not close
+# the backlog item of a ship whose branch still holds unlanded commits, so the
+# recorded branch (or the default fm/<id> for a record that predates branch=)
+# must be reachable from a remote-tracking branch or the local default branch,
+# or have its content already in the default branch. A branch that no longer
+# exists has nothing left to check. --force skips this like every other
+# landed-work check; it discards nothing, since the branch itself is never
+# deleted here.
+require_reassigned_ship_branch_landed() {
+  local branch default ref default_tree merged_tree unlanded
+  branch=$(meta_value "$META" branch)
+  [ -n "$branch" ] || branch="fm/$ID"
+  git -C "$PROJ" show-ref --verify --quiet "refs/heads/$branch" || return 0
+  default=$(default_branch) || {
+    echo "REFUSED: cannot determine the default branch for $PROJ to prove $ID's branch $branch landed; nothing was changed." >&2
+    return 1
+  }
+  if ! unlanded=$(git -C "$PROJ" log --oneline "refs/heads/$branch" --not --remotes "refs/heads/$default" -- 2>/dev/null); then
+    echo "REFUSED: cannot inspect $ID's branch $branch for unlanded commits; nothing was changed." >&2
+    return 1
+  fi
+  [ -n "$unlanded" ] || return 0
+  if git -C "$PROJ" show-ref --verify --quiet "refs/remotes/origin/$default"; then
+    ref="refs/remotes/origin/$default"
+  else
+    ref="refs/heads/$default"
+  fi
+  default_tree=$(git -C "$PROJ" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null || true)
+  merged_tree=$(git -C "$PROJ" merge-tree --write-tree "$ref" "refs/heads/$branch" 2>/dev/null | head -1 || true)
+  [ -z "$default_tree" ] || [ "$merged_tree" != "$default_tree" ] || return 0
+  echo "REFUSED: task $ID's pool slot was reassigned, but its branch $branch still holds commits that have not landed:" >&2
+  printf '%s\n' "$unlanded" | head -5 >&2
+  echo "The branch is intact in $PROJ; nothing was changed. Land it (bin/fm-merge-local.sh or its PR), or get the captain's explicit OK to drop it, then --force." >&2
+  return 1
 }
 
 firstmate_home_has_treehouse_slot() {
@@ -3609,6 +3643,9 @@ remove_secondmate_registry_entry() {
 
 require_exclusive_task_worktree_slot || exit 1
 require_owned_task_worktree_slot || exit 1
+if ! teardown_owns_worktree && [ "$KIND" = ship ] && [ "$FORCE" != "--force" ]; then
+  require_reassigned_ship_branch_landed || exit 1
+fi
 
 validate_pr_poll_cleanup "$STATE" "$ID" || exit 1
 

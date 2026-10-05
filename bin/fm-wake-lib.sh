@@ -2032,6 +2032,51 @@ fm_treehouse_slot_owner_release() {  # <worktree> <task-id>
   rm -f "$marker" 2>/dev/null || true
 }
 
+# The registry parser fm_local_firstmate_state_dirs needs, sourced on demand so a
+# caller that never walks the homes pays nothing.
+fm_treehouse_require_registry_lib() {
+  command -v secondmate_registry_parse_line >/dev/null 2>&1 && return 0
+  # shellcheck source=bin/fm-secondmate-registry-lib.sh
+  . "$FM_WAKE_LIB_DIR/fm-secondmate-registry-lib.sh"
+}
+
+# Every OTHER live task record that names a slot, across every local home.
+# A record is a reservation: while state/<id>.meta names a slot in worktree= or
+# home=, that slot still holds - or may still hold - that task's work, however
+# its endpoint, Treehouse lease, or claim currently reads. Sets
+# FM_TREEHOUSE_SLOT_RECORDERS to one "<state-dir> <task-id> <field>" entry
+# (tab-separated) per other record naming the slot; it runs in the caller's
+# shell rather than printing, so a failure's reason survives for the caller.
+# <self-meta> is skipped by identity, not spelling: the same record
+# reached through a differently resolved state dir is still itself, while a
+# differently named hardlink is another task's record. Returns 1, with the
+# reason in FM_LOCAL_FIRSTMATE_ERROR, when the homes cannot be
+# enumerated, because an incomplete scan cannot prove a slot unrecorded.
+fm_treehouse_slot_recorders() {  # <worktree> <record-state> <self-meta>
+  local worktree=$1 record_state=$2 self_meta=$3 slot state_dir other field line other_path other_slot
+  FM_TREEHOUSE_SLOT_RECORDERS=()
+  slot=$(CDPATH='' cd -- "$worktree" 2>/dev/null && pwd -P) || return 0
+  fm_treehouse_require_registry_lib
+  fm_local_firstmate_state_dirs "$record_state" || return 1
+  for state_dir in "${FM_LOCAL_FIRSTMATE_STATES[@]}"; do
+    for other in "$state_dir"/*.meta; do
+      [ -f "$other" ] && [ ! -L "$other" ] || continue
+      [ "${other##*/}" = "${self_meta##*/}" ] && [ "$other" -ef "$self_meta" ] && continue
+      for field in worktree home; do
+        other_path=
+        while IFS= read -r line || [ -n "$line" ]; do
+          case "$line" in "$field="*) other_path=${line#*=} ;; esac
+        done < "$other" 2>/dev/null || true
+        [ -n "$other_path" ] || continue
+        other_slot=$(CDPATH='' cd -- "$other_path" 2>/dev/null && pwd -P) || continue
+        [ "$other_slot" = "$slot" ] || continue
+        FM_TREEHOUSE_SLOT_RECORDERS+=("$state_dir"$'\t'"$(basename "$other" .meta)"$'\t'"$field")
+        break
+      done
+    done
+  done
+}
+
 fm_failure_episode_reset() {
   local state=$1 mode=${2:-acquire} lock current pid acquired=0 path
   lock="$state/.turnend-claude-blocks.lock"
