@@ -743,6 +743,187 @@ test_pool_slot_claim_follows_the_spawn_outcome() {
   pass "a Treehouse slot claim names the launched task, refuses when unclaimable, and is dropped by a locked abort"
 }
 
+# Re-lay a case as a two-slot Treehouse pool and drive the pane with an
+# acquisition that behaves like `treehouse get`: on the typed command it takes
+# the first slot no process is working in - Treehouse's own in-use measure - and
+# the pane then reports that slot. It deliberately ignores dirtiness, so only a
+# slot's reservation, never its dirt, can keep it from being handed out.
+# FM_FAKE_TREEHOUSE_IGNORE_USE=1 makes it hand out the first slot regardless.
+lay_out_as_two_slot_pool() {
+  local slot_root="$CASE_DIR/slots"
+  mkdir -p "$slot_root/1" "$slot_root/2"
+  git -C "$PROJECT_DIR" worktree move "$POOL_DIR" "$slot_root/1/project"
+  git -C "$PROJECT_DIR" worktree add --quiet --detach "$slot_root/2/project" "$INITIAL_SHA"
+  printf '{"worktrees":[{"name":"1","path":"%s"},{"name":"2","path":"%s"}]}\n' \
+    "$slot_root/1/project" "$slot_root/2/project" > "$slot_root/treehouse-state.json"
+  SLOT1=$(cd "$slot_root/1/project" && pwd -P)
+  SLOT2=$(cd "$slot_root/2/project" && pwd -P)
+  SLOT1_CLAIM="$slot_root/1/.fm-slot-owner"
+  SLOT2_CLAIM="$slot_root/2/.fm-slot-owner"
+  POOL_DIR=$SLOT1
+  mv "$FAKEBIN_DIR/tmux" "$FAKEBIN_DIR/tmux.base"
+  cat > "$FAKEBIN_DIR/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+slot_in_use() {  # <canonical-slot>
+  local c p
+  if [ -e /proc/self/cwd ]; then
+    for c in /proc/[0-9]*/cwd; do
+      p=$(readlink "$c" 2>/dev/null) || continue
+      case "$p" in "$1"|"$1"/*) return 0 ;; esac
+    done
+    return 1
+  fi
+  lsof -a -d cwd -Fn 2>/dev/null | awk -v s="$1" '
+    substr($0, 1, 1) == "n" { p = substr($0, 2); if (p == s || index(p, s "/") == 1) found = 1 }
+    END { exit !found }'
+}
+case "$*" in
+  *"#{pane_current_path}"*)
+    if [ -s "$FM_FAKE_TREEHOUSE_CHOSEN" ]; then
+      cat "$FM_FAKE_TREEHOUSE_CHOSEN"
+    else
+      printf '%s\n' "$FM_FAKE_TREEHOUSE_PROJECT"
+    fi
+    exit 0
+    ;;
+esac
+if [ "${1:-}" = send-keys ]; then
+  for a in "$@"; do
+    [ "$a" = "treehouse get" ] || continue
+    for slot in $FM_FAKE_TREEHOUSE_SLOTS; do
+      if [ "${FM_FAKE_TREEHOUSE_IGNORE_USE:-0}" != 1 ] && slot_in_use "$slot"; then
+        continue
+      fi
+      printf '%s\n' "$slot" > "$FM_FAKE_TREEHOUSE_CHOSEN"
+      break
+    done
+  done
+fi
+exec "$(dirname "$0")/tmux.base" "$@"
+SH
+  chmod +x "$FAKEBIN_DIR/tmux"
+}
+
+run_two_slot_spawn() {
+  local id=$1
+  shift
+  rm -f "$CASE_DIR/treehouse-chosen"
+  FM_FAKE_TREEHOUSE_SLOTS="$SLOT1 $SLOT2" \
+    FM_FAKE_TREEHOUSE_CHOSEN="$CASE_DIR/treehouse-chosen" \
+    FM_FAKE_TREEHOUSE_PROJECT="$PROJECT_DIR" \
+    run_spawn "$id" "$@"
+}
+
+assert_slot_not_held() {  # <slot> <description>
+  if [ -e /proc/self/cwd ]; then
+    local c p
+    for c in /proc/[0-9]*/cwd; do
+      p=$(readlink "$c" 2>/dev/null) || continue
+      case "$p" in "$1"|"$1"/*) fail "$2: process $(basename "$(dirname "$c")") still works in $1" ;; esac
+    done
+  elif lsof -a -d cwd -Fn 2>/dev/null | awk -v s="$1" '
+      substr($0, 1, 1) == "n" { p = substr($0, 2); if (p == s || index(p, s "/") == 1) found = 1 }
+      END { exit !found }'; then
+    fail "$2: a process still works in $1"
+  fi
+}
+
+# The reissue incident: a finished task's record still names its pool slot, but
+# nothing is running there any more, so Treehouse reads the slot as free. The
+# spawn must take another slot rather than put a second record on that copy -
+# whether the recorded copy is clean or still carries the task's uncommitted
+# work - and must leave nothing behind holding the recorded slot.
+test_spawn_never_reissues_a_recorded_slot() {
+  local rec id out status stale before shape
+  for shape in clean dirty; do
+    id="pool-recorded-slot-$shape-r1"
+    stale="finished-task-$shape"
+    rec=$(make_case "recorded-slot-$shape" "$id")
+    read_case_record "$rec"
+    lay_out_as_two_slot_pool
+    fm_write_meta "$HOME_DIR/state/$stale.meta" \
+      "window=firstmate:fm-$stale" "endpoint_task_id=$stale" \
+      "worktree=$SLOT1" "project=$PROJECT_DIR" "kind=scout"
+    printf 'task=%s\nhome=%s\n' "$stale" "$HOME_DIR" > "$SLOT1_CLAIM"
+    if [ "$shape" = dirty ]; then
+      printf 'edited by the finished task\n' >> "$SLOT1/README.md"
+      printf 'scratch the finished task never committed\n' > "$SLOT1/scratch.txt"
+    fi
+    before=$(git -C "$SLOT1" rev-parse HEAD)
+
+    out=$(run_two_slot_spawn "$id" --scout)
+    status=$?
+    expect_code 0 "$status" "a spawn beside a recorded $shape slot should launch in another slot"$'\n'"$out"
+    assert_grep "worktree=$SLOT2" "$HOME_DIR/state/$id.meta" \
+      "the spawn beside a recorded $shape slot did not take the free slot"
+    grep -Fxq -- "task=$id" "$SLOT2_CLAIM" \
+      || fail "the spawn did not claim the slot it took: $(cat "$SLOT2_CLAIM" 2>/dev/null)"
+    grep -Fxq -- "task=$stale" "$SLOT1_CLAIM" \
+      || fail "the spawn rewrote the recorded $shape slot's claim: $(cat "$SLOT1_CLAIM")"
+    [ "$(git -C "$SLOT1" rev-parse HEAD)" = "$before" ] \
+      || fail "the spawn moved the recorded $shape slot's HEAD"
+    if [ "$shape" = dirty ]; then
+      assert_grep 'edited by the finished task' "$SLOT1/README.md" \
+        "the spawn reset the recorded slot's uncommitted edit"
+      assert_grep 'scratch the finished task never committed' "$SLOT1/scratch.txt" \
+        "the spawn removed the recorded slot's untracked work"
+    fi
+    assert_slot_not_held "$SLOT1" "the spawn beside a recorded $shape slot"
+  done
+  pass "a spawn never takes a pool slot an existing task record names, clean or carrying uncommitted work"
+}
+
+# The backstop behind the holders: when the pool hands out a slot anyway, a
+# spawn refuses before claiming, refreshing, or launching in it - both for a
+# slot a local record names and for one whose claim names a task whose record
+# still exists in the claimant's own home.
+test_spawn_refuses_a_slot_another_record_reserves() {
+  local rec id out status stale other_home before
+  id='pool-reserved-slot-record-r1'
+  stale='live-recorded-task'
+  rec=$(make_case reserved-slot-record "$id")
+  read_case_record "$rec"
+  lay_out_as_two_slot_pool
+  fm_write_meta "$HOME_DIR/state/$stale.meta" \
+    "window=firstmate:fm-$stale" "endpoint_task_id=$stale" \
+    "worktree=$SLOT1" "project=$PROJECT_DIR" "kind=ship"
+  printf 'uncommitted work of the recorded task\n' > "$SLOT1/work.txt"
+  before=$(git -C "$SLOT1" rev-parse HEAD)
+  out=$(FM_FAKE_TREEHOUSE_IGNORE_USE=1 run_two_slot_spawn "$id" --scout)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn launched in a slot another task's record names"
+  assert_contains "$out" "task $stale's record" \
+    "the refusal did not name the record reserving the slot"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "spawn published a record for a reserved slot"
+  [ ! -e "$SLOT1_CLAIM" ] || fail "spawn claimed a reserved slot: $(cat "$SLOT1_CLAIM")"
+  [ "$(git -C "$SLOT1" rev-parse HEAD)" = "$before" ] || fail "spawn moved a reserved slot's HEAD"
+  assert_grep 'uncommitted work of the recorded task' "$SLOT1/work.txt" \
+    "spawn discarded a reserved slot's uncommitted work"
+
+  id='pool-reserved-slot-claim-r1'
+  rec=$(make_case reserved-slot-claim "$id")
+  read_case_record "$rec"
+  lay_out_as_two_slot_pool
+  other_home="$CASE_DIR/unregistered-home"
+  mkdir -p "$other_home/state"
+  fm_write_meta "$other_home/state/$stale.meta" \
+    "window=firstmate:fm-$stale" "endpoint_task_id=$stale" \
+    "worktree=$SLOT1" "project=$PROJECT_DIR" "kind=ship"
+  printf 'task=%s\nhome=%s\n' "$stale" "$other_home" > "$SLOT1_CLAIM"
+  out=$(run_two_slot_spawn "$id" --scout)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn launched in a slot claimed by a task whose record still exists"
+  assert_contains "$out" "owner claim names task $stale" \
+    "the refusal did not name the claimant whose record still exists"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "spawn published a record for a claimed slot"
+  grep -Fxq -- "task=$stale" "$SLOT1_CLAIM" \
+    || fail "spawn rewrote the live claimant's slot claim: $(cat "$SLOT1_CLAIM")"
+  pass "a spawn handed a reserved slot anyway refuses before touching it"
+}
+
+test_spawn_never_reissues_a_recorded_slot
+test_spawn_refuses_a_slot_another_record_reserves
 test_remote_seeded_home_spawns_from_treehouse_pool
 test_pool_slot_claim_follows_the_spawn_outcome
 test_linked_spawning_home_rejects_primary_before_refresh

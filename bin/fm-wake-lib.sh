@@ -1170,7 +1170,7 @@ fm_task_set_lock_path() {  # <state-dir>
 # the walk at the current home, which is the correct answer rather than an
 # error: the parent lives on another machine, so its filesystem can neither hold
 # nor be observed by a lock taken here, and a remote-seeded home is itself the
-# top of the local tree that bin/fm-teardown.sh's collect_local_firstmate_states
+# top of the local tree that fm_local_firstmate_state_dirs below
 # enumerates (that walk already skips remote registry entries for the same
 # reason). Refusing a remote binding instead made every operation anchored here
 # fail closed inside a remote secondmate home and its local descendants.
@@ -1345,6 +1345,101 @@ fm_treehouse_slot_owner_release() {  # <worktree> <task-id>
   [ "$FM_TREEHOUSE_SLOT_OWNER" = mine ] || return 0
   marker=$(fm_treehouse_slot_owner_marker "$worktree") || return 0
   rm -f "$marker" 2>/dev/null || true
+}
+
+# Every local Firstmate state directory whose task records may name a slot in a
+# pool this home can reach: the given record state, the local root home's, and
+# each locally registered secondmate home's below it, walked transitively.
+# Remote registry entries are skipped because their records live on another
+# machine. Sets FM_LOCAL_FIRSTMATE_STATES; on an unresolvable root, an unsafe
+# or malformed registry, or an unavailable registered home it returns 1 with
+# the reason in FM_LOCAL_FIRSTMATE_STATES_ERROR, since a scan that silently
+# skipped a home could not prove a slot unrecorded.
+fm_local_firstmate_state_dirs() {  # <record-state>
+  local record_state=$1 root home reg line child known existing i=0
+  local -a homes
+  FM_LOCAL_FIRSTMATE_STATES=("$record_state")
+  FM_LOCAL_FIRSTMATE_STATES_ERROR=
+  root=$(fm_firstmate_root_home "$FM_HOME") || {
+    FM_LOCAL_FIRSTMATE_STATES_ERROR="cannot resolve the root Firstmate home"
+    return 1
+  }
+  if ! command -v secondmate_registry_parse_line >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-secondmate-registry-lib.sh
+    . "$FM_WAKE_LIB_DIR/fm-secondmate-registry-lib.sh"
+  fi
+  homes=("$root")
+  while [ "$i" -lt "${#homes[@]}" ]; do
+    home=${homes[$i]}
+    i=$((i + 1))
+    known=0
+    for existing in "${FM_LOCAL_FIRSTMATE_STATES[@]}"; do
+      [ "$existing" != "$home/state" ] || known=1
+    done
+    [ "$known" = 1 ] || FM_LOCAL_FIRSTMATE_STATES+=("$home/state")
+    reg="$home/data/secondmates.md"
+    [ ! -e "$reg" ] && [ ! -L "$reg" ] && continue
+    [ -f "$reg" ] && [ ! -L "$reg" ] || {
+      FM_LOCAL_FIRSTMATE_STATES_ERROR="local Firstmate registry is unsafe at $reg"
+      return 1
+    }
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        "- "*)
+          secondmate_registry_parse_line "$line" || {
+            FM_LOCAL_FIRSTMATE_STATES_ERROR="malformed local Firstmate registry entry in $reg"
+            return 1
+          }
+          [ "$SECONDMATE_REGISTRY_REMOTE" -eq 0 ] || continue
+          child=$(CDPATH='' cd -- "$SECONDMATE_REGISTRY_HOME" 2>/dev/null && pwd -P) || {
+            FM_LOCAL_FIRSTMATE_STATES_ERROR="registered local Firstmate home is unavailable: $SECONDMATE_REGISTRY_HOME"
+            return 1
+          }
+          known=0
+          for existing in "${homes[@]}"; do
+            [ "$existing" != "$child" ] || known=1
+          done
+          [ "$known" = 1 ] || homes+=("$child")
+          ;;
+      esac
+    done < "$reg"
+  done
+}
+
+# Every OTHER live task record that names a slot, across every local home.
+# A record is a reservation: while state/<id>.meta names a slot in worktree= or
+# home=, that slot still holds - or may still hold - that task's work, however
+# its endpoint, Treehouse lease, or claim currently reads. Sets
+# FM_TREEHOUSE_SLOT_RECORDERS to one "<state-dir> <task-id> <field>" entry
+# (tab-separated) per other record naming the slot; it runs in the caller's
+# shell rather than printing, so a failure's reason survives for the caller.
+# <self-meta> is skipped by identity, not spelling: the same record
+# reached through a differently resolved state dir is still itself, while a
+# differently named hardlink is another task's record. Returns 1, with the
+# reason in FM_LOCAL_FIRSTMATE_STATES_ERROR, when the homes cannot be
+# enumerated, because an incomplete scan cannot prove a slot unrecorded.
+fm_treehouse_slot_recorders() {  # <worktree> <record-state> <self-meta>
+  local worktree=$1 record_state=$2 self_meta=$3 slot state_dir other field line other_path other_slot
+  FM_TREEHOUSE_SLOT_RECORDERS=()
+  slot=$(CDPATH='' cd -- "$worktree" 2>/dev/null && pwd -P) || return 0
+  fm_local_firstmate_state_dirs "$record_state" || return 1
+  for state_dir in "${FM_LOCAL_FIRSTMATE_STATES[@]}"; do
+    for other in "$state_dir"/*.meta; do
+      [ -f "$other" ] && [ ! -L "$other" ] || continue
+      [ "${other##*/}" = "${self_meta##*/}" ] && [ "$other" -ef "$self_meta" ] && continue
+      for field in worktree home; do
+        other_path=
+        while IFS= read -r line || [ -n "$line" ]; do
+          case "$line" in "$field="*) other_path=${line#*=} ;; esac
+        done < "$other" 2>/dev/null || true
+        [ -n "$other_path" ] || continue
+        other_slot=$(CDPATH='' cd -- "$other_path" 2>/dev/null && pwd -P) || continue
+        [ "$other_slot" = "$slot" ] || continue
+        FM_TREEHOUSE_SLOT_RECORDERS+=("$state_dir"$'\t'"$(basename "$other" .meta)"$'\t'"$field")
+        break
+      done
+    done
+  done
 }
 
 fm_failure_episode_reset() {

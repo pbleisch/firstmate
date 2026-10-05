@@ -1102,6 +1102,7 @@ SPAWN_TASK_SET_LOCK_HELD=0
 SPAWN_TREEHOUSE_PROJECT_LOCK=
 SPAWN_TREEHOUSE_PROJECT_LOCK_HELD=0
 SPAWN_SLOT_CLAIMED=0
+SPAWN_SLOT_HOLDER_PIDS=()
 RELAUNCH_REPLACEMENT_PENDING=0
 RELAUNCH_REPLACEMENT_BUSY_GEN=
 RELAUNCH_REPLACEMENT_HARNESS=
@@ -1109,6 +1110,91 @@ RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
+
+# A task record is a reservation on the pool slot it names. Treehouse cannot see
+# it: the interactive `treehouse get` hands out the first slot that is idle,
+# clean, and unleased, and a slot whose task worker or pane shell has exited
+# (or whose teardown returned it and then stopped before retiring the record)
+# reads exactly that way while its record still names it. Reissuing such a slot
+# puts two task records on one copy, which strands both teardowns and lets the
+# next return reset one task's work out from under the other.
+# So for the acquisition window, every slot of this project that any local
+# record names is held in use the way Treehouse itself measures use - a process
+# whose working directory is inside it - and Treehouse skips it for another or a
+# new slot. Each holder is a bounded sleep forked with its working directory
+# already in the slot, so it is in place the moment it exists; it is a direct
+# child released by pid once the slot is chosen or the spawn aborts, and it
+# expires on its own if the spawn is killed. The pool-state test reuses
+# fm_treehouse_pool_slot so only genuine slots of this project are held.
+SPAWN_SLOT_HOLD_SECS=300
+spawn_hold_recorded_slots() {
+  local state_dir meta field path slot holder_sleep here seen="|"
+  if ! fm_local_firstmate_state_dirs "$STATE"; then
+    echo "error: cannot list the task records that reserve Treehouse slots ($FM_LOCAL_FIRSTMATE_STATES_ERROR); refusing to acquire a slot that may be another task's" >&2
+    return 1
+  fi
+  holder_sleep=$(command -pv sleep) || {
+    echo "error: no system sleep to hold recorded Treehouse slots out of acquisition; refusing to acquire a slot that may be another task's" >&2
+    return 1
+  }
+  here=$PWD
+  for state_dir in "${FM_LOCAL_FIRSTMATE_STATES[@]}"; do
+    for meta in "$state_dir"/*.meta; do
+      [ -f "$meta" ] && [ ! -L "$meta" ] || continue
+      for field in worktree home; do
+        path=$(fm_meta_get "$meta" "$field")
+        [ -n "$path" ] || continue
+        fm_treehouse_pool_slot "$PROJ_ABS" "$path" || continue
+        slot=$(CDPATH='' cd -- "$path" 2>/dev/null && pwd -P) || continue
+        case "$seen" in *"|$slot|"*) continue ;; esac
+        seen="$seen$slot|"
+        CDPATH='' cd -- "$slot" || continue
+        "$holder_sleep" "$SPAWN_SLOT_HOLD_SECS" </dev/null >/dev/null 2>&1 &
+        SPAWN_SLOT_HOLDER_PIDS+=("$!")
+        CDPATH='' cd -- "$here" || return 1
+      done
+    done
+  done
+}
+
+spawn_release_slot_holders() {
+  local pid
+  for pid in ${SPAWN_SLOT_HOLDER_PIDS[@]+"${SPAWN_SLOT_HOLDER_PIDS[@]}"}; do
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  SPAWN_SLOT_HOLDER_PIDS=()
+}
+
+# The holders above keep every recorded slot out of acquisition, so this is the
+# backstop for a slot they could not cover: another task's record still names
+# the slot Treehouse handed this spawn, or its owner claim names a task whose
+# record still exists in the claimant's home. Either way the slot may hold that
+# task's work, so the spawn refuses before claiming, refreshing, or launching
+# anything in it - the slot's copy is left exactly as Treehouse handed it.
+spawn_refuse_recorded_slot() {
+  local recorder other_state other_id field claim_meta refused=0
+  fm_treehouse_slot_recorders "$WT" "$STATE" "$STATE/$ID.meta" || {
+    echo "error: cannot list the task records that reserve Treehouse slots ($FM_LOCAL_FIRSTMATE_STATES_ERROR); refusing to launch task $ID in a slot that may be another task's; inspect window $T" >&2
+    return 1
+  }
+  for recorder in ${FM_TREEHOUSE_SLOT_RECORDERS[@]+"${FM_TREEHOUSE_SLOT_RECORDERS[@]}"}; do
+    IFS=$'\t' read -r other_state other_id field <<<"$recorder"
+    refused=1
+    echo "error: Treehouse handed task $ID pool slot $WT, which task $other_id's record ($other_state/$other_id.meta) still names in $field=" >&2
+  done
+  fm_treehouse_slot_owner_state "$WT" "$ID"
+  if [ "$FM_TREEHOUSE_SLOT_OWNER" = other ] && [ -n "$FM_TREEHOUSE_SLOT_OWNER_HOME" ]; then
+    claim_meta="$FM_TREEHOUSE_SLOT_OWNER_HOME/state/$FM_TREEHOUSE_SLOT_OWNER_ID.meta"
+    if [ -f "$claim_meta" ]; then
+      refused=1
+      echo "error: Treehouse handed task $ID pool slot $WT, whose owner claim names task $FM_TREEHOUSE_SLOT_OWNER_ID, and that task's record ($claim_meta) still exists" >&2
+    fi
+  fi
+  [ "$refused" = 1 ] || return 0
+  echo "error: refusing to launch task $ID on a slot another task's record still reserves; nothing in the slot was changed. Retire a finished record with its own bin/fm-teardown.sh run, then retry; inspect window $T" >&2
+  return 1
+}
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -1139,6 +1225,7 @@ parse_orca_worktree_result() {
 
 spawn_abort_cleanup() {
   local status=$?
+  spawn_release_slot_holders
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] &&
     [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] &&
     [ -n "$SPAWN_META_TMP" ] &&
@@ -3840,6 +3927,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   fi
   [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
 elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+  spawn_hold_recorded_slots || exit 1
   spawn_send_text_line "$WT_TARGET" 'treehouse get'
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
@@ -3914,12 +4002,14 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # Written under the Treehouse project lock held from before slot allocation
   # through metadata publication, so no other spawn or return sees a half-claim.
   if fm_treehouse_pool_slot "$PROJ_ABS" "$WT"; then
+    spawn_refuse_recorded_slot || exit 1
     if ! fm_treehouse_slot_owner_claim "$WT" "$ID" "$FM_HOME"; then
       echo "error: could not claim Treehouse pool slot $WT for task $ID; refusing to launch a worker whose slot cannot later be proved to be its own; inspect window $T" >&2
       exit 1
     fi
     SPAWN_SLOT_CLAIMED=1
   fi
+  spawn_release_slot_holders
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   freshen_spawn_worktree_base "$WT" || exit 1
