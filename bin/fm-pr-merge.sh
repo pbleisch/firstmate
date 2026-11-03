@@ -183,8 +183,9 @@
 # A GitHub or Forgejo merge also passes the content guard
 # bin/fm-merge-guard-lib.sh owns: it prints the diff stat against a freshly
 # fetched origin/<base>, records it in state/<task-id>.merge-guard, and refuses
-# on any guard that lib names - a stale tree, deleted migrations or tests, mass
-# deletion, or a guard that could not run. An attended --allow-content <guard>
+# on any guard that lib names - a stale tree (with the earlier base commits
+# whose work it would revert), deleted migrations or tests, mass deletion, or a
+# guard that could not run. An attended --allow-content <guard>
 # waives exactly that named guard, may be repeated once per guard, is refused
 # while the away-posture record exists like --allow-red, and is passed only when
 # the captain names the guard. It never waives the head binding.
@@ -1594,6 +1595,7 @@ run_content_guard() {  # <base> <forge-head-ref>
     printf 'content: %s against origin/%s at %s for head %s\n' \
       "$FM_MERGE_GUARD_SHORTSTAT" "$base" "$FM_MERGE_GUARD_BASE_SHA" "$FM_PR_MERGE_HEAD" >&2
     [ -z "$FM_MERGE_GUARD_STAT" ] || printf '%s\n' "$FM_MERGE_GUARD_STAT" | sed 's/^/content: /' >&2
+    [ -z "$FM_MERGE_GUARD_REVERTED" ] || printf '%s\n' "$FM_MERGE_GUARD_REVERTED" | sed 's/^/content: reverts work from /' >&2
   fi
   while IFS= read -r line; do
     [ -n "$line" ] || continue

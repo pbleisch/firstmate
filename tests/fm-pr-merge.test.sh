@@ -3214,6 +3214,73 @@ test_mass_deletion_from_a_merge_resolution_refuses() {
   pass "fm-pr-merge refuses a PR deleting far more than its own commits delete"
 }
 
+# A fresh pull request with no review and no required check merges: the content
+# guard judges what a pull request changes, not how old it is.
+test_young_unreviewed_pr_merges() {
+  local case_dir now
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  case_dir=$(make_case young-unreviewed)
+  add_gh_mocks "$case_dir" b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8
+  jq -c ".createdAt = \"$now\" | .reviews = []" "$case_dir/github-view.json" > "$case_dir/github-view.tmp"
+  mv "$case_dir/github-view.tmp" "$case_dir/github-view.json"
+  run_merge_case "$case_dir" 160
+  expect_code 0 "$RC" "young-unreviewed: a fresh unreviewed PR must merge: $(cat "$case_dir/stderr")"
+  assert_logged_gh_merge "$case_dir" 160 example/repo --squash
+  run_merge_case "$case_dir" 160 --allow-content young-unreviewed
+  expect_code 2 "$RC" "young-unreviewed: the removed guard must not be a waivable name"
+  pass "fm-pr-merge merges a young unreviewed PR; there is no age guard"
+}
+
+# main: A -> C1 (a=2) -> C2 (a=3) -> C3 (b=2); the task forks at C1 and its tree
+# is grafted onto C3, so merging would revert C2 and C3 but keep C1.
+build_two_commit_revert() {  # <case_dir>; echoes the graft commit
+  local case_dir=$1 wt fork task_tree base
+  wt="$case_dir/wt"
+  printf '1\n' > "$wt/a.txt"
+  printf '1\n' > "$wt/b.txt"
+  case_git "$case_dir" add -A
+  case_git "$case_dir" commit -q -m 'add a and b'
+  printf '2\n' > "$wt/a.txt"
+  case_git "$case_dir" commit -q -am 'kept change to a'
+  case_git "$case_dir" push -q origin HEAD:refs/heads/main
+  fork=$(case_git "$case_dir" rev-parse HEAD)
+  case_git "$case_dir" checkout -q -b fm/task-x1
+  printf 'task\n' > "$wt/task.txt"
+  case_git "$case_dir" add -A
+  case_git "$case_dir" commit -q -m 'task work'
+  task_tree=$(case_git "$case_dir" rev-parse 'HEAD^{tree}')
+  case_git "$case_dir" checkout -q --detach "$fork"
+  printf '3\n' > "$wt/a.txt"
+  case_git "$case_dir" commit -q -am 'reverted change to a'
+  printf '2\n' > "$wt/b.txt"
+  case_git "$case_dir" commit -q -am 'reverted change to b'
+  case_git "$case_dir" push -q origin HEAD:refs/heads/main
+  base=$(case_git "$case_dir" rev-parse HEAD)
+  case_git "$case_dir" checkout -q fm/task-x1
+  case_git "$case_dir" commit-tree "$task_tree" -p "$base" -m 'task work'
+}
+
+test_stale_tree_lists_the_commits_it_reverts() {
+  local case_dir graft
+  case_dir=$(make_case reverted-commits)
+  add_gh_mocks "$case_dir" bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc
+  graft=$(build_two_commit_revert "$case_dir")
+  use_real_head "$case_dir" graft "$graft"
+  run_merge_case "$case_dir" 190
+  expect_code 1 "$RC" "reverted-commits: the stale tree must refuse"
+  assert_grep 'stale-tree: 2 file(s): a.txt, b.txt would return to bytes origin/main already replaced, reverting work from 2 commit(s)' \
+    "$case_dir/stderr" "reverted-commits: the finding did not count the reverted commits"
+  grep -q '^content: reverts work from [0-9a-f]\{7,\} [0-9-]\{10\} reverted change to b (b.txt)$' "$case_dir/stderr" \
+    || fail "reverted-commits: the change to b was not listed with its date and file"
+  grep -q '^content: reverts work from [0-9a-f]\{7,\} [0-9-]\{10\} reverted change to a (a.txt)$' "$case_dir/stderr" \
+    || fail "reverted-commits: the change to a was not listed with its date and file"
+  assert_no_grep 'kept change to a' "$case_dir/stderr" "reverted-commits: a change the head keeps was listed"
+  [ "$(grep -c '^reverted=' "$case_dir/state/task-x1.merge-guard")" -eq 2 ] \
+    || fail "reverted-commits: the record did not hold exactly the two reverted commits"
+  assert_no_grep 'pr merge' "$case_dir/gh.log" "reverted-commits: the forge merge ran"
+  pass "fm-pr-merge lists the earlier base commits whose work a stale tree would revert"
+}
+
 test_content_guard_that_cannot_run_refuses() {
   local case_dir
   case_dir=$(make_case guard-unavailable)
@@ -3291,6 +3358,8 @@ test_forgejo_merge_passes_the_content_guard() {
     "forgejo-content-guard: the diff stat against origin/main was not printed"
   assert_grep 'verdict=pass' "$case_dir/state/task-x1.merge-guard" \
     "forgejo-content-guard: the passing verdict was not recorded"
+  assert_no_grep 'reverts work from' "$case_dir/stderr" \
+    "forgejo-content-guard: a clean pull request listed reverted commits"
 
   case_dir=$(make_forgejo_case forgejo-content-guard-unavailable)
   git -C "$case_dir/wt" remote remove origin
@@ -5011,6 +5080,8 @@ test_moved_head_refuses_until_recorded_again
 test_rebind_needs_a_reason_and_a_present_captain
 test_pr134_graft_is_refused
 test_mass_deletion_from_a_merge_resolution_refuses
+test_young_unreviewed_pr_merges
+test_stale_tree_lists_the_commits_it_reverts
 test_content_guard_that_cannot_run_refuses
 test_allow_content_arguments_are_strict
 test_forgejo_first_merge_attempt_binds_the_head
