@@ -204,6 +204,8 @@ error: refusing to merge ...
   - the combined commit status is "none", not success
 ```
 
+As on GitLab, the only exception is an attended `--allow-no-pipeline` on an explicit captain order for a repository that deliberately runs no CI, which waives exactly this `none` reading and nothing else; the header of `bin/fm-pr-merge.sh` owns its guards.
+
 **Not verified here:** the shape of a populated (non-empty) combined-status response from a real Forgejo Actions run, its pagination, and the pull request `draft` field.
 Standing up a Forgejo Actions runner was out of scope for this pass; the merge gate requires the combined status's `state` field to read exactly `success`, matching GitHub's and GitLab's own state enums, and refuses on anything else including an unrecognized value - the same fail-safe-refuse posture as every other condition here.
 

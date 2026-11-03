@@ -4965,7 +4965,7 @@ test_allow_no_pipeline_merges_only_a_null_head_pipeline() {
   pass "fm-pr-merge --allow-no-pipeline waives only a null GitLab head pipeline and keeps every other condition"
 }
 
-test_allow_no_pipeline_is_attended_only_and_gitlab_only() {
+test_allow_no_pipeline_is_attended_only_and_refused_on_github() {
   local case_dir rc head
   case_dir=$(make_gitlab_case gitlab-no-pipeline-away pipeline=null)
   write_away_record "$case_dir" --words 'merge task-x1'
@@ -5004,17 +5004,83 @@ test_allow_no_pipeline_is_attended_only_and_gitlab_only() {
   assert_no_grep 'pr merge' "$case_dir/gh.log" \
     "github-no-pipeline: gh pr merge ran despite the waiver"
 
-  case_dir=$(make_forgejo_case forgejo-no-pipeline)
+  pass "fm-pr-merge --allow-no-pipeline is attended-only, takes no value, and does not apply to GitHub"
+}
+
+# The same waiver covers a Forgejo/Gitea repository that runs no CI: a head with
+# no commit statuses at all. It never passes a status that exists but is not
+# green, every other condition still holds, and it stays attended-only.
+test_allow_no_pipeline_waives_only_a_statusless_forgejo_head() {
+  local case_dir rc
+  case_dir=$(make_forgejo_case forgejo-no-pipeline-none)
+  write_forgejo_status_json "$case_dir/tea-status.json" total_count=0
   set +e
   run_pr_merge "$case_dir" task-x1 "$FJ_URL" --allow-no-pipeline \
     > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
-  expect_code 2 "$rc" "forgejo-no-pipeline: the waiver must not apply on Forgejo"
-  assert_grep '--allow-no-pipeline applies only to GitLab' "$case_dir/stderr" \
-    "forgejo-no-pipeline: the refusal did not name GitLab"
-  [ ! -s "$case_dir/tea.log" ] || fail "forgejo-no-pipeline: tea ran despite the waiver"
-  pass "fm-pr-merge --allow-no-pipeline is attended-only, takes no value, and applies only to GitLab"
+  expect_code 0 "$rc" "forgejo-no-pipeline-none: a head with no statuses must merge under the waiver ($(cat "$case_dir/stderr"))"
+  assert_grep "with no commit statuses, waived by --allow-no-pipeline" "$case_dir/stderr" \
+    "forgejo-no-pipeline-none: the waiver was not named in the verified line"
+  assert_present "$case_dir/tea-merge-called" "forgejo-no-pipeline-none: no merge request was sent"
+
+  # Gitea 1.27 reports a head with no statuses as null statuses with a zero
+  # total rather than an empty list; it is the same "none" reading.
+  case_dir=$(make_forgejo_case forgejo-no-pipeline-null)
+  printf '%s\n' '{"state":"","sha":"","total_count":0,"statuses":null}' > "$case_dir/tea-status.json"
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$FJ_URL" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "forgejo-no-pipeline-null: null statuses must refuse as none without the waiver"
+  assert_grep 'the combined commit status is "none", not success' "$case_dir/stderr" \
+    "forgejo-no-pipeline-null: null statuses were not read as none"
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$FJ_URL" --allow-no-pipeline > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "forgejo-no-pipeline-null: null statuses must merge under the waiver ($(cat "$case_dir/stderr"))"
+  assert_present "$case_dir/tea-merge-called" "forgejo-no-pipeline-null: no merge request was sent"
+
+  case_dir=$(make_forgejo_case forgejo-no-pipeline-red)
+  write_forgejo_status_json "$case_dir/tea-status.json" state=failure
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$FJ_URL" --allow-no-pipeline \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "forgejo-no-pipeline-red: a failing status must still refuse under the waiver"
+  assert_grep 'the combined commit status is "failure", not success' "$case_dir/stderr" \
+    "forgejo-no-pipeline-red: the failing status was not reported"
+  assert_absent "$case_dir/tea-merge-called" "forgejo-no-pipeline-red: a merge request was sent"
+
+  case_dir=$(make_forgejo_case forgejo-no-pipeline-draft draft=true)
+  write_forgejo_status_json "$case_dir/tea-status.json" total_count=0
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$FJ_URL" --allow-no-pipeline \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "forgejo-no-pipeline-draft: the waiver must not lift any other condition"
+  assert_grep 'the pull request is a draft' "$case_dir/stderr" \
+    "forgejo-no-pipeline-draft: the draft refusal was not reported"
+  assert_no_grep 'combined commit status' "$case_dir/stderr" \
+    "forgejo-no-pipeline-draft: the waived status was still reported as a refusal"
+  assert_absent "$case_dir/tea-merge-called" "forgejo-no-pipeline-draft: a merge request was sent"
+
+  case_dir=$(make_forgejo_case forgejo-no-pipeline-away)
+  write_forgejo_status_json "$case_dir/tea-status.json" total_count=0
+  write_away_record "$case_dir" --words 'merge anything green'
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$FJ_URL" --allow-no-pipeline \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "forgejo-no-pipeline-away: the waiver must refuse while away"
+  assert_grep '--allow-no-pipeline is attended-only' "$case_dir/stderr" \
+    "forgejo-no-pipeline-away: the away refusal was not named"
+  assert_absent "$case_dir/tea-merge-called" "forgejo-no-pipeline-away: a merge request was sent"
+  pass "fm-pr-merge --allow-no-pipeline waives only a Forgejo head with no commit statuses, attended"
 }
 
 test_gitlab_head_override_args_refuse_before_recording
@@ -5074,7 +5140,8 @@ test_required_partial_reads_report_all_failures
 test_allow_red_refused_on_forgejo
 test_allow_missing_refused_on_forgejo
 test_allow_no_pipeline_merges_only_a_null_head_pipeline
-test_allow_no_pipeline_is_attended_only_and_gitlab_only
+test_allow_no_pipeline_is_attended_only_and_refused_on_github
+test_allow_no_pipeline_waives_only_a_statusless_forgejo_head
 test_hand_edited_binding_refuses
 test_moved_head_refuses_until_recorded_again
 test_rebind_needs_a_reason_and_a_present_captain
