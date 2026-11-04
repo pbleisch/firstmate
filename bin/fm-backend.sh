@@ -333,6 +333,31 @@ fm_backend_detect_hc_core_sock() {
   fi
 }
 
+# fm_backend_hc_running_core_select: make this process reach <session>'s
+# RUNNING core, and say whether one is running, without contacting hc. A
+# process with no XDG_RUNTIME_DIR - a remote job runs under env -i - resolves
+# the state-directory layout above, while a core started from a login session
+# on systemd Linux listens under that session's /run/user/<uid>; its first hc
+# call would then start a second core nothing watches. So when XDG_RUNTIME_DIR
+# is unset and the session's socket is in the login runtime directory,
+# XDG_RUNTIME_DIR is exported to it, for this shell and its children. Call it
+# directly, never in a command substitution, or the export is lost. Returns 0
+# when the session's socket exists in the resulting layout and 1 when none
+# does; a present socket answers or refuses, and only a missing one lets hc
+# start a core. FM_BACKEND_HC_LOGIN_RUNTIME_BASE (default /run/user) exists for
+# tests.
+fm_backend_hc_running_core_select() {  # <session>
+  local session=$1 login_dir
+  if [ -z "${FM_HC_SOCKET:-}" ] && [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    login_dir="${FM_BACKEND_HC_LOGIN_RUNTIME_BASE:-/run/user}/$(id -u 2>/dev/null)"
+    if [ -S "$login_dir/herdr-core/$session.sock" ]; then
+      XDG_RUNTIME_DIR=$login_dir
+      export XDG_RUNTIME_DIR
+    fi
+  fi
+  [ -S "$(HC_SESSION=$session fm_backend_detect_hc_core_sock)" ]
+}
+
 # fm_backend_detect_herdr_app_terminal: this process's own terminal record
 # carries a non-empty herdr.space label, the exact condition the app uses to
 # show a terminal in the window. The caller has already proven

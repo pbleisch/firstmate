@@ -15,6 +15,8 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # shellcheck source=tests/rex-fake-fixture.sh
 . "$(dirname "${BASH_SOURCE[0]}")/rex-fake-fixture.sh"
+# shellcheck source=tests/hc-fake-fixture.sh
+. "$(dirname "${BASH_SOURCE[0]}")/hc-fake-fixture.sh"
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (the herdr adapter parses its JSON)"; exit 0; }
 command -v python3 >/dev/null 2>&1 || { echo "skip: python3 not found (plistlib parses the owned launch-agent contract)"; exit 0; }
 
@@ -78,6 +80,8 @@ new_case() {
   unset CASE_SECOND_LOGIN_SHELL
   unset CASE_ENV_SHELL
   unset CASE_RESOLVE_DSCL
+  unset CASE_XDG_RUNTIME_DIR
+  unset CASE_HC_LOGIN_BASE
   CASE_N=$((CASE_N + 1))
   CASE_LOGIN_SHELL=${4:-/bin/sh}
   CASE_DIR="$TMP_ROOT/case$CASE_N"
@@ -358,6 +362,8 @@ doctor() {
     SHELL="${CASE_ENV_SHELL-${SHELL-}}" \
     FM_REMOTE_JOB_PLATFORM_OVERRIDE="${CASE_PLATFORM_OVERRIDE-}" \
     FM_REMOTE_JOB_ACTIVE="${CASE_REMOTE_JOB_ACTIVE-1}" \
+    XDG_RUNTIME_DIR="${CASE_XDG_RUNTIME_DIR-${XDG_RUNTIME_DIR-}}" \
+    FM_BACKEND_HC_LOGIN_RUNTIME_BASE="${CASE_HC_LOGIN_BASE-}" \
     "$ROOT/bin/fm-remote-doctor.sh" "$@" 2>&1
   )
   DOCTOR_RC=$?
@@ -1188,3 +1194,105 @@ assert_contains "$DOCTOR_OUT" 'check remote-job-worker=ok:' \
 assert_not_contains "$DOCTOR_OUT" 'check herdr-server=' "the herdr server was checked for rex on linux"
 [ ! -s "$CASE_LAUNCHCTL_LOG" ] || fail "the linux rex path invoked launchctl"
 pass "a Linux host verifies rex without any Aqua-specific requirement"
+
+# --- the hc backend: herdr-core, its version floor, and a running default core -
+
+# install_case_hc [herdr-core|hc]: put the shared file-backed hc fake on the
+# case PATH under that name and give the account a running default core in
+# hc's state-directory layout. A remote job carries no XDG_RUNTIME_DIR, so the
+# case runs without one. The socket lives under a short path (a unix socket
+# path is limited to about 100 bytes) that the account's state directory links
+# to.
+install_case_hc() {
+  local name=${1:-herdr-core} short
+  write_hc_fake_cli "$CASE_BIN/$name" "$CASE_STATE/hcfake"
+  short=$(mktemp -d /tmp/fmhcd.XXXXXX) || fail "could not create the core socket directory"
+  FM_TEST_CLEANUP_DIRS+=("$short")
+  mkdir -p "$CASE_HOME/.local"
+  ln -s "$short" "$CASE_HOME/.local/state"
+  CASE_HC_SOCK="$CASE_HOME/.local/state/herdr-core/default/default.sock"
+  hc_fake_socket "$short/herdr-core/default/default.sock"
+  CASE_HC_SHORT=$short
+  CASE_XDG_RUNTIME_DIR=
+  CASE_HC_LOGIN_BASE="$short/run"
+}
+
+new_case Darwin no-herdr gui
+install_case_hc
+doctor --backend hc
+expect_code 1 "$DOCTOR_RC" "an hc host with an absent job worker was reported ready"
+assert_contains "$DOCTOR_OUT" "required hc=$CASE_BIN/herdr-core" "herdr-core was not reported as the required hc CLI"
+assert_not_contains "$DOCTOR_OUT" 'required herdr=' "an hc verification still required the herdr CLI"
+assert_contains "$DOCTOR_OUT" "check hc=ok: $CASE_BIN/herdr-core (hc 0.1.17)" "the fake herdr-core was not detected"
+assert_contains "$DOCTOR_OUT" "check hc-core=ok: the core for hc session 'default' answers at $CASE_HC_SOCK" \
+  "the running default core was not accepted"
+assert_not_contains "$DOCTOR_OUT" 'check herdr=' "an hc verification still ran the herdr checks"
+assert_not_contains "$DOCTOR_OUT" 'check launchagent=' "an hc verification still ran the Herdr launch-agent checks"
+assert_not_contains "$DOCTOR_OUT" 'check rex' "an hc verification ran rex checks"
+doctor --backend hc --fix
+expect_code 0 "$DOCTOR_RC" "an hc host was not ready after --fix"
+assert_contains "$DOCTOR_OUT" 'check remote-job-worker-loaded=ok:' "--fix did not load the remote job worker for hc"
+assert_not_contains "$DOCTOR_OUT" 'fix hc' "--fix claimed an hc repair"
+assert_no_grep 'dev.firstmate.herdr' "$CASE_LAUNCHCTL_LOG" "the hc repair touched a herdr launch agent"
+[ "$(grep -c $'\x1fserver\x1fstart' "$CASE_STATE/hcfake/log")" -eq 0 ] || fail "the doctor started an hc core"
+assert_no_dangerous_calls "the hc repair reached for auto-login, FileVault, or the keychain"
+pass "an hc-verified host checks herdr-core, its running default core, and the backend-independent worker"
+
+# No running core is a human gap, and nothing contacts hc beyond its version,
+# so the doctor never starts the core Herdr.app should own.
+new_case Darwin no-herdr gui
+install_case_hc
+rm -f "$CASE_HC_SHORT/herdr-core/default/default.sock"
+for mode in check fix; do
+  : > "$CASE_STATE/hcfake/log"
+  if [ "$mode" = fix ]; then doctor --backend hc --fix; else doctor --backend hc; fi
+  expect_code 1 "$DOCTOR_RC" "an hc host with no running core was reported ready ($mode)"
+  assert_contains "$DOCTOR_OUT" "check hc-core=human: no core for hc session 'default' is running on this account" \
+    "a missing core was not a human gap ($mode)"
+  assert_contains "$DOCTOR_OUT" 'action: hc-core:' "a missing core came with no operator action ($mode)"
+  if grep -v $'\x1f--version' "$CASE_STATE/hcfake/log" | grep -q .; then
+    fail "the doctor contacted hc with no running core ($mode): $(cat "$CASE_STATE/hcfake/log")"
+  fi
+done
+pass "a missing default core is a human gap the doctor never starts"
+
+# A core that a login session started on systemd Linux listens in the login
+# runtime directory, which a remote job does not carry; the doctor finds it
+# there.
+new_case Linux no-herdr
+install_case_hc
+rm -f "$CASE_HC_SHORT/herdr-core/default/default.sock"
+hc_fake_socket "$CASE_HC_LOGIN_BASE/$(id -u)/herdr-core/default.sock"
+doctor --backend hc
+expect_code 0 "$DOCTOR_RC" "an hc core in the login runtime directory was not found"
+assert_contains "$DOCTOR_OUT" "check hc-core=ok: the core for hc session 'default' answers at $CASE_HC_LOGIN_BASE/$(id -u)/herdr-core/default.sock" \
+  "the doctor did not report the login runtime directory's core"
+assert_grep "XDG_RUNTIME_DIR=$CASE_HC_LOGIN_BASE/$(id -u)" "$CASE_STATE/hcfake/log" \
+  "the handshake did not reach the login runtime directory's core"
+assert_contains "$DOCTOR_OUT" 'check gui-session=skip:' "an Aqua login session was required for hc on linux"
+assert_contains "$DOCTOR_OUT" 'check linger=' "linger was not checked for hc on linux"
+pass "a Linux hc host finds a core in the login runtime directory and checks linger"
+
+# herdr-core below the adapter's floor is a human gap; the hc alias alone
+# resolves; an hc-only host resolves hc under `any`.
+new_case Darwin no-herdr gui
+install_case_hc
+printf '0.1.14\n' > "$CASE_STATE/hcfake/version"
+doctor --backend hc
+expect_code 1 "$DOCTOR_RC" "an older herdr-core was reported ready"
+assert_contains "$DOCTOR_OUT" 'check hc=human:' "herdr-core below the floor was not tagged human"
+assert_contains "$DOCTOR_OUT" 'older than the verified minimum' "the floor gap did not name the version problem"
+new_case Darwin no-herdr gui
+install_case_hc hc
+doctor --backend hc
+assert_contains "$DOCTOR_OUT" "required hc=$CASE_BIN/hc" "the hc alias alone did not resolve"
+assert_contains "$DOCTOR_OUT" 'check hc=ok:' "the hc alias was not accepted"
+doctor
+assert_contains "$DOCTOR_OUT" 'check hc=ok:' "an hc-only host did not resolve hc under any"
+assert_not_contains "$DOCTOR_OUT" 'check backend=' "an hc-only host was reported as having no backend"
+new_case Darwin no-herdr gui
+doctor --backend hc
+expect_code 1 "$DOCTOR_RC" "an hc-less host was reported ready for hc"
+assert_contains "$DOCTOR_OUT" 'check hc=human:' "a missing herdr-core was not a human gap"
+assert_contains "$DOCTOR_OUT" 'required hc=MISSING' "the missing herdr-core was not reported"
+pass "the hc floor, the alias, and any-resolution follow the hc adapter"

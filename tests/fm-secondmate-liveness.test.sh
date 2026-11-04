@@ -1559,6 +1559,27 @@ test_remote_full_probe_rex_readiness_verdicts() {
   pass "full probe: rex readiness gaps and unreachable hosts stay explicit"
 }
 
+test_remote_full_probe_hc_route() {
+  local w out
+  w=$(make_remote_probe_world_rex probe-hc)
+  sed -i.bak '/^remote_backend=/d;/^remote_rex_/d;/^remote_target=/d' "$w/home/state/rsm1.meta"
+  rm -f "$w/home/state/rsm1.meta.bak"
+  printf 'remote_backend=hc\nremote_hc_session=default\nremote_target=default:t4\n' >> "$w/home/state/rsm1.meta"
+
+  # A green readiness gate, an alive hc endpoint, and a matching route keep
+  # the recorded hc backend live.
+  out=$(probe_remote "$w" full FM_FAKE_ROUTE_BACKEND=hc FM_FAKE_ROUTE_TARGET=default:t4)
+  [ "$out" = 'alive|alive|0|||' ] || fail "a live hc route should stay a quiet no-op, got: $out"
+  grep -q -- '--backend hc' "$w/ssh.log" \
+    || fail "the readiness gate did not ask the remote doctor about hc: $(cat "$w/ssh.log")"
+
+  # A herdr route under an hc record is drift to report, never to migrate.
+  out=$(probe_remote "$w" full FM_FAKE_ROUTE_BACKEND=herdr)
+  [ "$out" = "skipped|alive|0|||alive remote endpoint runs on backend 'herdr', but this home recorded 'hc'; migrate or retire it explicitly" ] \
+    || fail "a herdr route under an hc record must be reported, got: $out"
+  pass "full probe: a live hc route stays alive through the hc readiness gate, and drift is reported"
+}
+
 test_remote_full_probe_legacy_record_defaults_herdr() {
   local w out
   w=$(make_remote_probe_world_rex probe-legacy)
@@ -1617,6 +1638,7 @@ test_remote_poll_probe_unreachable_preserves_route
 test_remote_full_probe_rex_route
 test_remote_full_probe_rex_backend_drift
 test_remote_full_probe_rex_readiness_verdicts
+test_remote_full_probe_hc_route
 test_remote_full_probe_legacy_record_defaults_herdr
 
 echo "# all fm-secondmate-liveness tests passed"

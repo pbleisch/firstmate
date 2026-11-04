@@ -131,6 +131,7 @@ The respawn is `bin/fm-spawn.sh <id> --secondmate` on the mate's recorded backen
 [`bin/fm-secondmate-move.sh`](../bin/fm-secondmate-move.sh) `<id> --backend hc` moves an existing local mate from another local backend onto hc while keeping its home, records, and backlog, and recovery then keeps it on hc because the record names hc; its header owns the sequence and its refusals.
 Stopping and restarting an hc second mate (`bin/fm-control.sh <id> exit` and `relaunch`, which `/updatefirstmate` uses through `bin/fm-secondmate-restart.sh`) adopts the mate's surviving terminal, so the replacement keeps its address, labels, and space.
 A mate whose terminal is missing or finished is never relaunched in place; recovery owns that respawn.
+A remote second mate can also run on hc, in its host's `default` core; [remote second mates](remote-secondmates.md#launch-or-recover) owns that placement and its readiness.
 
 ## Limits
 

@@ -22,7 +22,7 @@ Firstmate does not support placing an individual worker remotely or failing a re
 
 ## Where the remote agent runs
 
-The remote second-mate agent runs on one of two session-provider backends, selected per launch.
+The remote second-mate agent runs on one of three session-provider backends, selected per launch.
 [Launch selection and placement](#launch-or-recover) define the backend contract.
 Provisioning checks any available supported backend; launch checks the selected one.
 
@@ -33,6 +33,9 @@ Provisioning checks any available supported backend; launch checks the selected 
 - A remote Rex endpoint requires a persistent rex server started with `rex server start`, which is a detached daemon no SSH session owns.
   An ephemeral `rex server run --exit-empty` server exits when its last session or control connection disappears, so it can never satisfy remote readiness.
 - [Rex's server-stop limits](rex-backend.md#active-limits) explain session restoration and agent recovery.
+- A remote hc endpoint runs in the account's `default` herdr-core session, a per-user core daemon no SSH session owns.
+  It is the core a Herdr.app machine connection to that host already watches, so the mate and its crew appear in Herdr.app under that machine.
+  The mate's crew start in the same core when the mate home selects hc, through its inherited `config/backend` or the [app-terminal signal](hc-backend.md#second-mates) its labeled terminal carries.
 - Local second mates are unaffected and keep their ordinary backend and session selection.
   So do the workers a remote second mate supervises inside its own home.
 
@@ -231,10 +234,11 @@ Check any host against it directly:
 ```sh
 bin/fm-on.sh <secondmate-id|ssh-alias> fm-remote-doctor.sh
 bin/fm-on.sh <secondmate-id|ssh-alias> fm-remote-doctor.sh --backend rex
+bin/fm-on.sh <secondmate-id|ssh-alias> fm-remote-doctor.sh --backend hc
 ```
 
-`--backend` names the session backend to verify: `herdr`, `rex`, or `any`.
-The default `any` resolves herdr when its CLI is present and rex otherwise, so a host offering both is verified for the default backend.
+`--backend` names the session backend to verify: `herdr`, `rex`, `hc`, or `any`.
+The default `any` resolves herdr when its CLI is present, then rex, then hc, so a host offering several is verified for the default backend.
 The launch path passes the launch's own selection, so the gate a launch passes is the gate for the backend it will use.
 
 That run is read-only.
@@ -275,6 +279,10 @@ Under `--backend rex --fix`, it also starts the account's persistent rex server 
 It never stops or restarts an answering server, because a stop ends every process in that server's sessions, including unrelated work and sibling agents, and a restore brings back only shells.
 An answering exit-empty server is reported as a human gap: at a time when nothing runs there, an operator runs `rex server stop` and then `rex server start` on that account, and rex stays not ready until then.
 Because Rex starts a missing server as exit-empty, nothing else Firstmate runs for a remote second mate starts one: while no server answers, the remote endpoint state reads `unreadable`, and recovery waits for this repair to start the persistent server.
+Under `--backend hc` nothing is repaired: herdr-core below the adapter's version floor, no running `default` core, and an account that does not linger on Linux are human gaps.
+Firstmate never starts or restarts that core, because hc starts a fresh core on any contact whose socket is missing, and one started from a remote job may not be the core Herdr.app watches.
+Remote jobs run without the login session's `XDG_RUNTIME_DIR`, so the doctor and the remote control plane look for the core's socket under the login runtime directory (`/run/user/<uid>`) as well as hc's own state-directory layout, and use whichever holds the running core.
+While no core runs, every remote hc verb refuses and the remote endpoint state reads `unverified`, so recovery waits for the core to come back.
 
 ### How the Herdr launch agent starts its server
 
@@ -341,7 +349,7 @@ A file at `~/.local/bin/fm-remote-entrypoint.sh` that is not Firstmate's own sym
 
 | Requirement | Tools |
 | --- | --- |
-| Always required | `git`, `jq`, the selected backend's CLI (`herdr` or `rex`), compatible `tasks-axi`, and `treehouse` |
+| Always required | `git`, `jq`, the selected backend's CLI (`herdr`, `rex`, or `herdr-core` or its `hc` alias at the [hc adapter's floor](hc-backend.md)), compatible `tasks-axi`, and `treehouse` |
 | At least one of | `claude`, `codex`, `opencode`, `pi`, `pi-signed`, `grok`, `kimi`, or `omp` |
 | Additionally required on macOS | `lsof`, so the doctor and guard can prove which process owns the session socket |
 
@@ -450,18 +458,19 @@ The primary then takes these steps:
 3. It transfers the inherited-material allowlist.
 4. It asks the remote host to launch on that backend.
 
-A new route defaults to Herdr; pass `--backend rex` to select Rex.
+A new route defaults to Herdr; pass `--backend rex` to select Rex or `--backend hc` to select hc.
 Without an explicit backend, a later launch or liveness recovery preserves the parent's recorded `remote_backend`; legacy records without that field use Herdr.
 An existing endpoint on a different backend is refused rather than migrated.
 Placement is per backend:
 
 - Herdr: all remote secondmates on one host share `fm-remote` and retain separate `2ndmate-<id>` workspaces inside it.
 - Rex: each remote secondmate home gets its own `2ndmate-<id>-<hash>` session on the host's persistent personal rex server, the same placement rule a local secondmate home uses.
+- hc: every remote secondmate on one host shares the account's `default` core; each mate's terminal carries its own space label, the [local second-mate placement](hc-backend.md#second-mates), and its identity labels are the host code root's, the identity every remote verb uses.
 
 ### Refused and unsupported launches
 
-- An explicit request for any backend other than herdr or rex is refused rather than honored, and the remote host refuses one too.
-- An existing remote endpoint recorded outside its backend's contract - a Herdr session other than `fm-remote`, or a Rex route whose recorded server is not a local `unix://` endpoint - is classified as unverified and left untouched.
+- An explicit request for any backend other than herdr, rex, or hc is refused rather than honored, and the remote host refuses one too.
+- An existing remote endpoint recorded outside its backend's contract - a Herdr session other than `fm-remote`, a Rex route whose recorded server is not a local `unix://` endpoint, or an hc session other than `default` - is classified as unverified and left untouched.
   Launch, liveness recovery, control, and retirement refuse it until an operator explicitly migrates it, instead of attempting a live cutover.
 - A launch after a host has drifted out of readiness fails with the doctor's own gap text instead of leaving a half-created endpoint.
 - Raw launch commands are not accepted for remote secondmates.
@@ -764,6 +773,7 @@ It refuses while any of these holds:
 
 Herdr retirement closes only the retiring secondmate's panes or `2ndmate-<id>` workspace in `fm-remote`, never the shared session or a sibling's workspace or panes.
 Rex retirement follows the [recorded-block and empty-session cleanup contract](rex-backend.md#cleanup-and-the-absence-proof), never stopping the shared server.
+hc retirement closes only the retiring secondmate's recorded terminal, never the shared `default` core.
 SSH exit 255 preserves both the route and local records because completion is unknown.
 `--force` remains the explicit discard path and requires the same captain authority as local secondmate discard.
 
@@ -810,6 +820,7 @@ bin/fm-test-run.sh tests/fm-remote-reply.test.sh
 bin/fm-test-run.sh tests/fm-remote-backlog-handoff.test.sh
 bin/fm-test-run.sh tests/fm-remote-secondmate-lifecycle-e2e.test.sh
 bin/fm-test-run.sh tests/fm-remote-secondmate-omp.test.sh
+bin/fm-test-run.sh tests/fm-remote-secondmate-hc.test.sh
 bin/fm-test-run.sh tests/fm-remote-secondmate-trace-context.test.sh
 ```
 

@@ -3744,3 +3744,5 @@ Herdr.app's installed guide and adoption implementation identify `herdr.tab` ter
 - `send --wait`'s `started`/`working` proof against a real status-reporting harness; the lab run covered a non-reporting shell, whose verdict falls to the composer screen.
 - Conversational submit confirmation across harnesses beyond the exercised omp lifecycle path.
 - Native `status.state` reported by a real harness launched through `bin/fm-spawn.sh`.
+- A remote second mate on hc against a real host's core and Herdr.app's machine connection to it, including where that core's socket lives when a login session started it; `tests/fm-remote-secondmate-hc.test.sh` covers the remote control plane against a fake core only.
+- Stopping and relaunching an hc second mate with a real harness; `tests/fm-backend-hc.test.sh` covers it against a fake core only.

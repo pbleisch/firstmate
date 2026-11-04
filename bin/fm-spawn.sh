@@ -1329,7 +1329,7 @@ fi
 spawn_remote_secondmate() {
   local id=$1 remote host root home harness positional model effort backend out rc meta tmp
   local remote_backend remote_target remote_harness remote_herdr_session registry_lock remote_lock remote_generation
-  local remote_rex_session_id remote_rex_server remote_rex_ok
+  local remote_rex_session_id remote_rex_server remote_rex_ok remote_hc_session remote_hc_ok
   local remote_traceparent remote_recorded_traceparent sm_primary_head sync_out sync_rc account_config
   local -a launch_args
   id=${POS[0]:-}
@@ -1437,7 +1437,8 @@ spawn_remote_secondmate() {
   # A remote second mate runs only on a backend whose session-provider server
   # outlives every SSH connection that supervises it: herdr (its server belongs
   # to the host's GUI login session) is the default; rex runs on the host's
-  # persistent personal rex server. Without an explicit selection a relaunch
+  # persistent personal rex server, and hc in the account's default
+  # herdr-core session, which Herdr.app shows. Without an explicit selection a relaunch
   # keeps the backend its record names, and a record written before rex
   # existed names none, so it is herdr. bin/fm-remote-doctor.sh gates that host
   # on the selected backend, and the remote home's config/backend never
@@ -1448,11 +1449,11 @@ spawn_remote_secondmate() {
   fi
   case "${backend:--}" in
   -) backend=herdr ;;
-  herdr | rex) ;;
+  herdr | rex | hc) ;;
   *)
     fm_lock_release "$registry_lock" || true
     fm_lock_release "$SPAWN_TASK_LOCK" || true
-    echo "error: a remote secondmate runs only on the herdr or rex backend, not '$backend'" >&2
+    echo "error: a remote secondmate runs only on the herdr, rex, or hc backend, not '$backend'" >&2
     return 1
     ;;
   esac
@@ -1570,6 +1571,7 @@ spawn_remote_secondmate() {
   remote_herdr_session=
   remote_rex_session_id=
   remote_rex_server=
+  remote_hc_session=
   case "$remote_backend" in
     herdr)
       remote_herdr_session=$(printf '%s\n' "$out" | sed -n 's/^herdr_session=//p' | tail -1)
@@ -1598,6 +1600,22 @@ spawn_remote_secondmate() {
         fm_lock_release "$registry_lock" || true
         fm_lock_release "$SPAWN_TASK_LOCK" || true
         echo "error: remote launch returned malformed Rex route metadata (session '${remote_rex_session_id:-missing}', server '${remote_rex_server:-missing}', target '${remote_target:-missing}'); preserving the remote route for reconciliation" >&2
+        return 1
+      fi
+      ;;
+    hc)
+      # The route must name the account's default core session and a
+      # <session>:<address> target inside it.
+      remote_hc_session=$(printf '%s\n' "$out" | sed -n 's/^hc_session=//p' | tail -1)
+      remote_hc_ok=1
+      [ "$remote_hc_session" = default ] || remote_hc_ok=0
+      case "$remote_target" in default:t?*) ;; *) remote_hc_ok=0 ;; esac
+      case "${remote_target#default:t}" in '' | *[!0-9a-z]*) remote_hc_ok=0 ;; esac
+      if [ "$remote_hc_ok" -ne 1 ]; then
+        fm_lock_release "$remote_lock" || true
+        fm_lock_release "$registry_lock" || true
+        fm_lock_release "$SPAWN_TASK_LOCK" || true
+        echo "error: remote launch returned malformed hc route metadata (session '${remote_hc_session:-missing}', target '${remote_target:-missing}'), expected session 'default'; preserving the remote route for reconciliation" >&2
         return 1
       fi
       ;;
@@ -1634,6 +1652,7 @@ spawn_remote_secondmate() {
         echo "remote_rex_session_id=$remote_rex_session_id"
         echo "remote_rex_server=$remote_rex_server"
         ;;
+      hc) echo "remote_hc_session=$remote_hc_session" ;;
     esac
     echo "remote_target=$remote_target"
     [ -z "$remote_recorded_traceparent" ] || echo "traceparent=$remote_recorded_traceparent"
