@@ -297,8 +297,9 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
 # is refused for a remote mate before any attempt is recorded, because a remote
 # mate's backend belongs to its host. A move never resumes in place: a T3
 # resume becomes a kill that must prove the thread archived before the
-# respawn on the target. Without it a local mate is respawned on its recorded
-# backend.
+# respawn on the target, and a move off T3 then removes the T3 environment
+# from the mate's home, refusing the respawn if it cannot. Without it a local
+# mate is respawned on its recorded backend.
 # On t3code a close that cannot be proven stops there: the thread and its
 # metadata stay as recorded, the verdict becomes skipped, and nothing is
 # spawned, because a second thread beside a live one is the duplicate
@@ -371,6 +372,23 @@ fm_secondmate_liveness_relaunch() {  # <meta> <id> [timeout-secs] [backend]
       FM_SM_LIVE_STATUS=skipped
       fm_lock_release "$relaunch_lock" || true
       FM_SM_LIVE_REASON="could not prove the old $backend endpoint $target closed; it and its record are left in place, not replaced"
+      FM_SM_LIVE_RC=1
+      return 1
+    fi
+  fi
+  # A move off T3 removes the environment the T3 launch wrote into the mate's
+  # home once the old thread is proven closed above: its FM_SUPERVISOR_BACKEND
+  # and FM_SUPERVISOR_TARGET still name the archived thread, so the replacement
+  # would otherwise keep discovering that thread as its supervisor endpoint.
+  if [ -n "$move_backend" ] && [ "$move_backend" != t3code ] && [ "$(fm_backend_of_meta "$meta")" = t3code ]; then
+    local mate_home
+    mate_home=$(fm_meta_get "$meta" home)
+    [ -n "$mate_home" ] || mate_home=$(fm_meta_get "$meta" worktree)
+    if [ -z "$mate_home" ] || ! { fm_backend_source t3code && fm_backend_t3code_home_env_cleanup "$mate_home"; } 2>/dev/null; then
+      fm_secondmate_liveness_ledger_add "$id" failed || true
+      FM_SM_LIVE_STATUS=skipped
+      fm_lock_release "$relaunch_lock" || true
+      FM_SM_LIVE_REASON="the old T3 thread is closed, but the T3 environment in second mate $id's home ${mate_home:-(none recorded)} could not be removed, so nothing was launched on $move_backend"
       FM_SM_LIVE_RC=1
       return 1
     fi

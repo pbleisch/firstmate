@@ -2459,8 +2459,13 @@ test_failed_t3_secondmate_move_archives_before_respawn_on_target() {
   mkdir -p "$root/bin"
   printf '#!/usr/bin/env bash\nprintf "SPAWN %%s\\n" "$*" >> "%s"\n' "$CASE_DIR/spawns" > "$root/bin/fm-spawn.sh"
   chmod +x "$root/bin/fm-spawn.sh"
-  run_move_relaunch() {  # <state-dir>
-    mkdir -p "$1"
+  run_move_relaunch() {  # <state-dir> [settings-json]
+    mkdir -p "$1" "$CASE_DIR/sm-home/.claude"
+    # The environment the T3 launch wrote into the mate's home, beside an
+    # entry of the home's own.
+    local settings="{\"env\":{\"HOME_OWN\":\"kept\",\"FM_SUPERVISOR_BACKEND\":\"t3code\",\"FM_SUPERVISOR_TARGET\":\"$thread\",\"FM_T3CODE_ENV_KEYS\":\"FM_SUPERVISOR_BACKEND,FM_SUPERVISOR_TARGET\"}}"
+    [ "$#" -lt 2 ] || settings=$2
+    printf '%s\n' "$settings" > "$CASE_DIR/sm-home/.claude/settings.local.json"
     fm_write_meta "$1/smmove.meta" "window=fm-smmove" "kind=secondmate" "harness=claude" "backend=t3code" "t3_thread_id=$thread" "home=$CASE_DIR/sm-home"
     STATE="$1" FM_STATE_OVERRIDE="$1" FM_CONFIG_OVERRIDE="$CONFIG" FM_HOME="$CASE_DIR/home" FM_ROOT_OVERRIDE="$root" bash -c '
 . "$0/bin/fm-secondmate-liveness-lib.sh"
@@ -2476,6 +2481,8 @@ fm_secondmate_liveness_relaunch "$1" smmove "" hc && echo relaunched=yes || echo
   [ "$(t3_request "$(t3_log_line_of 'r.tool === "t3_thread_organize"')" 'r.arguments.action')" = archive ] || fail "the move closes the thread by archiving it"
   assert_grep "SPAWN smmove --secondmate --backend hc" "$CASE_DIR/spawns" "the respawn lands on the move's target backend"
   assert_grep relaunched "$CASE_DIR/state-ok/.secondmate-relaunch-smmove" "the move is recorded in the relaunch ledger"
+  assert_not_contains "$(cat "$CASE_DIR/sm-home/.claude/settings.local.json")" FM_SUPERVISOR "a move off T3 must not leave the archived thread as the mate's supervisor endpoint"
+  assert_grep '"HOME_OWN":"kept"' "$CASE_DIR/sm-home/.claude/settings.local.json" "the home's own env entries survive the move"
   : > "$CASE_DIR/spawns"
   : > "$LOG"
   t3_world "$(t3_thread_json "$thread" failed false)"
@@ -2485,7 +2492,17 @@ fm_secondmate_liveness_relaunch "$1" smmove "" hc && echo relaunched=yes || echo
   [ ! -s "$CASE_DIR/spawns" ] || fail "no respawn may run after an unproved close, got $(cat "$CASE_DIR/spawns")"
   assert_not_contains "$(t3_dispatch_types)" t3_thread_send "a refused move must not resume the thread either"
   assert_grep "t3_thread_id=$thread" "$CASE_DIR/state-fail/smmove.meta" "the endpoint record is kept"
-  pass "secondmate move backend=t3code: a failed run is archived with a proven close and respawned on the target, never resumed in place"
+  assert_grep FM_SUPERVISOR_TARGET "$CASE_DIR/sm-home/.claude/settings.local.json" "an unproved close leaves the live thread's environment in place"
+  # A T3 environment the move cannot remove stops it after the proven close,
+  # before anything is launched.
+  : > "$CASE_DIR/spawns"
+  : > "$LOG"
+  t3_world "$(t3_thread_json "$thread" failed false)"
+  out=$(run_move_relaunch "$CASE_DIR/state-envfail" '{"env":{"FM_T3CODE_ENV_KEYS":"FM_SUPERVISOR_TARGET",')
+  assert_contains "$out" "relaunched=no status=skipped reason=the old T3 thread is closed, but the T3 environment in second mate smmove's home $CASE_DIR/sm-home could not be removed" "an unremovable T3 environment must stop the move: $out"
+  [ ! -s "$CASE_DIR/spawns" ] || fail "no respawn may run with the old T3 environment still in the home, got $(cat "$CASE_DIR/spawns")"
+  assert_grep failed "$CASE_DIR/state-envfail/.secondmate-relaunch-smmove" "the refused move is recorded as a failed attempt"
+  pass "secondmate move backend=t3code: a failed run is archived with a proven close, its T3 home environment removed, and respawned on the target, never resumed in place"
 }
 
 # A secondmate whose thread was archived while its run still drains is not
