@@ -502,6 +502,26 @@ run_hc_control() {
     bash "${HC_CASE_PROGRAM:-$FM_TEST_ROOT/bin/fm-control.sh}" "$CONTROL_ID" "$@" 2>&1
 }
 
+# make_control_case_a_secondmate: turn the control case into a local hc second
+# mate whose terminal already sits in its seeded home, as a --secondmate spawn
+# leaves it (the mate's own space label, this home's identity labels).
+make_control_case_a_secondmate() {
+  local mate="$D/mate"
+  mkdir -p "$mate/bin" "$mate/data" "$mate/state" "$mate/config" "$mate/projects"
+  printf '%s\n' "$CONTROL_ID" > "$mate/.fm-secondmate-home"
+  printf '# Firstmate\n' > "$mate/AGENTS.md"
+  printf 'charter\n' > "$mate/data/charter.md"
+  printf '%s\n' 'projects/' 'state/' 'data/' 'config/' > "$mate/.gitignore"
+  git -C "$mate" init -q -b main
+  jq --arg cwd "$mate" '.foreground.cwd=$cwd | .labels["herdr.space"]="fm-mate-space"' "$D/t2.json" > "$D/new.json"
+  mv "$D/new.json" "$D/t2.json"
+  sed -e "s|^worktree=.*|worktree=$mate|" -e '/^mode=/d' -e '/^yolo=/d' -e '/^branch=/d' -e 's/^kind=ship$/kind=secondmate/' \
+    "$HOMEDIR/state/$CONTROL_ID.meta" > "$D/new.meta"
+  printf 'home=%s\n' "$mate" >> "$D/new.meta"
+  mv "$D/new.meta" "$HOMEDIR/state/$CONTROL_ID.meta"
+  cp "$HOMEDIR/state/$CONTROL_ID.meta" "$D/meta-before"
+}
+
 test_control_exit_proves_stop_and_is_idempotent() {
   local out rc=0
   setup_control_case control-exit
@@ -581,14 +601,36 @@ test_control_relaunch_reuses_identity_work_and_name() {
   pass "hc: relaunch republishes a live replacement while retaining task, local work, terminal and name"
 }
 
+# A second mate on hc stops and restarts in the terminal its spawn labeled into
+# the mate's own space, the restart /updatefirstmate drives for a local mate.
+test_control_secondmate_exit_and_relaunch_keep_the_mates_terminal() {
+  local out rc=0 line
+  setup_control_case secondmate-relaunch
+  make_control_case_a_secondmate
+  out=$(run_hc_control exit) || rc=$?
+  expect_code 0 "$rc" "an hc second mate's agent must stop: $out"
+  assert_equals "$(jq -r '.foreground.name' "$D/t2.json")" sh "the mate's agent ended but its terminal survived"
+  rc=0
+  out=$(run_hc_control relaunch --harness omp --model default --effort default --note 'Reload the updated instructions.') || rc=$?
+  expect_code 0 "$rc" "an hc second mate must relaunch in its own terminal: $out"
+  for line in kind=secondmate backend=hc hc_session=fmtest hc_terminal=t2 window=fmtest:t2 "home=$D/mate"; do
+    assert_contains "$(cat "$HOMEDIR/state/$CONTROL_ID.meta")" "$line" "the republished mate record retains $line"
+  done
+  assert_equals "$(jq -r '.foreground.name' "$D/t2.json")" omp "the replacement agent runs in the mate's terminal"
+  assert_equals "$(jq -r '.labels["herdr.space"]' "$D/t2.json")" fm-mate-space "the mate stays in its own space"
+  assert_not_contains "$(cat "$D/log")" $'\x1frun\x1f' "the replacement adopts the mate's terminal rather than creating one"
+  assert_contains "$(cat "$HOMEDIR/state/$CONTROL_ID.control-relaunch")" phase=complete "the transaction is complete"
+  pass "hc: a second mate stops and relaunches in its own labeled terminal"
+}
+
 test_control_relaunch_failure_boundaries() {
   local scenario out rc
-  for scenario in no-note pending missing secondmate launch-fails launch-sticks; do
+  for scenario in no-note pending missing missing-secondmate launch-fails launch-sticks; do
     setup_control_case "relaunch-$scenario"
     case "$scenario" in
       pending) printf '❯ draft\n' > "$D/screen" ;;
       missing) rm "$D/t2.json" ;;
-      secondmate) printf 'kind=secondmate\nhome=%s\n' "$D/work" >> "$HOMEDIR/state/$CONTROL_ID.meta"; cp "$HOMEDIR/state/$CONTROL_ID.meta" "$D/meta-before" ;;
+      missing-secondmate) make_control_case_a_secondmate; rm "$D/t2.json" ;;
       launch-*) touch "$D/$scenario" ;;
     esac
     rc=0
@@ -689,6 +731,7 @@ fm_test_run \
   test_control_exit_preserves_all_refusals \
   test_control_exit_never_claims_an_unconfirmed_stop \
   test_control_relaunch_reuses_identity_work_and_name \
+  test_control_secondmate_exit_and_relaunch_keep_the_mates_terminal \
   test_control_relaunch_failure_boundaries \
   test_task_names_are_valid_stable_and_collision_safe \
   test_process_scan_failures_never_prove_dead

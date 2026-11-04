@@ -106,7 +106,7 @@ An input, capture, or close that carries the task label refuses a terminal whose
 | Agent state | `hc get`, the foreground process and its process group, through the shared classifier |
 | Close | `hc kill`, then `hc rm`, then `hc get` must answer not found |
 
-`bin/fm-control.sh <id> exit` and `relaunch` are supported for ship and scout tasks in a surviving, positively classified local terminal.
+`bin/fm-control.sh <id> exit` and `relaunch` are supported for ship, scout, and second-mate tasks in a surviving, positively classified local terminal.
 They use the shared [agent control contract](agent-control.md), including its composer, prompt, harness, and transactional refusal rules.
 The process-state read verifies task/home labels before trusting the foreground, and a shell is agent-free only after a complete process-group scan.
 A failed, incomplete, or unattributed process read refuses rather than claiming the agent stopped.
@@ -129,7 +129,8 @@ A terminal whose program finished reads `missing` while the core still lists it 
 A terminal already gone is simply respawned, and an alive mate is never touched.
 The respawn is `bin/fm-spawn.sh <id> --secondmate` on the mate's recorded backend (PR #8082), so a local hc second mate stays on hc whatever `config/backend` says.
 [`bin/fm-secondmate-move.sh`](../bin/fm-secondmate-move.sh) `<id> --backend hc` moves an existing local mate from another local backend onto hc while keeping its home, records, and backlog, and recovery then keeps it on hc because the record names hc; its header owns the sequence and its refusals.
-Lifecycle control of an hc second mate (`bin/fm-control.sh <id> exit` and `relaunch`) is refused; the control plane supports hc for ship and scout tasks only.
+Stopping and restarting an hc second mate (`bin/fm-control.sh <id> exit` and `relaunch`, which `/updatefirstmate` uses through `bin/fm-secondmate-restart.sh`) adopts the mate's surviving terminal, so the replacement keeps its address, labels, and space.
+A mate whose terminal is missing or finished is never relaunched in place; recovery owns that respawn.
 
 ## Limits
 

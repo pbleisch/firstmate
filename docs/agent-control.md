@@ -199,8 +199,7 @@ The worktree and the task's records are unaffected either way.
   An `alive`, `ambiguous`, or `unreadable` verdict all refuse (a Rex `unreadable` after the absence proof cannot settle it), and so does any endpoint whose absence is not provable, which on tmux is every `missing`; absence is claimed only from positive evidence of it.
   For a ship or scout it also refuses, by name, a recorded worktree that is the home, the code root, or a repository's primary checkout (its git dir equals its git common dir), so a worker only ever comes back in its own task worktree.
   This check lives only in the launch owner, so on the `relaunch` verb it fires after the old agent has stopped and the transaction ends as a failed launch.
-  hc permits adoption of a surviving task-owned terminal, but refuses missing or finished terminals because its record does not identify the core/socket that could prove their absence.
-  It also refuses secondmate control; see [the hc guide](hc-backend.md#limits).
+  hc permits adoption of a surviving task-owned terminal, but refuses missing or finished terminals because its record does not identify the core/socket that could prove their absence ([the hc guide](hc-backend.md#limits)).
   It also requires the shell to be in the recorded worktree: every backend but Orca (which owns its own task worktree with no current-path probe) gets one explicit `cd` to the recorded path, then a pre-launch path read that refuses before any harness starts unless it confirms the endpoint is sitting in the recorded copy.
 
 ## Capability matrix

@@ -237,7 +237,10 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
   backend=$(fm_backend_of_meta "$meta")
   target=$(fm_backend_target_of_meta "$meta")
   [ -n "$target" ] || target="$window"
-  agent_state=$(fm_backend_agent_state "$backend" "$target" 2>/dev/null) || agent_state=unreadable
+  # hc binds its read to the terminal's labels, so the mate's own task label is
+  # passed: a reused address carrying any other terminal reads unreadable,
+  # never as this mate alive. Other backends ignore it.
+  agent_state=$(fm_backend_agent_state "$backend" "$target" "fm-$id" 2>/dev/null) || agent_state=unreadable
   case "$harness" in
     claude|codex|opencode|pi|pi-signed|grok|kimi|omp) ;;
     *)

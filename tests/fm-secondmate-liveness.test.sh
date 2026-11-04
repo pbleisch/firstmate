@@ -985,6 +985,27 @@ test_sweep_leaves_an_alive_hc_secondmate_untouched() {
   pass "sweep: an alive hc secondmate is left exactly as it is"
 }
 
+# A fresh core can hand the mate's recorded address to another terminal of this
+# same home. The probe is bound to the mate's own task label, so that terminal
+# reads unreadable rather than as the mate alive, and nothing is touched.
+test_sweep_never_reads_another_task_at_the_mates_address_as_the_mate() {
+  local out before verb
+  hc_world sweep-hc-reused
+  hc_seed_terminal "$W_DIR/hc" t1 live claude fm-other-task "$W_TAG"
+  before=$(cat "$W_DIR/home/state/sm1.meta")
+
+  out=$(run_hc_bootstrap "$W_DIR" "$W_PATH" "$W_HCBIN" "$W_LOG")
+
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: skipped: endpoint probe unreadable (backend=hc)" \
+    "another task's terminal at the mate's address must be reported, not adopted as alive: $out"
+  assert_not_contains "$out" "already live" "another task's live agent must never read as the mate alive"
+  for verb in kill rm run; do
+    assert_not_contains "$(cat "$W_DIR/hc/log")" $'\x1f'"$verb"$'\x1f' "another task's terminal must not be touched ($verb)"
+  done
+  [ "$(cat "$W_DIR/home/state/sm1.meta")" = "$before" ] || fail "the mate's record must not change"
+  pass "sweep: another task's terminal at an hc mate's recorded address is never read as the mate"
+}
+
 # --- bin/fm-secondmate-move.sh: moving a local mate onto another backend ------
 
 # make_move_tmux <dir>: a file-driven fake tmux (FM_MOVE_FAKE_DIR) with the
@@ -1581,6 +1602,7 @@ test_sweep_closes_and_respawns_a_dead_hc_secondmate
 test_sweep_removes_a_finished_hc_husk_before_respawn
 test_sweep_respawns_a_not_found_hc_secondmate
 test_sweep_leaves_an_alive_hc_secondmate_untouched
+test_sweep_never_reads_another_task_at_the_mates_address_as_the_mate
 test_move_stops_a_live_tmux_secondmate_and_relaunches_it_on_hc
 test_move_relaunches_an_already_stopped_tmux_secondmate_on_hc
 test_move_refuses_before_stopping_anything

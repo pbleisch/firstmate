@@ -401,8 +401,6 @@ RECORDED_HARNESS=$(fm_meta_get "$META" harness)
 KIND=$(fm_meta_get "$META" kind)
 WT=$(fm_meta_get "$META" worktree)
 [ -n "$KIND" ] || KIND=ship
-[ "$BACKEND" != hc ] || [ "$KIND" != secondmate ] \
-  || die "the hc backend does not support secondmate lifecycle control"
 # OpenCode's composer exit key changed between its 1.x and 2.x lines; the major
 # spawn detected is recorded here so the exit command below matches the running
 # agent. Absent (a legacy record or a non-opencode task) it stays empty.
