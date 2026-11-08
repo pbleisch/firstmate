@@ -865,6 +865,10 @@ pressure-file ~/.cache/lookout-beat/beat.json      # repeatable; a lookout.beat 
 reserve-flag /var/run/fm-reserved.flag host reserved by the captain   # repeatable; admit nothing while the file exists
 captain-idle 300       # opt-in, macOS: the captain counts as present when input was idle under 300 s
 quota-provider claude  # opt-in: publish that provider's quota runway
+quota-reserve-5h 20    # defer new Claude charter work below 20% in the five-hour window
+quota-reserve-weekly 20 # defer new Claude charter work below 20% in the weekly window
+quota-pace-ignore-above 60 # defer ahead-of-pace Claude charter work at or below 60% weekly left
+captain-present-claude-max 1 # limit running Claude charter workers while input idle is under five minutes
 max-load1 20           # keep a raw 1-minute load rule while beats replace it
 ```
 
@@ -874,10 +878,17 @@ An unknown key, a repeated single key, or a malformed value makes the whole file
 
 A pressure file is any producer of the `lookout.beat` 1.x shape, read by its own file age on this machine; a missing, stale, or unreadable one is skipped with its reason and the host's own probes stand in, so a broken beat never blocks anything.
 `captain-idle` reads input idle time locally and publishes only `present`, `idle`, or `away` (an away record), never the idle time itself.
-`quota-provider` is the only key that makes the script reach the network, through `quota-axi`, bounded to five seconds.
+`quota-provider` makes the published report read that provider through `quota-axi`, bounded to five seconds.
+The three `quota-*` reserve keys independently opt a fresh Claude charter spawn into reading Claude's five-hour and weekly windows through the same bounded quota call.
+Each reserve floor defers only below its percentage; `quota-pace-ignore-above` defers an ahead-of-pace week at or below its percentage and ignores pace above it.
+Unreadable Claude quota defers a charter spawn whenever a quota reserve key is set.
+`captain-present-claude-max` counts Claude charter task records in this home's `state/*.meta`; it applies while input idle is under `captain-idle` seconds, or 300 seconds when that key is absent.
+An unreadable idle probe counts as present, while an away record removes the present cap.
+Absent reserve keys add no charter restriction, and all four keys accept at most one value each; percentages must be between 0 and 100, and the present cap must be a non-negative integer.
 
 While the file exists, the watcher runs `bin/fm-capacity.sh --publish` detached at most every 30 seconds, writing this home's lane facts to `state/lane-capacity.json`: its lanes, its cap and limits, its machine's pressure and boots, its watcher's freshness, and its own admission verdict.
-Publishing is best-effort and never changes what the watcher does; no spawn reads the verdict.
+Publishing is best-effort and never changes what the watcher does; no spawn reads the general lane verdict.
+For a charter-authorized task, firstmate passes `--charter <project>` to `bin/fm-spawn.sh`, which records the charter and runs only the reserve admission for a resolved Claude harness before creating launch state.
 `bin/fm-capacity.sh --admit` is an advisory check of the same verdict: it exits 0 when the verdict admits or the file is absent, and reports the reasons on stderr with exit 75 when it does not.
 No Firstmate script calls it.
 The script's header owns the report line, the published document's fields, the verdict, the beat freshness rules, the host-constraint thresholds, and the probe fallbacks.

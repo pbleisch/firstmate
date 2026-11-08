@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--hermes-profile <name>] [--account <entry>] [--backend <name>] [--herdr-resume-lock-wait]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--hermes-profile <name>] [--account <entry>] [--backend <name>] [--herdr-resume-lock-wait]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--charter <project>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--hermes-profile <name>] [--account <entry>] [--backend <name>] [--herdr-resume-lock-wait]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--base-branch <branch>] [--charter <project>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--hermes-profile <name>] [--account <entry>] [--backend <name>] [--herdr-resume-lock-wait]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
@@ -43,6 +43,12 @@
 #   loud one-line deviation notice is printed and the spawn continues.
 #   no-mistakes-prod-only is a registry policy rather than a task mode and is
 #   refused as a flag value.
+#   --charter marks a fresh charter-authorized ship or scout for <project>.
+#   It must match the project directory name and records charter= in task meta.
+#   Only a resolved Claude harness then calls fm-capacity.sh --admit-charter;
+#   its reserve refusal exits 75 before worktree, endpoint, or meta creation.
+#   Non-Claude and unmarked tasks never run that reserve check. Relaunches reuse
+#   their recorded charter and do not recheck quota for already-running work.
 #   --branch-prefix is the optional prefix selected at intake for this ship's
 #   immutable branch, defaulting to "fm/". It must agree with the branch recorded
 #   in the brief, and is refused on scouts, secondmates, and relaunches. When the
@@ -1009,6 +1015,8 @@ UPSTREAM_CONSENT_SET=0
 TRACEPARENT_SET=0
 ACCOUNT_ARG=
 ACCOUNT_SET=0
+CHARTER_PROJECT=
+CHARTER_SET=0
 RELAUNCH=0
 # Opt-in only: exact-resume presentation-order lock waits instead of refusing.
 # Absent/unset keeps upstream refuse-on-contention. See header.
@@ -1071,6 +1079,10 @@ for a in "$@"; do
     account)
       ACCOUNT_ARG=$a
       ACCOUNT_SET=1
+      ;;
+    charter)
+      CHARTER_PROJECT=$a
+      CHARTER_SET=1
       ;;
     *)
       echo "error: internal parser state for --$want_value" >&2
@@ -1148,6 +1160,11 @@ for a in "$@"; do
     ACCOUNT_ARG=${a#--account=}
     ACCOUNT_SET=1
     ;;
+  --charter) want_value=charter ;;
+  --charter=*)
+    CHARTER_PROJECT=${a#--charter=}
+    CHARTER_SET=1
+    ;;
   *) POS+=("$a") ;;
   esac
 done
@@ -1199,6 +1216,14 @@ fi
   echo "error: --account requires a non-empty value" >&2
   exit 1
 }
+[ "$CHARTER_SET" -eq 0 ] || [ -n "$CHARTER_PROJECT" ] || {
+  echo "error: --charter requires a non-empty project name" >&2
+  exit 1
+}
+[ "$CHARTER_SET" -eq 0 ] || [ "$KIND" != secondmate ] || {
+  echo 'error: --charter applies only to ship and scout spawns' >&2
+  exit 1
+}
 # A secondmate, local or remote, launches on its own per-mate pin, so --account
 # is refused here, before the remote route could ignore it.
 [ "$ACCOUNT_SET" -eq 0 ] || [ "$KIND" != secondmate ] || {
@@ -1231,6 +1256,10 @@ esac
 # task's own durable record below. Contradicting it on the command line is a
 # refusal rather than a silently-ignored flag.
 if [ "$RELAUNCH" -eq 1 ]; then
+  [ "$CHARTER_SET" -eq 0 ] || {
+    echo "error: --relaunch reuses the task's recorded charter; --charter cannot override it" >&2
+    exit 1
+  }
   [ "$BACKEND_SET" -eq 0 ] || {
     echo "error: --relaunch reuses the task's recorded backend; --backend cannot override it" >&2
     exit 1
@@ -1718,6 +1747,8 @@ SPAWN_TASK_SET_LOCK=
 SPAWN_TASK_SET_LOCK_HELD=0
 SPAWN_TREEHOUSE_PROJECT_LOCK=
 SPAWN_TREEHOUSE_PROJECT_LOCK_HELD=0
+SPAWN_CHARTER_LOCK=
+SPAWN_CHARTER_LOCK_HELD=0
 SPAWN_SLOT_CLAIMED=0
 SPAWN_FRESH_ENDPOINT_OPENED=0
 SPAWN_FRESH_WIRING_PENDING=0
@@ -2121,6 +2152,10 @@ spawn_abort_cleanup() {
     SPAWN_TREEHOUSE_PROJECT_LOCK_HELD=0
     fm_lock_release "$SPAWN_TREEHOUSE_PROJECT_LOCK" || true
   fi
+  if [ "$SPAWN_CHARTER_LOCK_HELD" = 1 ]; then
+    SPAWN_CHARTER_LOCK_HELD=0
+    fm_lock_release "$SPAWN_CHARTER_LOCK" || true
+  fi
   if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_SET_LOCK_HELD=0
     fm_lock_release "$SPAWN_TASK_SET_LOCK" || true
@@ -2258,6 +2293,10 @@ if [ "$RELAUNCH" -eq 1 ] && [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart"
   exit 1
 fi
 if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in */*) false ;; *) true ;; esac then
+  if [ "$CHARTER_SET" -eq 1 ]; then
+    echo 'error: --charter is single-task only; name each project on its own spawn' >&2
+    exit 1
+  fi
   if [ "$KIND" != secondmate ] && [ -z "$HARNESS_ARG" ] && [ -f "$CONFIG/crew-dispatch.json" ]; then
     echo "error: config/crew-dispatch.json is active - pass an explicit harness resolved from the dispatch rules (the consultation backstop, so the rules are never silently skipped)." >&2
     exit 1
@@ -4283,6 +4322,31 @@ else
   PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
   WT=""
   BRIEF="$DATA/$ID/brief.md"
+fi
+if [ "$CHARTER_SET" -eq 1 ]; then
+  if [ "$CHARTER_PROJECT" != "$(basename "$PROJ_ABS")" ]; then
+    echo "error: --charter project '$CHARTER_PROJECT' does not match project directory '$(basename "$PROJ_ABS")'" >&2
+    exit 1
+  fi
+  if [ "$HARNESS" = claude ]; then
+    # Hold the home lock from the present-cap count through metadata publication.
+    # A simultaneous charter spawn then sees this worker's recorded claim.
+    if [ -f "$CONFIG/lane-capacity" ] &&
+      grep -Eq '^[[:space:]]*captain-present-claude-max[[:space:]]' "$CONFIG/lane-capacity"; then
+      SPAWN_CHARTER_LOCK="$STATE/.charter-admit.lock"
+      fm_lock_acquire_wait "$SPAWN_CHARTER_LOCK" || exit 1
+      SPAWN_CHARTER_LOCK_HELD=1
+    fi
+    # The worker account was already resolved above. Measure the same Claude
+    # root the new worker will spend, including a selected account-list entry.
+    if [ "$WORKER_ACCOUNT_DECLARED" = ordinary ]; then
+      env -u CLAUDE_CONFIG_DIR "$SCRIPT_DIR/fm-capacity.sh" --admit-charter || exit $?
+    elif [ -n "$WORKER_ACCOUNT_ROOT" ]; then
+      CLAUDE_CONFIG_DIR="$WORKER_ACCOUNT_ROOT" "$SCRIPT_DIR/fm-capacity.sh" --admit-charter || exit $?
+    else
+      "$SCRIPT_DIR/fm-capacity.sh" --admit-charter || exit $?
+    fi
+  fi
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] &&
   git -C "$PROJ_ABS" rev-parse --git-dir >/dev/null 2>&1 &&
@@ -7351,6 +7415,7 @@ preserve_relaunch_meta() {
     esac
   fi
   echo "kind=$KIND"
+  [ "$CHARTER_SET" -eq 0 ] || echo "charter=$CHARTER_PROJECT"
   [ -z "$MODE" ] || echo "mode=$MODE"
   [ -z "$YOLO" ] || echo "yolo=$YOLO"
   [ -z "${BRANCH:-}" ] || echo "branch=$BRANCH"
@@ -7452,6 +7517,10 @@ if [ "$RELAUNCH" -eq 0 ]; then
     exit 1
   fi
   SPAWN_META_TMP=
+  if [ "$SPAWN_CHARTER_LOCK_HELD" = 1 ]; then
+    SPAWN_CHARTER_LOCK_HELD=0
+    fm_lock_release "$SPAWN_CHARTER_LOCK"
+  fi
 fi
 
 # Fuse the backlog In-flight transition into the publication that just created

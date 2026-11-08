@@ -7,11 +7,13 @@
 #   fm-capacity.sh --json     the fm-lane-capacity.v1 document on stdout
 #   fm-capacity.sh --publish  write that document to state/lane-capacity.json
 #   fm-capacity.sh --admit    this home's own admission verdict as an exit status
+#   fm-capacity.sh --admit-charter  Claude charter reserve verdict only
 #
 # It reads this home's state/*.meta, the optional config/lane-capacity, the
 # pressure files and reserve flags that file names, and the host's own probes.
 # It never spawns, locks, or changes anything; --publish writes its one file.
-# It is network-free unless config/lane-capacity names a quota-provider.
+# It is network-free unless config/lane-capacity names a quota-provider, or a
+# charter admission has an enabled quota reserve key.
 # docs/configuration.md "Lane capacity" owns the config/lane-capacity format
 # (the cap on its first line, then optional keyed lines); with the file absent
 # nothing changes and no target is ever invented.
@@ -109,13 +111,16 @@
 #
 # --admit exits 0 when config/lane-capacity is absent or the verdict admits,
 # and 75 with one `deferred:` line on stderr when it does not.
+# --admit-charter checks only the optional charter reserve keys. It exits 0
+# when they are absent, 75 with one `deferred:` line for a reserve refusal,
+# and 1 for an invalid config. It never applies general lane admission.
 #
 # Environment: FM_HOME, FM_STATE_OVERRIDE, FM_CONFIG_OVERRIDE, and
 # FM_PROJECTS_OVERRIDE resolve the home exactly as the other bin/ scripts do.
 #
 # Exit status: 0 on a report, 1 on an invalid config/lane-capacity (report,
-# --json, --admit), 2 on a usage error or --json without jq, 75 on an --admit
-# deferral.
+# --json, --admit, --admit-charter), 2 on a usage error or --json without jq,
+# 75 on an --admit or --admit-charter deferral.
 set -u
 export LC_ALL=C
 
@@ -141,9 +146,10 @@ case "${1:-}" in
   --json) mode=json ;;
   --publish) mode=publish ;;
   --admit) mode=admit ;;
-  *) echo "usage: fm-capacity.sh [--json|--publish|--admit|--help]" >&2; exit 2 ;;
+  --admit-charter) mode=charter-admit ;;
+  *) echo "usage: fm-capacity.sh [--json|--publish|--admit|--admit-charter|--help]" >&2; exit 2 ;;
 esac
-[ "$#" -le 1 ] || { echo "usage: fm-capacity.sh [--json|--publish|--admit|--help]" >&2; exit 2; }
+[ "$#" -le 1 ] || { echo "usage: fm-capacity.sh [--json|--publish|--admit|--admit-charter|--help]" >&2; exit 2; }
 
 is_uint() {
   case "$1" in ''|*[!0-9]*) return 1 ;; esac
@@ -165,7 +171,7 @@ file_mtime() {
 now=$(date +%s)
 
 case "$mode" in
-  admit|publish) [ -e "$LANE_CONFIG" ] || exit 0 ;;
+  admit|charter-admit|publish) [ -e "$LANE_CONFIG" ] || exit 0 ;;
 esac
 if [ "$mode" = publish ]; then
   interval=${FM_LANE_CAPACITY_PUBLISH_INTERVAL:-30}
@@ -208,6 +214,10 @@ min_disk_gb=
 max_load1=
 captain_idle=
 quota_provider=
+quota_reserve_5h=
+quota_reserve_weekly=
+quota_pace_ignore_above=
+captain_present_claude_max=
 pressure_files=
 reserve_flags=
 expand_path() {
@@ -240,7 +250,7 @@ parse_lane_config() {
     [ "$key" = "$line" ] || rest=$(printf '%s' "${line#* }" | sed 's/^ *//')
     value=${rest%% *}
     case "$key" in
-      min-avail-gb|min-disk-gb|max-load1|captain-idle|quota-provider|pressure-file|reserve-flag) ;;
+      min-avail-gb|min-disk-gb|max-load1|captain-idle|quota-provider|quota-reserve-5h|quota-reserve-weekly|quota-pace-ignore-above|captain-present-claude-max|pressure-file|reserve-flag) ;;
       *) config_error "$lineno" "unknown key" "'$key'"; return 1 ;;
     esac
     case "$key" in
@@ -268,6 +278,21 @@ parse_lane_config() {
         case "$value" in ''|*[!a-z0-9-]*) config_error "$lineno" "quota-provider needs one provider name"; return 1 ;; esac
         quota_provider=$value
         ;;
+      quota-reserve-5h|quota-reserve-weekly|quota-pace-ignore-above)
+        if ! is_num "$value" || num_lt 100 "$value"; then
+          config_error "$lineno" "$key needs a percentage from 0 to 100"
+          return 1
+        fi
+        case "$key" in
+          quota-reserve-5h) quota_reserve_5h=$value ;;
+          quota-reserve-weekly) quota_reserve_weekly=$value ;;
+          quota-pace-ignore-above) quota_pace_ignore_above=$value ;;
+        esac
+        ;;
+      captain-present-claude-max)
+        is_uint "$value" && [ "${#value}" -le 9 ] || { config_error "$lineno" "captain-present-claude-max needs a non-negative integer"; return 1; }
+        captain_present_claude_max=$((10#$value))
+        ;;
       pressure-file)
         [ -n "$value" ] && [ "$value" = "$rest" ] || { config_error "$lineno" "pressure-file takes one absolute path"; return 1; }
         path=$(expand_path "$value") || { config_error "$lineno" "pressure-file takes one absolute path"; return 1; }
@@ -292,6 +317,87 @@ if [ -e "$LANE_CONFIG" ]; then
     target=invalid
     min_avail_gb='' min_disk_gb='' max_load1='' captain_idle='' quota_provider='' pressure_files='' reserve_flags=''
   fi
+fi
+
+# This is called only by a fresh Claude charter spawn, before it creates a
+# worktree, endpoint, or metadata. Existing workers are never stopped for quota.
+if [ "$mode" = charter-admit ]; then
+  if [ "$target" = invalid ]; then
+    echo "fm-capacity: $target_error" >&2
+    exit 1
+  fi
+  if [ -n "$quota_reserve_5h$quota_reserve_weekly$quota_pace_ignore_above" ]; then
+    if ! command -v quota-axi >/dev/null 2>&1 || [ "$have_jq" -eq 0 ]; then
+      echo 'deferred: Claude charter quota unreadable' >&2
+      exit 75
+    fi
+    # shellcheck source=bin/fm-timeout-lib.sh
+    . "$SCRIPT_DIR/fm-timeout-lib.sh"
+    qout=$(fm_run_timed "$QUOTA_TIMEOUT" env -u QUOTA_AXI_SNAPSHOT quota-axi --json --provider claude --max-age 15m 2>/dev/null) || qout=
+    quota_fields=$(printf '%s' "$qout" | jq -er '
+      [.providers[]? | select(.provider == "claude")] as $providers |
+      if ($providers | length) != 1 then empty else
+        $providers[0] as $provider |
+        if $provider.state.stale == true or $provider.state.status == "error" then empty else
+        [$provider.windows[]? | select(.kind == "five_hour")] as $five |
+        [$provider.windows[]? | select(.kind == "weekly")] as $week |
+        if ($five | length) != 1 or ($week | length) != 1 then empty else
+          $five[0].percentRemaining as $f |
+          $week[0].percentRemaining as $w |
+          if ($f | type) != "number" or ($w | type) != "number" or
+             $f < 0 or $f > 100 or $w < 0 or $w > 100 then empty
+          else
+            ($week[0].pace.status | if type == "string" then . else "unknown" end) as $pace |
+            "\($f)|\($w)|\($pace)"
+          end
+        end end
+      end' 2>/dev/null) || quota_fields=
+    if [ -z "$quota_fields" ]; then
+      echo 'deferred: Claude charter quota unreadable' >&2
+      exit 75
+    fi
+    IFS='|' read -r five_left week_left week_pace <<< "$quota_fields"
+    if [ -n "$quota_reserve_5h" ] && num_lt "$five_left" "$quota_reserve_5h"; then
+      echo "deferred: Claude charter 5h reserve ($five_left% left; floor $quota_reserve_5h%)" >&2
+      exit 75
+    fi
+    if [ -n "$quota_reserve_weekly" ] && num_lt "$week_left" "$quota_reserve_weekly"; then
+      echo "deferred: Claude charter weekly reserve ($week_left% left; floor $quota_reserve_weekly%)" >&2
+      exit 75
+    fi
+    if [ -n "$quota_pace_ignore_above" ] && ! num_lt "$quota_pace_ignore_above" "$week_left"; then
+      case "$week_pace" in
+        ahead) echo "deferred: Claude charter pace band ($week_left% weekly left; ahead of pace)" >&2; exit 75 ;;
+        unknown|"") echo 'deferred: Claude charter quota unreadable (weekly pace)' >&2; exit 75 ;;
+      esac
+    fi
+  fi
+  if [ -n "$captain_present_claude_max" ]; then
+    # Unknown input idle is treated as present so the cap cannot be bypassed
+    # by an unreadable HID probe. An away record removes the present cap.
+    captain_present=1
+    if [ -f "$STATE/.afk-contract" ] &&
+      [ "$(FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE "$SCRIPT_DIR/fm-afk-contract.sh" mode 2>/dev/null)" = away ]; then
+      captain_present=0
+    elif [ "$(uname -s 2>/dev/null)" = Darwin ]; then
+      v=$(ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/{print int($NF / 1000000000); exit}')
+      if is_uint "$v" && [ "$v" -ge "${captain_idle:-300}" ]; then captain_present=0; fi
+    fi
+    if [ "$captain_present" -eq 1 ]; then
+      claude_charters=0
+      for meta in "$STATE"/*.meta; do
+        [ -f "$meta" ] || continue
+        if grep -qx 'harness=claude' "$meta" 2>/dev/null && grep -q '^charter=.' "$meta" 2>/dev/null; then
+          claude_charters=$((claude_charters + 1))
+        fi
+      done
+      if [ "$claude_charters" -ge "$captain_present_claude_max" ]; then
+        echo "deferred: Claude charter captain-present cap ($claude_charters running; max $captain_present_claude_max)" >&2
+        exit 75
+      fi
+    fi
+  fi
+  exit 0
 fi
 
 # --- host probes ------------------------------------------------------------
