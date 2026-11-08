@@ -45,8 +45,9 @@ EOF
 set_quota() { # <five-hour-left> <weekly-left> <weekly-pace>
   jq -cn --argjson five "$1" --argjson week "$2" --arg pace "$3" '
     {schemaVersion: 5, providers: [{provider: "claude", windows: [
-      {kind: "five_hour", percentRemaining: $five},
-      {kind: "weekly", percentRemaining: $week, pace: {status: $pace}}
+      {id: "five_hour", kind: "session", percentRemaining: $five, pace: {status: "behind"}},
+      {id: "seven_day", kind: "weekly", percentRemaining: $week, pace: {status: $pace}},
+      {id: "model:fable", kind: "model", percentRemaining: 0, pace: {status: "ahead"}}
     ]}]}' > "$QUOTA_FILE"
 }
 

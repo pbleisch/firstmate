@@ -339,8 +339,8 @@ if [ "$mode" = charter-admit ]; then
       if ($providers | length) != 1 then empty else
         $providers[0] as $provider |
         if $provider.state.stale == true or $provider.state.status == "error" then empty else
-        [$provider.windows[]? | select(.kind == "five_hour")] as $five |
-        [$provider.windows[]? | select(.kind == "weekly")] as $week |
+        [$provider.windows[]? | select(.id == "five_hour")] as $five |
+        [$provider.windows[]? | select(.id == "seven_day")] as $week |
         if ($five | length) != 1 or ($week | length) != 1 then empty else
           $five[0].percentRemaining as $f |
           $week[0].percentRemaining as $w |
