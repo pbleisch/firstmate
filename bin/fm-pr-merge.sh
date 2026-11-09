@@ -15,7 +15,7 @@
 # Usage:
 #   fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check>]
 #     [--allow-missing <check>] [--allow-no-pipeline] [--allow-content <guard>]...
-#     [-- <forge merge flags>]
+#     [--secondmate-pr] [-- <forge merge flags>]
 #   fm-pr-merge.sh -h | --help
 #
 # Merge method on GitHub defaults to --squash when the caller passes none of
@@ -210,7 +210,17 @@
 # explicit captain instruction and never skips the live green check, the
 # away-record read, or a captain hold.
 #
-# Usage: fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check-name>] [--allow-missing <check-name>] [--allow-no-pipeline] [--allow-content <guard>]... [-- <extra forge merge args>]
+# Usage: fm-pr-merge.sh <task-id> <pr-url> [--attended-override] [--allow-red <check-name>] [--allow-missing <check-name>] [--allow-no-pipeline] [--allow-content <guard>]... [--secondmate-pr] [-- <extra forge merge args>]
+#
+# --secondmate-pr merges a Forgejo pull request a registered second mate
+# reported, named by a second mate PR record id instead of a task id. The record
+# lives under state/secondmate-prs/, outside the task namespace, and
+# bin/fm-secondmate-pr-merge.sh owns how it is armed. Every gate above still
+# applies unchanged, the record's own binding, locks, and guard and authority
+# records stay in that directory, and the away-posture record, captain holds,
+# and the merge outcome are still this home's own. The merge is refused unless
+# the record holds a recorded captain instruction and its reported_pr= is
+# exactly the requested URL, and a record id is refused without the flag.
 #
 # On GitLab, this script confirms the MR is actually merged before reporting it;
 # an auto-merge-queued or unconfirmed request leaves the poll armed and records
@@ -292,6 +302,7 @@ if [ "$PROVIDER" = gerrit ]; then
 fi
 shift 2
 ATTENDED_OVERRIDE=false
+SECONDMATE_PR=false
 ALLOW_NO_PIPELINE=false
 ALLOW_RED=()
 ALLOW_MISSING=()
@@ -347,6 +358,14 @@ while [ "$#" -gt 0 ]; do
       echo "error: --allow-content requires a separate guard name argument" >&2
       exit 2
       ;;
+    --secondmate-pr)
+      SECONDMATE_PR=true
+      shift
+      ;;
+    --secondmate-pr=*)
+      echo "error: --secondmate-pr takes no value" >&2
+      exit 2
+      ;;
     --) shift; break ;;
     *) break ;;
   esac
@@ -369,6 +388,10 @@ if [ "${#ALLOW_RED[@]}" -gt 0 ]; then
       exit 2
       ;;
   esac
+fi
+if [ "$SECONDMATE_PR" = true ] && [ "$PROVIDER" != forgejo ]; then
+  echo "error: --secondmate-pr supports only Forgejo pull requests, whose head this path can bind when the instruction is recorded" >&2
+  exit 2
 fi
 if [ "${#ALLOW_CONTENT[@]}" -gt 0 ] && [ "$PROVIDER" = gitlab ]; then
   echo "error: --allow-content does not apply to GitLab, where the content guard does not run" >&2
@@ -525,7 +548,20 @@ fm_backlog_directory_present "$STATE" "state directory" || {
   echo "error: PR merge refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
   exit 1
 }
-META="$STATE/$ID.meta"
+# A task's own files live in the home's state directory. A second mate PR record
+# (bin/fm-secondmate-pr-merge.sh owns it) keeps its per-record files - record,
+# binding, locks, guard and authority records - in its own directory, outside
+# the task namespace every fleet reader enumerates, while the away-posture
+# record, captain holds, and the merge outcome stay on the home's state.
+RECORD_STATE=$STATE
+if [ "$SECONDMATE_PR" = true ]; then
+  RECORD_STATE="$STATE/secondmate-prs"
+  fm_backlog_directory_present "$RECORD_STATE" "second mate PR record directory" || {
+    echo "error: PR merge refused: no second mate PR record is armed for $ID" >&2
+    exit 1
+  }
+fi
+META="$RECORD_STATE/$ID.meta"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
@@ -542,10 +578,30 @@ META="$STATE/$ID.meta"
 fm_lease_forbid_branch "PR merge (fm-pr-merge)" --away-relocated
 
 if [ ! -f "$META" ] || [ -L "$META" ]; then
-  echo "error: task metadata is unavailable" >&2
+  if [ "$SECONDMATE_PR" = true ]; then
+    echo "error: PR merge refused: no second mate PR record is armed for $ID, so no captain instruction names this pull request" >&2
+  else
+    echo "error: task metadata is unavailable" >&2
+  fi
   exit 1
 fi
-if ! fm_backlog_meta_spawn_gen_optional "$META" "$STATE"; then
+# A second mate PR record merges only the pull request its recorded captain
+# instruction names; bin/fm-secondmate-pr-merge.sh owns how that record is made.
+merge_record_value() {  # <key>
+  grep "^$1=" "$META" | tail -1 | cut -d= -f2- || true
+}
+if [ "$SECONDMATE_PR" = true ]; then
+  if [ "$(merge_record_value kind)" != secondmate-pr ] \
+    || [ "$(merge_record_value reported_pr)" != "$URL" ] \
+    || [ -z "$(merge_record_value instruction | tr -d '[:space:]')" ]; then
+    echo "error: PR merge refused: second mate PR record $ID holds no recorded captain instruction naming $URL" >&2
+    exit 1
+  fi
+elif [ "$(merge_record_value kind)" = secondmate-pr ]; then
+  echo "error: PR merge refused: $ID is a second mate PR record; merge it through bin/fm-secondmate-pr-merge.sh" >&2
+  exit 1
+fi
+if ! fm_backlog_meta_spawn_gen_optional "$META" "$RECORD_STATE"; then
   echo "error: PR merge refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
   exit 1
 fi
@@ -559,9 +615,9 @@ merge_control_cleanup() {
   [ -z "$MERGE_CONTROL_LOCK" ] || fm_lock_release "$MERGE_CONTROL_LOCK" || true
 }
 trap merge_control_cleanup EXIT
-MERGE_CONTROL_LOCK="$STATE/.control-$ID.lock"
+MERGE_CONTROL_LOCK="$RECORD_STATE/.control-$ID.lock"
 fm_lock_acquire_wait "$MERGE_CONTROL_LOCK"
-if ! fm_backlog_meta_spawn_gen_optional "$META" "$STATE"; then
+if ! fm_backlog_meta_spawn_gen_optional "$META" "$RECORD_STATE"; then
   echo "error: task $ID changed while waiting to merge; refusing: $FM_BACKLOG_TRANSITION_ERROR" >&2
   exit 1
 fi
@@ -741,9 +797,9 @@ FIELDS
 # Forgejo merge here is immediate. Shares FM_PR_MERGE_HEAD, declared above.
 FORGEJO_BASE=
 forgejo_verify_mergeable() {
-  local pr_json status_json fields line
+  local pr_json fields line
   local total=0 named=0 refusals=''
-  local state='' mergeable='' draft='' live_head='' base='' ci_state='' page_state='' page_count='' page=1
+  local state='' mergeable='' draft='' live_head='' base='' ci_state=''
   local ci_waived=false
 
   if ! pr_json=$(tea api --login "$FORGEJO_LOGIN" --repo "$PR_OWNER/$PR_REPO" \
@@ -787,50 +843,11 @@ FIELDS
     echo "error: could not read the Forgejo pull request head commit before merging" >&2
     return 1
   fi
-  # An absent combined status (no statuses on any page, as a repo with no
-  # configured Actions reports) is a real "none" here rather than nothing to
-  # check, the same reading GitLab's null head_pipeline gets above. The
-  # endpoint computes its combined state from one page of the latest status
-  # per context, so every page is read until an empty one and the head is
-  # green only when each non-empty page is; the first page that is not
-  # success, or that cannot be read, decides the refusal.
-  ci_state=none
-  while :; do
-    if ! status_json=$(tea api --login "$FORGEJO_LOGIN" --repo "$PR_OWNER/$PR_REPO" \
-        "/repos/{owner}/{repo}/commits/$live_head/status?limit=50&page=$page" 2>/dev/null) \
-      || ! fields=$(printf '%s' "$status_json" | jq -r '
-          if type == "object" and ((.statuses // []) | type) == "array" then
-            "count=" + ((.statuses // []) | length | tostring),
-            "state=" + ((.state // "") | tostring)
-          else
-            error("status payload is not a combined status")
-          end' 2>/dev/null); then
-      ci_state=unreadable
-      break
-    fi
-    page_count='' page_state=''
-    while IFS= read -r line; do
-      case "$line" in
-        count=*) page_count=${line#count=} ;;
-        state=*) page_state=${line#state=} ;;
-      esac
-    done <<FIELDS
-$fields
-FIELDS
-    [ "$page_count" != 0 ] || break
-    if [ "$page_state" != success ]; then
-      ci_state=${page_state:-unreadable}
-      break
-    fi
-    ci_state=success
-    page=$((page + 1))
-    # A server that ignores the page parameter would repeat a non-empty page
-    # forever, so an implausible page count is unreadable rather than green.
-    if [ "$page" -gt 100 ]; then
-      ci_state=unreadable
-      break
-    fi
-  done
+  # An absent combined status is a real "none" here rather than nothing to
+  # check, the same reading GitLab's null head_pipeline gets above; the lib
+  # owns how every status page is read.
+  fm_pr_forgejo_combined_status "$FORGEJO_LOGIN" "$PR_OWNER/$PR_REPO" "$live_head"
+  ci_state=$FM_PR_FORGEJO_CI_STATE
 
   [ "$state" = open ] \
     || refusals="$refusals  - state is \"${state:-unreadable}\", not open
@@ -1422,7 +1439,7 @@ METHODS
 }
 
 record_pr_metadata() {
-  if ! FM_PR_CHECK_MERGE=1 "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL"; then
+  if ! FM_PR_CHECK_MERGE=1 FM_STATE_OVERRIDE="$RECORD_STATE" "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL"; then
     return 1
   fi
   grep -qxF "pr=$URL" "$META" || {
@@ -1514,7 +1531,7 @@ persist_accepted_merge_authority() {
   local status=0
   MERGE_META_LOCK=$(fm_meta_lock_path "$META") || return 1
   fm_lock_acquire_wait "$MERGE_META_LOCK" || return 1
-  fm_merge_authority_persist "$STATE" "$ID" "$META" \
+  fm_merge_authority_persist "$RECORD_STATE" "$ID" "$META" \
     "$PROVIDER" "$PR_HOST" "$PR_PATH" "$PR_NUMBER" "$FM_PR_MERGE_AUTHORITY" \
     || status=1
   fm_lock_release "$MERGE_META_LOCK" || status=1
@@ -1553,7 +1570,7 @@ refuse_github_queue_while_away() {
 # recorded (bin/fm-pr-binding-lib.sh); a hand-edited binding is refused before
 # anything is recorded or read from the forge.
 require_intact_pr_binding() {
-  fm_pr_binding_meta_check "$STATE" "$ID" "$META" && return 0
+  fm_pr_binding_meta_check "$RECORD_STATE" "$ID" "$META" && return 0
   printf 'error: refusing to merge %s: %s; record the pull request with bin/fm-pr-check.sh, present it and its diff stat to the captain, and merge only on fresh approval\n' \
     "$URL" "$FM_PR_BINDING_ERROR" >&2
   return 1
@@ -1562,7 +1579,7 @@ require_intact_pr_binding() {
 BOUND_HEAD=
 BOUND_TREE=
 read_merge_binding() {
-  if ! fm_pr_binding_read "$STATE" "$ID" || [ "$FM_PR_BINDING_PRESENT" -ne 1 ] \
+  if ! fm_pr_binding_read "$RECORD_STATE" "$ID" || [ "$FM_PR_BINDING_PRESENT" -ne 1 ] \
     || [ "$FM_PR_BINDING_URL" != "$URL" ]; then
     echo "error: refusing to merge $URL: its PR binding could not be read back after recording" >&2
     return 1
@@ -1624,7 +1641,7 @@ run_content_guard() {  # <base> <forge-head-ref>
 $hits
 HITS
   [ -z "$unwaived" ] || verdict=refused
-  fm_merge_guard_record "$STATE" "$ID" "$URL" "$FM_PR_MERGE_HEAD" "$base" \
+  fm_merge_guard_record "$RECORD_STATE" "$ID" "$URL" "$FM_PR_MERGE_HEAD" "$base" \
     "$verdict" "$hits" "$waived" \
     || echo "warning: the content guard record for $URL could not be written" >&2
   [ -z "$waived" ] || printf 'content: waived by the captain'"'"'s named override: %s\n' "$waived" >&2
@@ -1643,7 +1660,7 @@ require_recorded_pr_identity() {
   # Parsed in a subshell so FM_PR_* stays the new URL's identity for every
   # caller after this gate; only the already-notified verdict escapes.
   if ( fm_pr_url_parse "$existing" \
-    && fm_pr_poll_merge_already_notified "$STATE" "$ID" \
+    && fm_pr_poll_merge_already_notified "$RECORD_STATE" "$ID" \
       "$FM_PR_PROVIDER" "$FM_PR_HOST" "$FM_PR_PATH" "$FM_PR_NUMBER" ); then
     return 0
   fi

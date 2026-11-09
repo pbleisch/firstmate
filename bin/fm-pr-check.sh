@@ -59,6 +59,10 @@
 # merge-time record binds the head the forge reports now. A merge-time record
 # never rebinds. A scan never rebinds either: it records only a task with no
 # pr= or with the same reported pr=.
+# A secondmate record is refused, because its reported PR belongs to a task in
+# the mate's own home. A second mate PR record (kind=secondmate-pr, owned by
+# bin/fm-secondmate-pr-merge.sh) is accepted only at merge time, and only its
+# binding is written: it arms no merge poll and publishes no ready line.
 # Usage: fm-pr-check.sh <task-id> <pr-url> [--rebind <reason>]
 #        fm-pr-check.sh scan
 set -eu
@@ -220,8 +224,20 @@ fi
 # work once that pull request merges.
 KIND=$(grep '^kind=' "$META" | tail -1 | cut -d= -f2- || true)
 if [ "$KIND" = secondmate ]; then
-  echo "error: $ID is a secondmate, not a delivery lane - $URL was reported on its status channel but belongs to a task in the mate's own home, which arms its own merge watch" >&2
+  echo "error: $ID is a secondmate, not a delivery lane - $URL was reported on its status channel but belongs to a task in the mate's own home, which arms its own merge watch; to merge it on the captain's word use bin/fm-secondmate-pr-merge.sh" >&2
   exit 1
+fi
+# A second mate PR record (bin/fm-secondmate-pr-merge.sh) is bound here only at
+# merge time and only for its binding: the mate's own home watches the pull
+# request, so no merge poll, ready line, contribution watch, or home guard runs
+# for it.
+SECONDMATE_PR=0
+if [ "$KIND" = secondmate-pr ]; then
+  if [ "${FM_PR_CHECK_MERGE:-}" != 1 ]; then
+    echo "error: $ID is a second mate PR record; it is bound only through bin/fm-secondmate-pr-merge.sh" >&2
+    exit 1
+  fi
+  SECONDMATE_PR=1
 fi
 
 # A prior exact merged result may have queued its durable wake immediately
@@ -345,7 +361,7 @@ if [ "$PROVIDER" = github ] && [ "${FM_PR_CHECK_MERGE:-}" != 1 ] && command -v g
   fi
 fi
 
-"$FM_ROOT/bin/fm-guard.sh" || true
+[ "$SECONDMATE_PR" -eq 1 ] || "$FM_ROOT/bin/fm-guard.sh" || true
 
 # pr_head is recorded only when the forge's CLI can supply it without changing
 # what arming costs. gh exposes the head commit as a selectable field; plain
@@ -429,8 +445,10 @@ pr_check_cleanup() {
 }
 trap pr_check_cleanup EXIT
 trap 'exit 1' HUP INT TERM
-fm_pr_poll_prepare "$STATE" "$ID" "$PROVIDER" "$URL" "$HOST" "$PROJECT_PATH" "$NUMBER" "$SCRIPT_DIR/fm-pr-poll.sh" \
-  || { echo "error: could not prepare PR poll" >&2; exit 1; }
+if [ "$SECONDMATE_PR" -eq 0 ]; then
+  fm_pr_poll_prepare "$STATE" "$ID" "$PROVIDER" "$URL" "$HOST" "$PROJECT_PATH" "$NUMBER" "$SCRIPT_DIR/fm-pr-poll.sh" \
+    || { echo "error: could not prepare PR poll" >&2; exit 1; }
+fi
 
 META_LOCK=$(fm_meta_lock_path "$META") || exit 1
 fm_lock_acquire_wait "$META_LOCK"
@@ -481,6 +499,10 @@ if [ "$KEEP_BINDING" -eq 0 ] && [ -n "$PRIOR_URL" ] \
     "$ID" "$URL" "${PR_HEAD:-<unrecorded>}" "$PRIOR_URL" "${PRIOR_HEAD:-<unrecorded>}" "$ID" >&2
 fi
 
+if [ "$SECONDMATE_PR" -eq 1 ]; then
+  printf 'bound: second mate PR record %s to %s at head %s\n' "$ID" "$URL" "${PR_HEAD:-<unrecorded>}"
+  exit 0
+fi
 PR_POLL_PUBLISH_LOCK="$STATE/.pr-poll-publish-$ID.lock"
 fm_lock_acquire_wait "$PR_POLL_PUBLISH_LOCK"
 PR_POLL_PUBLISH_LOCK_HELD=1

@@ -1242,6 +1242,58 @@ FIELDS
   FM_PR_RECORD_HEAD=$head
 }
 
+# The combined commit status of <sha> in Forgejo repository <owner/repo>, read
+# through "tea api" with <login>, into FM_PR_FORGEJO_CI_STATE: success, a
+# non-success Forgejo state (pending, failure, error, warning), none, or
+# unreadable. An absent combined status (no statuses on any page, as a repo
+# with no configured Actions reports) is a real "none" rather than nothing to
+# check. The endpoint computes its combined state from one page of the latest
+# status per context, so every page is read until an empty one and the head is
+# success only when each non-empty page is; the first page that is not
+# success, or that cannot be read, decides the result. Shared by
+# bin/fm-pr-merge.sh's pre-merge gate and bin/fm-secondmate-pr-merge.sh's poll.
+# shellcheck disable=SC2034 # FM_PR_FORGEJO_CI_STATE is read by sourcing callers.
+fm_pr_forgejo_combined_status() {  # <login> <owner/repo> <sha>
+  local login=$1 slug=$2 sha=$3 status_json fields line page=1 page_count page_state
+  FM_PR_FORGEJO_CI_STATE=none
+  while :; do
+    if ! status_json=$(tea api --login "$login" --repo "$slug" \
+        "/repos/{owner}/{repo}/commits/$sha/status?limit=50&page=$page" 2>/dev/null) \
+      || ! fields=$(printf '%s' "$status_json" | jq -r '
+          if type == "object" and ((.statuses // []) | type) == "array" then
+            "count=" + ((.statuses // []) | length | tostring),
+            "state=" + ((.state // "") | tostring)
+          else
+            error("status payload is not a combined status")
+          end' 2>/dev/null); then
+      FM_PR_FORGEJO_CI_STATE=unreadable
+      return 0
+    fi
+    page_count='' page_state=''
+    while IFS= read -r line; do
+      case "$line" in
+        count=*) page_count=${line#count=} ;;
+        state=*) page_state=${line#state=} ;;
+      esac
+    done <<FIELDS
+$fields
+FIELDS
+    [ "$page_count" != 0 ] || return 0
+    if [ "$page_state" != success ]; then
+      FM_PR_FORGEJO_CI_STATE=${page_state:-unreadable}
+      return 0
+    fi
+    FM_PR_FORGEJO_CI_STATE=success
+    page=$((page + 1))
+    # A server that ignores the page parameter would repeat a non-empty page
+    # forever, so an implausible page count is unreadable rather than green.
+    if [ "$page" -gt 100 ]; then
+      FM_PR_FORGEJO_CI_STATE=unreadable
+      return 0
+    fi
+  done
+}
+
 # gerrit-axi resolves its server from the current directory's origin remote
 # first, so the host is passed explicitly from the parsed identity and a read
 # outside a clone still reaches the right server. A change number is
