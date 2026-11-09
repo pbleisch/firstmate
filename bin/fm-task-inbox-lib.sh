@@ -95,13 +95,15 @@
 #   FM_TASK_INBOX_BUSY_MAX     default 2; consecutive busy-deferred due polls before escalation
 
 _FM_TASK_INBOX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Both dependencies are canonical lint roots in their own right. Keep them as
+# These dependencies are canonical lint roots in their own right. Keep them as
 # analysis boundaries here so ShellCheck's external-source traversal does not
 # recursively duplicate the full backend graph for every inbox consumer.
 # shellcheck source=/dev/null
 . "$_FM_TASK_INBOX_LIB_DIR/fm-wake-lib.sh"
 # shellcheck source=/dev/null
 . "$_FM_TASK_INBOX_LIB_DIR/fm-backend.sh"
+# shellcheck source=/dev/null
+. "$_FM_TASK_INBOX_LIB_DIR/fm-busy-lib.sh"
 
 FM_TASK_INBOX_SCHEMA='fm-task-inbox.v1'
 FM_TASK_INBOX_GRACE_DEFAULT=90
@@ -386,34 +388,53 @@ fm_task_inbox_doorbell_line() {  # <record-path>
 # whose Enter never landed, so on an agent not reported busy it is submitted
 # rather than skipped; skipping it would block every later ring. On both paths
 # a lost first Enter gets one confirmed retry.
+# Every keystroke is bracketed by fm_busy_input_begin/end for the record's
+# task, so a ring clears a Codex worker's turn-end idle marker before it lands;
+# a marker that cannot be cleared skips the ring as a failed send.
 fm_task_inbox_ring() {  # <backend> <target> <record-path> [expected-label]
   local backend=$1 target=$2 rec=$3 label=${4:-} line cstate verdict
+  local inbox state id harness token rc
   case "$(fm_backend_agent_state "$backend" "$target" 2>/dev/null || true)" in
     dead|missing) return 3 ;;
   esac
   if ! line=$(fm_task_inbox_doorbell_line "$rec"); then
     return 2
   fi
+  inbox=${rec%/*}
+  inbox=${inbox%/handled}
+  state=${inbox%/*}
+  id=${inbox##*/}
+  id=${id%.inbox}
+  harness=$(sed -n 's/^harness=//p' "$state/$id.meta" 2>/dev/null | head -n 1)
   cstate=$(fm_backend_composer_state "$backend" "$target" "$label" 2>/dev/null) || cstate=unknown
   case "$cstate" in
     pending)
       fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" \
         && [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" != busy ] \
         || return 1
-      fm_backend_send_key "$backend" "$target" Enter "$label" >/dev/null 2>&1 || return 2
-      sleep 0.3
-      fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label" || return 0
-      fm_backend_send_key "$backend" "$target" Enter "$label" >/dev/null 2>&1 || return 2
-      return 0
+      token=$(fm_busy_input_begin "$state" "$id" "$harness" text "$line") || return 2
+      rc=0
+      if ! fm_backend_send_key "$backend" "$target" Enter "$label" >/dev/null 2>&1; then
+        rc=2
+      else
+        sleep 0.3
+        if fm_task_inbox_composer_holds "$backend" "$target" "$line" "$label"; then
+          fm_backend_send_key "$backend" "$target" Enter "$label" >/dev/null 2>&1 || rc=2
+        fi
+      fi
+      fm_busy_input_end "$state" "$id" "$harness" "$token"
+      return "$rc"
       ;;
   esac
+  token=$(fm_busy_input_begin "$state" "$id" "$harness" text "$line") || return 2
   # Accepted residual race: terminal input and Enter are separate delivery
   # steps, so an agent exiting after the liveness check could leave a bare
   # shell only a suffix; the `: ` prefix protects complete lines only. Do not
   # add process-bound atomic delivery here unless an incident reopens this.
-  if ! verdict=$(fm_backend_send_text_submit "$backend" "$target" "$line" 2 0.4 0.3 "$label" 2>/dev/null); then
-    return 2
-  fi
+  rc=0
+  verdict=$(fm_backend_send_text_submit "$backend" "$target" "$line" 2 0.4 0.3 "$label" 2>/dev/null) || rc=2
+  fm_busy_input_end "$state" "$id" "$harness" "$token"
+  [ "$rc" = 0 ] || return 2
   # The verdict is read only to report a failed keystroke; every other value
   # (empty, pending, unknown, ...) is deliberately ignored, never proof.
   [ "$verdict" != send-failed ] || return 2

@@ -497,21 +497,52 @@ test_claude_hooks_stale_incarnation_harmless() {
   pass "claude hook events from a superseded incarnation are rejected without breaking the hook"
 }
 
-test_codex_unverified_until_a_semantic_source_exists() {
-  local rec id=busy-cx-1 out state
-  rec=$(make_spawn_case codex-unverified codex "$id")
+test_codex_crewmate_notify_records_the_turn_end_marker() {
+  local rec id=busy-cx-1 out state state_real gen launch brief t0 payload
+  local -a argv
+  rec=$(make_spawn_case codex-notify codex "$id")
   read_case_record "$rec"
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$id" "$PROJ_DIR")
+  : > "$CASE_DIR/launch.log"
+  out=$(FM_FAKE_LAUNCH_LOG="$CASE_DIR/launch.log" run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$id" "$PROJ_DIR")
   expect_code 0 $? "codex spawn should succeed: $out"
-  state="$HOME_DIR/state"
-  assert_absent "$state/$id.busy-gen" "codex must not arm a busy contract with no verified semantic source"
-  assert_absent "$WT_DIR/.codex/hooks.json" "codex must not install unverified busy hooks"
   assert_contains "$out" 'spawned '"$id"' harness=codex' "codex spawn did not complete normally"
+  state="$HOME_DIR/state"
+  state_real=$(cd "$state" && pwd -P)
+  gen=$(cat "$state/$id.busy-gen" 2>/dev/null) || fail "a codex crewmate must arm a busy gen for its notify program"
+  assert_absent "$WT_DIR/.codex/hooks.json" "codex must not install unverified busy hooks"
   out=$(classify codex "$id" "$state")
-  [ "$out" = "unknown codex-unverified" ] || fail "codex must classify 'unknown codex-unverified', got '$out'"
-  out=$(fm_busy_classify tmux fake:w codex "$id" "$state" '• Working (6s • esc to interrupt)')
-  [ "$out" = "unknown codex-unverified" ] || fail "codex must not fall back to footer text, got '$out'"
-  pass "codex classifies unknown until a semantic source is verified, never idle or footer-matched"
+  [ "$out" = "unknown codex-unverified" ] || fail "a fresh codex crewmate must classify 'unknown codex-unverified', got '$out'"
+  # Parse the launch's notify argv the way the shell and Codex's TOML -c do.
+  launch=$(cat "$CASE_DIR/launch.log")
+  out=$(python3 -I - "$launch" <<'PYC'
+import shlex, sys, tomllib
+words = shlex.split(sys.argv[1])
+notify = [w for w in words if w.startswith("notify=")]
+assert len(notify) == 1, words
+print("\n".join(tomllib.loads(notify[0])["notify"]))
+PYC
+) || fail "the codex launch carries no parseable notify program: $launch"
+  argv=()
+  while IFS= read -r word; do argv+=("$word"); done <<< "$out"
+  [ "${#argv[@]}" = 4 ] && [ "${argv[0]}" = "$ROOT/bin/fm-codex-notify.sh" ] \
+    && [ "${argv[1]}" = "$state_real" ] && [ "${argv[2]}" = "$id" ] && [ "${argv[3]}" = "$gen" ] \
+    || fail "the notify argv must name fm-codex-notify.sh, the state dir, the task, and its gen: ${argv[*]}"
+  brief=$(printf 'Brief.\n' | "$ROOT/bin/fm-operational-input.sh" encode launch-brief | jq -Rs '[.]')
+  t0=$(perl -MTime::HiRes=time -e 'printf "%d", time() * 1000')
+  payload=$(python3 -I - "$t0" "$brief" <<'PYC'
+import json, sys
+h = format(int(sys.argv[1]) + 5, "012x")
+u = lambda t: f"{h[:8]}-{h[8:12]}-7{t*3}-8{t*3}-{t*12}"
+print(json.dumps({"type": "agent-turn-complete", "thread-id": u("a"), "turn-id": u("b"),
+                  "input-messages": json.loads(sys.argv[2])}))
+PYC
+)
+  rm -f "$state/$id.turn-ended"
+  "${argv[@]}" "$payload" || fail "the notify program must exit 0"
+  [ -e "$state/$id.turn-ended" ] || fail "the notify program must keep touching the turn-ended notification"
+  out=$(classify codex "$id" "$state")
+  [ "$out" = "idle codex-notify" ] || fail "the launch-brief turn end must classify 'idle codex-notify', got '$out'"
+  pass "a codex crewmate's notify program carries its gen and records the turn-end idle marker"
 }
 
 # Gemini's hooks are PROJECT hooks in the worktree's own .gemini/settings.json,
@@ -1106,7 +1137,7 @@ test_secondmate_codex_and_grok_do_not_arm_a_parent_turnend() {
     || fail "codex secondmate spawn failed: $out"
   state="$case_dir/primary/state"
   launch=$(cat "$case_dir/launch.log")
-  assert_absent "$state/$id.busy-gen" "codex secondmate must not arm a busy contract with no verified source"
+  assert_absent "$state/$id.busy-gen" "codex secondmate must not arm a busy contract: it has no notify program"
   assert_not_contains "$launch" "turn-ended" "codex secondmate launch referenced a parent turn-ended signal"
   assert_not_contains "$launch" "notify=" "codex secondmate launch included the parent turn-end notify hook"
   out=$(classify codex "$id" "$state")
@@ -1151,6 +1182,6 @@ test_gemini_is_refused_as_a_secondmate
 test_kiro_hooks_semantic_lifecycle
 test_kiro_hooks_stale_incarnation_harmless
 test_raw_kiro_launch_has_no_semantic_wiring
-test_codex_unverified_until_a_semantic_source_exists
+test_codex_crewmate_notify_records_the_turn_end_marker
 
 echo "all fm-busy-adapter-wiring tests passed"

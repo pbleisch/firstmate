@@ -509,7 +509,7 @@ dismiss_interrupt_hazard() {  # <key> <ere>
 # sooner than its press gap; without that proof INTERRUPT_ARMED=no and no
 # further press is sent. Its hazard surface is then closed before returning.
 send_interrupt_keys() {
-  local key repeat clear arm hazard gap i=0
+  local key repeat clear arm hazard gap i=0 token
   if [ "$HARNESS" = hermes ] && [ "$(fm_backend_composer_state "$BACKEND" "$T")" != empty ]; then
     die 'Hermes double-Escape clears an unsent draft; interrupt requires a proven empty composer'
   fi
@@ -525,6 +525,8 @@ send_interrupt_keys() {
     || die "harness $HARNESS needs $clear to clear its composer after an interrupt, which the $BACKEND backend cannot deliver; refusing to leave the cancelled prompt where the next submitted line would concatenate onto it"
   [ -z "$arm$hazard" ] || fm_backend_visible_capture_supported "$BACKEND" \
     || die "harness $HARNESS must see its screen between interrupt presses, because a repeated $key on an idle agent opens its revert picker, and the $BACKEND backend has no verified viewport read; refusing to press blind"
+  token=$(fm_busy_input_begin "$STATE" "$ID" "$HARNESS" key) \
+    || die "task $ID's turn-end marker could not be cleared before its interrupt; nothing was sent"
   INTERRUPT_ARMED=yes
   INTERRUPT_HAZARD=none
   while [ "$i" -lt "$repeat" ]; do
@@ -541,6 +543,7 @@ send_interrupt_keys() {
   [ -z "$hazard" ] || dismiss_interrupt_hazard "$key" "$hazard"
   [ -z "$clear" ] || fm_backend_send_key "$BACKEND" "$T" "$clear" "$LABEL" \
     || die "interrupt key $key reached task $ID, but $clear did not, so its composer still holds the cancelled prompt; clear it before the next lifecycle action"
+  fm_busy_input_end "$STATE" "$ID" "$HARNESS" "$token"
 }
 
 prepare_interrupt_ack() {
@@ -721,7 +724,7 @@ retire_busy_incarnation() {
 # do_exit: stop the running agent, preserving endpoint and worktree. Prints
 # `already-stopped`, `endpoint-gone`, or `stopped`.
 do_exit() {
-  local state cmd hazard verdict composer_state cancel absence interrupt_result=not-needed dialog
+  local state cmd hazard verdict composer_state cancel absence interrupt_result=not-needed dialog token
   require_state_verified_backend exit
   fm_control_backend_exit_supported "$BACKEND" \
     || die "task $ID runs on the $BACKEND backend, whose T3 Orchestrator V2 tools have no session stop, so 'exit' cannot stop its agent; 'interrupt' ends the running turn and teardown archives the thread"
@@ -821,6 +824,8 @@ do_exit() {
   # interacting with the typed submit verification. A Ctrl-C over leftover
   # composer text only clears it, so Ctrl-U clears the composer first and one
   # more Ctrl-C follows if the agent is still alive.
+  token=$(fm_busy_input_begin "$STATE" "$ID" "$HARNESS" key) \
+    || die "task $ID's turn-end marker could not be cleared before its exit command; nothing was sent"
   case "$cmd" in
     C-c)
       fm_backend_send_key "$BACKEND" "$T" C-u "$LABEL" \

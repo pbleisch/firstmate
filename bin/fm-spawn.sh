@@ -554,7 +554,10 @@
 #                  own leading space, and is empty on every fresh spawn and for
 #                  every other harness)
 #     __TURNEND__  absolute path to state/<task-id>.turn-ended (for harnesses whose
-#                  turn-end signal rides the launch command, e.g. codex -c notify=[...])
+#                  turn-end signal rides the launch command)
+#     __CODEXNOTIFY__ the codex crewmate's -c notify= argv array, naming
+#                  bin/fm-codex-notify.sh with this task's state dir, id, and busy gen
+#                  (codex_notify_toml builds and escapes it)
 #     __PIEXT__    absolute path to state/<task-id>.pi-ext.ts (pi busy-state extension,
 #                  written by this script; outside the worktree to avoid pi's trust gate;
 #                  a secondmate loads it beside its two primary extensions)
@@ -2815,6 +2818,21 @@ shell_quote() {
   printf "'"
 }
 
+# codex_notify_toml <value>...: the TOML array of literal strings that Codex's
+# `-c notify=` runs as argv, escaped for the double-quoted shell word the codex
+# launch template puts it in. A TOML literal string cannot hold a single quote
+# or a control character, so such a value (or an empty one) is refused.
+codex_notify_toml() {
+  local v out='[' sep=''
+  for v in "$@"; do
+    case "$v" in '' | *"'"* | *[[:cntrl:]]*) return 1 ;; esac
+    v=$(printf '%s' "$v" | sed 's/[\\"$`]/\\&/g')
+    out="$out$sep'$v'"
+    sep=,
+  done
+  printf '%s]' "$out"
+}
+
 resolve_pi_executable() {
   local candidate dir
   candidate=$(type -P -- "$1" 2>/dev/null) || return 1
@@ -3085,7 +3103,7 @@ launch_template() {
     if [ "$kind" = secondmate ]; then
       printf '%s' 'codex __MODELFLAG____EFFORTFLAG____CODEXAPPROVALFLAG__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
     else
-      printf '%s' 'codex __MODELFLAG____EFFORTFLAG____CODEXAPPROVALFLAG__ --disable hooks -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+      printf '%s' 'codex __MODELFLAG____EFFORTFLAG____CODEXAPPROVALFLAG__ --disable hooks -c "notify=__CODEXNOTIFY__" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
     fi
     ;;
   opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}__EFFORTFLAG__}'\'' __OPENCODEBIN__ __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
@@ -6583,6 +6601,18 @@ BUSY_GEN=
       echo "error: codex semantic busy-state wiring is not implemented; extend the probe only together with verified wiring" >&2
       exit 1
     fi
+    # The turn-end marker (bin/fm-busy-lib.sh "Codex turn-end marker") needs
+    # this gen in the crewmate launch's notify program. It is seeded unknown:
+    # nothing Codex emits ever reports a turn as running, so a busy seed could
+    # only go stale. A secondmate launch carries no notify program.
+    if [ "$RAW_LAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
+      BUSY_GEN=$("$FM_ROOT/bin/fm-busy-event.sh" arm "$STATE_REAL" "$ID" \
+        --state unknown --source fm-spawn --event launch-brief) || {
+        echo "error: failed to arm the busy-state contract for $ID" >&2
+        exit 1
+      }
+      [ "$RELAUNCH" -ne 1 ] || RELAUNCH_REPLACEMENT_BUSY_GEN=$BUSY_GEN
+    fi
     ;;
   esac
   case "$WIRING_HARNESS" in
@@ -7134,13 +7164,11 @@ EOF
     ;;
   codex*)
     # Semantic busy-state source negotiation (bin/fm-busy-lib.sh owns the
-    # probes and the evidence). Neither Codex path is usable on the
-    # installed binary: a pane worker's turns are not observable through
-    # the app-server protocol, and its lifecycle hooks did not fire for a
-    # firstmate-launched worker. Codex therefore classifies unknown with
-    # an explicit reason rather than falling back to idle, and no busy
-    # wiring is installed. The turn-end NOTIFICATION marker still rides
-    # the launch command via -c notify=[...] and __TURNEND__.
+    # probes and the evidence). Neither Codex semantic path is usable, so a
+    # crewmate's only wiring is the launch command's -c notify= program
+    # (__CODEXNOTIFY__, bin/fm-codex-notify.sh), which carries the gen armed
+    # above, records the "Codex turn-end marker", and keeps touching the
+    # turn-end NOTIFICATION marker.
     ;;
   grok*)
     # Parent turn-end wiring only. A secondmate already classifies through the
@@ -7650,6 +7678,15 @@ if [ "$HARNESS" = rovo ]; then
 fi
 LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
 LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
+case "$LAUNCH" in
+*__CODEXNOTIFY__*)
+  CODEXNOTIFY=$(codex_notify_toml "$FM_ROOT/bin/fm-codex-notify.sh" "$STATE_REAL" "$ID" "$BUSY_GEN") || {
+    echo "error: cannot build the codex notify program for $ID: a path holds a quote, a newline, or no busy-state gen was armed" >&2
+    exit 1
+  }
+  LAUNCH=${LAUNCH//__CODEXNOTIFY__/"$CODEXNOTIFY"}
+  ;;
+esac
 LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
 LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
 LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}

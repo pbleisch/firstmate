@@ -42,6 +42,25 @@
 #       an old task from retiring a newly armed incarnation. A missing sidecar
 #       is already retired, so any orphan record is removed idempotently.
 #
+#   input <state-dir> <id> begin --kind text|key      (text on stdin)
+#   input <state-dir> <id> end --token T
+#       Codex turn-end marker inputs (contract in fm-busy-lib.sh). begin binds
+#       to the current gen, writes `unknown fm-input input`, stamps
+#       state/<id>.busy-input with a ceiling-millisecond start, keeps a text
+#       delivery's exact text in state/<id>.busy-input.text, and prints that
+#       start as the token. end stamps the finish of the delivery whose token
+#       still names the latest begin, and is a no-op otherwise.
+#
+#   codex-turn-end <state-dir> <id> --gen G      (notify JSON payload on stdin)
+#       Write `idle codex-notify turn-end` only when the payload passes every
+#       check in fm-busy-lib.sh's Codex turn-end marker contract, binding the
+#       main thread to state/<id>.codex-thread on its launch-brief turn. A
+#       payload that fails any check is refused and changes nothing.
+#       FM_BUSY_CODEX_ABSORB_MS overrides the absorbed-input delay (3000).
+#
+#   Arm and retire remove both input sidecars and the thread binding, since
+#   all three belong to one incarnation.
+#
 #   stream <state-dir> <id> <open|progress|close> --gen G --request N
 #       Mutate the optional Pi stream contract owned by fm-busy-lib.sh.
 #       Open requires a strictly newer request; open and progress both require
@@ -61,6 +80,9 @@ usage:
   fm-busy-event.sh apply <state-dir> <id> <busy|idle|unknown> (--gen G | --current-gen) --source S --event E [--turn-ended]
   fm-busy-event.sh progress <state-dir> <id> --gen G
   fm-busy-event.sh stream <state-dir> <id> <open|progress|close> --gen G --request N
+  fm-busy-event.sh input <state-dir> <id> begin --kind text|key   (text on stdin)
+  fm-busy-event.sh input <state-dir> <id> end --token T
+  fm-busy-event.sh codex-turn-end <state-dir> <id> --gen G   (payload on stdin)
   fm-busy-event.sh retire <state-dir> <id> (--gen G | --current-gen)
 See the header comment for the full contract.
 EOF
@@ -73,7 +95,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CMD=${1:-}
 case "$CMD" in
-  arm|apply|progress|stream|retire) shift ;;
+  arm|apply|progress|stream|retire|input|codex-turn-end) shift ;;
   *) usage ;;
 esac
 
@@ -92,6 +114,14 @@ SOURCE=
 EVENT=
 STREAM_OP=
 REQUEST=
+INPUT_OP=
+INPUT_KIND=
+TOKEN=
+if [ "$CMD" = input ]; then
+  INPUT_OP=${1:-}
+  case "$INPUT_OP" in begin|end) shift ;; *) usage ;; esac
+  USE_CURRENT_GEN=1
+fi
 if [ "$CMD" = apply ]; then
   NEW_STATE=${1:-}
   case "$NEW_STATE" in busy|idle|unknown) shift ;; *) usage ;; esac
@@ -112,9 +142,17 @@ while [ $# -gt 0 ]; do
     --event) EVENT=${2:-}; shift 2 || usage ;;
     --turn-ended) [ "$CMD" = apply ] || usage; TURN_ENDED=1; shift ;;
     --request) REQUEST=${2:-}; shift 2 || usage ;;
+    --kind) [ "$INPUT_OP" = begin ] || usage; INPUT_KIND=${2:-}; shift 2 || usage ;;
+    --token) [ "$INPUT_OP" = end ] || usage; TOKEN=${2:-}; shift 2 || usage ;;
     *) usage ;;
   esac
 done
+if [ "$CMD" = input ]; then
+  [ "$USE_CURRENT_GEN" = 1 ] && [ -z "$GEN" ] || usage
+  case "$INPUT_OP:$INPUT_KIND" in begin:text|begin:key) : ;; begin:*) usage ;; esac
+  [ "$INPUT_OP" != end ] || fm_busy_stream_uint_valid "$TOKEN" || usage
+fi
+[ "$CMD" != codex-turn-end ] || { [ "$USE_CURRENT_GEN" = 0 ] && [ -n "$GEN" ]; } || usage
 if [ "$CMD" = apply ] || [ "$CMD" = arm ]; then
   case "$NEW_STATE" in busy|idle|unknown) : ;; *) usage ;; esac
   fm_busy_token_valid "$SOURCE" || { echo "error: invalid --source" >&2; exit 1; }
@@ -196,6 +234,53 @@ clear_stream_incarnation() {
   rm -f "$STATE/$ID.model-stream" "$STATE/$ID.model-stream-order" "$STATE/$ID.model-progress"
 }
 
+clear_incarnation_sidecars() {
+  clear_stream_incarnation &&
+    rm -f "$INPUT_FILE" "$INPUT_FILE.text" "$(fm_busy_codex_thread_path "$STATE" "$ID")"
+}
+
+# Read state/<id>.busy-input as "<gen> <start> <done> <kind>", or fail.
+input_read() {
+  local line version gen start finish kind extra
+  line=$(head -n 1 "$INPUT_FILE" 2>/dev/null) || return 1
+  read -r version gen start finish kind extra <<< "$line"
+  [ "$version" = v1 ] && [ -z "$extra" ] || return 1
+  gen=${gen#gen=} start=${start#start=} finish=${finish#done=} kind=${kind#kind=}
+  fm_busy_token_valid "$gen" && fm_busy_stream_uint_valid "$start" || return 1
+  case "$finish" in ''|*[!0-9]*) return 1 ;; esac
+  case "$kind" in text|key) : ;; *) return 1 ;; esac
+  printf '%s %s %s %s' "$gen" "$start" "$finish" "$kind"
+}
+
+input_write() {  # <gen> <start> <done> <kind>
+  printf 'v1 gen=%s start=%s done=%s kind=%s\n' "$1" "$2" "$3" "$4" > "$INPUT_FILE.tmp.$$" &&
+    mv -f "$INPUT_FILE.tmp.$$" "$INPUT_FILE"
+}
+
+# The Codex notify payload is parsed before the lock: everything here depends
+# on the payload alone. Arrival is floored so the absorbed-input delay is never
+# overstated.
+INPUT_FILE=$(fm_busy_input_path "$STATE" "$ID")
+if [ "$CMD" = codex-turn-end ]; then
+  ARRIVAL_MS=$(fm_busy_now_ms floor)
+  command -v jq >/dev/null 2>&1 || { echo "error: codex-turn-end needs jq" >&2; exit 1; }
+  PAYLOAD=$(cat)
+  ids=$(printf '%s' "$PAYLOAD" | jq -r 'select(type == "object" and .type == "agent-turn-complete")
+    | [(.["thread-id"] // ""), (.["turn-id"] // "")] | @tsv' 2>/dev/null) || ids=
+  IFS=$'\t' read -r THREAD TURN <<< "$ids"
+  if ! TURN_MS=$(fm_busy_uuid7_ms "${TURN:-}") || ! fm_busy_uuid7_ms "${THREAD:-}" >/dev/null; then
+    echo "error: not a recognised Codex agent-turn-complete payload for $ID" >&2
+    exit 1
+  fi
+  FIRST_KIND=$(printf '%s' "$PAYLOAD" | jq -j '.["input-messages"][0] // empty | strings' 2>/dev/null \
+    | "$SCRIPT_DIR/fm-operational-input.sh" kind 2>/dev/null) || FIRST_KIND=
+fi
+INPUT_TEXT=
+if [ "$CMD" = input ] && [ "$INPUT_OP" = begin ] && [ "$INPUT_KIND" = text ]; then
+  INPUT_TEXT=$(cat; printf x) || exit 1
+  INPUT_TEXT=${INPUT_TEXT%x}
+fi
+
 old_umask=$(umask)
 umask 077
 
@@ -204,7 +289,7 @@ if [ "$CMD" = arm ]; then
   lock_acquire || exit 1
   {
     printf '%s\n' "$GEN" > "$GEN_FILE.tmp.$$" && mv -f "$GEN_FILE.tmp.$$" "$GEN_FILE" \
-      && write_record "$GEN" 1 && rm -f "$STATE/$ID.progress" && clear_stream_incarnation
+      && write_record "$GEN" 1 && rm -f "$STATE/$ID.progress" && clear_incarnation_sidecars
   } || { lock_release; umask "$old_umask"; echo "error: arm failed for $ID" >&2; exit 1; }
   lock_release
   umask "$old_umask"
@@ -227,7 +312,7 @@ fi
 lock_acquire || { umask "$old_umask"; exit 1; }
 CURRENT=$(fm_busy_current_gen "$STATE" "$ID") || {
   if [ "$CMD" = retire ] && [ ! -e "$GEN_FILE" ] && [ ! -L "$GEN_FILE" ]; then
-    if ! { rm -f "$REC" "$STATE/$ID.progress" && clear_stream_incarnation; }; then
+    if ! { rm -f "$REC" "$STATE/$ID.progress" && clear_incarnation_sidecars; }; then
       lock_release
       umask "$old_umask"
       echo "error: busy-state retirement failed for $ID" >&2
@@ -252,7 +337,7 @@ if [ "$GEN" != "$CURRENT" ]; then
   exit 1
 fi
 if [ "$CMD" = retire ]; then
-  if ! { rm -f "$GEN_FILE" "$REC" "$STATE/$ID.progress" && clear_stream_incarnation; }; then
+  if ! { rm -f "$GEN_FILE" "$REC" "$STATE/$ID.progress" && clear_incarnation_sidecars; }; then
     lock_release
     umask "$old_umask"
     echo "error: busy-state retirement failed for $ID" >&2
@@ -311,6 +396,70 @@ if [ "$CMD" = stream ]; then
   lock_release
   exit 0
 fi
+PRINT_TOKEN=
+if [ "$CMD" = input ] && [ "$INPUT_OP" = end ]; then
+  snapshot=$(input_read) || { lock_release; umask "$old_umask"; exit 0; }
+  read -r in_gen in_start in_done in_kind <<< "$snapshot"
+  if [ "$in_gen" = "$GEN" ] && [ "$in_start" = "$TOKEN" ] && [ "$in_done" = 0 ]; then
+    input_write "$GEN" "$in_start" "$(fm_busy_now_ms ceil)" "$in_kind" || {
+      lock_release; umask "$old_umask"; exit 1
+    }
+  fi
+  lock_release
+  umask "$old_umask"
+  exit 0
+fi
+if [ "$CMD" = input ]; then
+  # Never let a stamp run backwards: a second delivery in the same
+  # millisecond still gets a strictly later token.
+  in_start=$(fm_busy_now_ms ceil)
+  if snapshot=$(input_read); then
+    read -r in_gen prev_start _ _ <<< "$snapshot"
+    [ "$in_gen" != "$GEN" ] || [ "$in_start" -gt "$prev_start" ] || in_start=$((prev_start + 1))
+  fi
+  if [ "$INPUT_KIND" = text ]; then
+    printf '%s' "$INPUT_TEXT" > "$INPUT_FILE.text.tmp.$$" && mv -f "$INPUT_FILE.text.tmp.$$" "$INPUT_FILE.text"
+  else
+    rm -f "$INPUT_FILE.text"
+  fi
+  # shellcheck disable=SC2181 # the if/else above is one compound command
+  if [ $? -ne 0 ] || ! input_write "$GEN" "$in_start" 0 "$INPUT_KIND"; then
+    lock_release; umask "$old_umask"; echo "error: input stamp failed for $ID" >&2; exit 1
+  fi
+  NEW_STATE=unknown SOURCE=fm-input EVENT=input PRINT_TOKEN=$in_start
+fi
+if [ "$CMD" = codex-turn-end ]; then
+  refuse_turn_end() {
+    lock_release
+    umask "$old_umask"
+    echo "error: codex turn end refused for $ID: $1" >&2
+    exit 1
+  }
+  thread_file=$(fm_busy_codex_thread_path "$STATE" "$ID")
+  bound=$(cat "$thread_file" 2>/dev/null) || bound=
+  if [ -n "$bound" ]; then
+    [ "$bound" = "v1 gen=$GEN thread=$THREAD" ] || refuse_turn_end "not the bound main thread"
+  else
+    [ "$FIRST_KIND" = launch-brief ] || refuse_turn_end "thread not bound and this is not the launch-brief turn"
+    { printf 'v1 gen=%s thread=%s\n' "$GEN" "$THREAD" > "$thread_file.tmp.$$" &&
+      mv -f "$thread_file.tmp.$$" "$thread_file"; } || refuse_turn_end "thread binding could not be written"
+  fi
+  if snapshot=$(input_read); then
+    read -r in_gen in_start in_done in_kind <<< "$snapshot"
+    if [ "$in_gen" = "$GEN" ] && [ "$TURN_MS" -le "$in_start" ]; then
+      absorb_ms=${FM_BUSY_CODEX_ABSORB_MS:-3000}
+      case "$absorb_ms" in ''|*[!0-9]*) absorb_ms=3000 ;; esac
+      [ "$in_kind" = text ] && [ "$in_done" -gt 0 ] && [ "$ARRIVAL_MS" -ge $((in_done + absorb_ms)) ] ||
+        refuse_turn_end "the turn began before the last input"
+      printf '%s' "$PAYLOAD" | jq -e --rawfile t "$INPUT_FILE.text" '
+        def norm: sub("^\\s+"; "") | sub("\\s+$"; "");
+        ($t | norm) as $want
+        | $want != "" and any((.["input-messages"] // [])[] | strings; norm == $want)' >/dev/null 2>&1 ||
+        refuse_turn_end "the turn began before the last input and did not absorb it"
+    fi
+  fi
+  NEW_STATE=idle SOURCE=codex-notify EVENT=turn-end
+fi
 OLD_SEQ=0
 if [ -f "$REC" ]; then
   old_line=$(head -n 1 "$REC" 2>/dev/null || true)
@@ -338,4 +487,5 @@ umask "$old_umask"
 # Best effort: the record already settled, so a failed touch never refuses it.
 [ "$TURN_ENDED" = 0 ] || touch "$STATE/$ID.turn-ended" 2>/dev/null || true
 lock_release
+[ -z "$PRINT_TOKEN" ] || printf '%s\n' "$PRINT_TOKEN"
 exit 0

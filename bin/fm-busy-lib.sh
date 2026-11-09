@@ -47,6 +47,12 @@
 #   kiro-hook        Kiro V2 agent-config hooks (userPromptSubmit opens; stop
 #                    closes) - kiro's ONLY state source; its per-turn stop hook
 #                    also keeps the turn-ended notification touch
+#   codex-notify     Codex per-launch `-c notify=` turn-end program
+#                    (bin/fm-codex-notify.sh): IDLE evidence only, never busy;
+#                    see "Codex turn-end marker" below
+#   fm-input         a Firstmate delivery into a Codex worker (fm-send text or
+#                    key, steering re-ring, control keys): unknown, clearing
+#                    any codex-notify idle until a later turn end
 #   codex-hook, codex-appserver  reserved: Codex, gated by
 #                    fm_busy_codex_semantic_source
 #   kimi-wire, kimi-hook  reserved: standalone Kimi, gated by fm_busy_kimi_verified
@@ -142,9 +148,33 @@
 # fm_busy_codex_hooks_verified): the approved contract prefers Codex's
 # app-server turn lifecycle with capability negotiation, and sanctions its
 # stable lifecycle hooks as the intermediate. Neither is usable on the
-# installed binary, so Codex classifies unknown codex-unverified rather than
-# falling back to idle, and fm-spawn installs no Codex busy wiring.
-# docs/verification/supervision.md owns the evidence for both probes.
+# installed binary, so Codex reports unknown codex-unverified except where the
+# turn-end marker below proves a finished turn; it is never busy from Firstmate
+# evidence. docs/verification/supervision.md owns the evidence for the probes.
+#
+# Codex turn-end marker: a crewmate or scout launch carries `-c notify=` naming
+# bin/fm-codex-notify.sh with this incarnation's gen, and fm-spawn arms the
+# record at `unknown fm-spawn`. Codex runs that program with an
+# agent-turn-complete JSON payload after each completed turn of ANY thread it
+# hosts (its auto-title side threads included), never after an interrupted
+# turn. fm-busy-event.sh codex-turn-end turns a payload into `idle codex-notify`
+# only when all of these hold under the writer lock:
+#   - the gen is current;
+#   - the payload's thread is the incarnation's main thread: the first payload
+#     whose first input message is the launch-brief operational input binds
+#     state/<id>.codex-thread, and every other thread is refused;
+#   - the completed turn began after the last Firstmate input (turn ids are
+#     UUIDv7, so the id carries the turn's start in milliseconds), or that
+#     input was absorbed by this very turn: its exact text is one of the
+#     turn's input messages and the payload arrived at least
+#     FM_BUSY_CODEX_ABSORB_MS (3000) after its delivery finished.
+# Every Firstmate delivery into the worker first writes `unknown fm-input`
+# and stamps state/<id>.busy-input (fm_busy_input_begin/end below), so input
+# always clears the marker and a late payload for an earlier turn is refused.
+# Anything unparseable, unbound, or unordered leaves the record unknown.
+# Residual: input typed straight into the pane bypasses Firstmate, so it is
+# invisible until that turn ends; a native backend busy verdict, where the
+# backend has one, still overrides the idle marker in fm_busy_classify.
 #
 # Sourcing: set -u and set -e safe; no subshell-unfriendly globals.
 
@@ -183,6 +213,10 @@ fm_busy_kimi_verified() {
 # but an interactive TUI worker neither starts nor attaches to the
 # app-server daemon, and `codex app-server daemon start` refuses outside the
 # managed standalone install, so no client can observe a pane worker's turns.
+# codex-cli 0.167.0 (live, 2026-11-09): still NOT observable. The TUI always
+# runs on the app-server now (`tui_app_server` is a removed, always-on
+# feature), but in-process: a pane launched under an isolated CODEX_HOME
+# started no daemon and exposed no control socket.
 fm_busy_codex_appserver_observable() {
   return 1
 }
@@ -196,9 +230,90 @@ fm_busy_codex_appserver_observable() {
 # under `codex exec`, in either case with --dangerously-bypass-hook-trust,
 # while global hooks fired in the same runs. Codex additionally exposes no
 # StopFailure hook, so an API-error turn end would need separate coverage
-# even after the discovery problem is solved.
+# even after the discovery problem is solved. Since then crewmate launches
+# disable Codex's hook layer outright (bin/fm-spawn.sh owns why), so hooks are
+# not a worker source on any version.
 fm_busy_codex_hooks_verified() {
   return 1
+}
+
+# Codex turn-end marker helpers (contract in the header above).
+_FM_BUSY_LIB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
+
+fm_busy_input_path() {  # <state-dir> <id>
+  printf '%s/%s.busy-input' "$1" "$2"
+}
+
+fm_busy_codex_thread_path() {  # <state-dir> <id>
+  printf '%s/%s.codex-thread' "$1" "$2"
+}
+
+# fm_busy_now_ms <floor|ceil>: wall-clock epoch milliseconds. Without a
+# sub-second clock the second is rounded toward the requested side, so an
+# input stamp (ceil) is never earlier, and an arrival stamp (floor) never
+# later, than the real moment.
+fm_busy_now_ms() {  # <floor|ceil>
+  local rt sec frac ms
+  rt=${EPOCHREALTIME:-}
+  if [ -n "$rt" ]; then
+    sec=${rt%[.,]*}
+    frac=${rt#*[.,]}
+    case "$sec$frac" in ''|*[!0-9]*) rt= ;; esac
+  fi
+  if [ -z "$rt" ] && ms=$(perl -MTime::HiRes=time -e 'printf "%d", time() * 1000' 2>/dev/null) \
+    && case "$ms" in ''|*[!0-9]*) false ;; *) true ;; esac; then
+    [ "$1" = ceil ] && ms=$((ms + 1))
+    printf '%s' "$ms"
+    return 0
+  fi
+  if [ -n "$rt" ]; then
+    frac="${frac}000"
+    ms=$((10#$sec * 1000 + 10#${frac:0:3}))
+    [ "$1" = ceil ] && ms=$((ms + 1))
+    printf '%s' "$ms"
+    return 0
+  fi
+  sec=$(date +%s)
+  if [ "$1" = ceil ]; then
+    printf '%s' "$((sec * 1000 + 999))"
+  else
+    printf '%s' "$((sec * 1000))"
+  fi
+}
+
+# fm_busy_uuid7_ms <uuid>: the millisecond timestamp of an RFC 9562 version-7
+# UUID, or failure for any other shape.
+fm_busy_uuid7_ms() {  # <uuid>
+  local u=${1:-}
+  case "$u" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-7[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$((16#${u:0:8}${u:9:4}))"
+}
+
+# fm_busy_input_begin <state-dir> <id> <harness> <text|key> [text]: record a
+# Firstmate delivery into a Codex worker BEFORE its first byte is sent, so the
+# idle marker is gone before the input can start a turn. Prints the delivery
+# token for fm_busy_input_end (empty when nothing was recorded). A no-op for
+# other harnesses and for a task with no armed incarnation; any other failure
+# returns 1 and the caller must not deliver, because an uncleared marker could
+# read a busy worker idle.
+fm_busy_input_begin() {  # <state-dir> <id> <harness> <text|key> [text]
+  local state=$1 id=$2 harness=$3 kind=$4 text=${5-}
+  case "$harness" in codex*) : ;; *) return 0 ;; esac
+  fm_busy_codex_semantic_source && return 0
+  [ -f "$(fm_busy_gen_path "$state" "$id")" ] || return 0
+  printf '%s' "$text" | "$_FM_BUSY_LIB_DIR/fm-busy-event.sh" input "$state" "$id" begin --kind "$kind"
+}
+
+# fm_busy_input_end <state-dir> <id> <harness> <token>: stamp that the
+# delivery begun with <token> has finished. Best effort: a missing stamp only
+# withholds the absorbed-steer path, never permits an idle.
+fm_busy_input_end() {  # <state-dir> <id> <harness> <token>
+  [ -n "${4:-}" ] || return 0
+  case "$3" in codex*) : ;; *) return 0 ;; esac
+  "$_FM_BUSY_LIB_DIR/fm-busy-event.sh" input "$1" "$2" end --token "$4" >/dev/null 2>&1 || true
 }
 
 # fm_busy_codex_semantic_source: 0 when ANY verified Codex semantic source
@@ -328,8 +443,11 @@ fm_busy_sources_for_harness() {  # <harness>
   case "${1:-}" in
     claude*) adapter=claude-hook ;;
     codex*)
-      fm_busy_codex_semantic_source || { printf ''; return 0; }
-      adapter='codex-hook codex-appserver'
+      if fm_busy_codex_semantic_source; then
+        adapter='codex-hook codex-appserver'
+      else
+        adapter='codex-notify fm-input'
+      fi
       ;;
     opencode*) adapter=opencode-plugin ;;
     gemini*) adapter=gemini-hook ;;
@@ -1103,8 +1221,8 @@ fm_busy_gemini_launch_prompt_tail() {
 # or fail when this harness has none. Consumes the tail on stdin. Scoped to
 # exactly the harnesses fm-spawn.sh arms with the fm-spawn busy source
 # (claude*, opencode*, pi, pi-signed, omp, gemini) since only those can ever
-# read a pinned "busy fm-spawn" record; codex and standalone Kimi already
-# classify unknown before a record is ever consulted, and opencode ships no
+# read a pinned "busy fm-spawn" record; codex (seeded unknown, and read only
+# for its idle marker) and standalone Kimi never read busy, and opencode ships no
 # trust dialog at all.
 fm_busy_launch_prompt_parked() {  # <harness>
   case "${1:-}" in
@@ -1148,6 +1266,24 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
       ;;
     codex*)
       if ! fm_busy_codex_semantic_source; then
+        # Only the turn-end marker can speak, and only for idle; every other
+        # record or absence keeps the established unknown codex-unverified.
+        # A native backend busy verdict outranks the marker, because input
+        # typed straight into the pane never clears it.
+        out=$(fm_busy_record_read "$state" "$id" 2>/dev/null) || out=
+        if case "$out" in 'idle codex-notify '*) true ;; *) false ;; esac; then
+          case "$backend" in
+            herdr|rex|tern|hc)
+              if command -v fm_backend_busy_state >/dev/null 2>&1 \
+                && [ "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null || true)" = busy ]; then
+                printf 'busy %s-native' "$backend"
+                return 0
+              fi
+              ;;
+          esac
+          printf 'idle codex-notify'
+          return 0
+        fi
         printf 'unknown codex-unverified'
         return 0
       fi

@@ -339,6 +339,26 @@ fm_send_record_interrupt() { # <key>
   }
 }
 
+# fm_send_input_begin / fm_send_input_end: bracket a direct key or typed-plane
+# text delivery to a local task with bin/fm-busy-lib.sh's input stamps, so a
+# Codex worker's turn-end idle marker is cleared before the input lands. A
+# marker that cannot be cleared refuses the delivery. Inbox steers are
+# bracketed inside fm_task_inbox_ring instead.
+FM_SEND_INPUT_ID=
+FM_SEND_INPUT_TOKEN=
+fm_send_input_begin() { # <text|key> [text]
+  [ -n "$TARGET_META" ] && [ "$TARGET_BACKEND" != remote ] || return 0
+  FM_SEND_INPUT_ID=$(fm_send_id_from_meta "$TARGET_META")
+  FM_SEND_INPUT_TOKEN=$(fm_busy_input_begin "$STATE" "$FM_SEND_INPUT_ID" "$TARGET_HARNESS" "$1" "${2-}") || {
+    echo "error: nothing sent to $T: the $TARGET_HARNESS turn-end marker for $FM_SEND_INPUT_ID could not be cleared first" >&2
+    return 1
+  }
+}
+fm_send_input_end() {
+  [ -n "$FM_SEND_INPUT_TOKEN" ] || return 0
+  fm_busy_input_end "$STATE" "$FM_SEND_INPUT_ID" "$TARGET_HARNESS" "$FM_SEND_INPUT_TOKEN"
+}
+
 fm_send_meta_for_key_value() { # <state-dir> <key> <value>
   local state=$1 key=$2 value=$3 meta got
   for meta in "$state"/*.meta; do
@@ -918,9 +938,14 @@ if [ "${1:-}" = "--key" ]; then
       echo "error: key '$key' not sent to remote secondmate $TARGET_REMOTE_ID; completion may be unknown" >&2
       exit 1
     fi
-  elif ! fm_backend_send_key "$TARGET_BACKEND" "$T" "$key" "$EXPECTED_LABEL"; then
-    echo "error: key '$key' not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
-    exit 1
+  else
+    fm_send_input_begin key || exit 1
+    if ! fm_backend_send_key "$TARGET_BACKEND" "$T" "$key" "$EXPECTED_LABEL"; then
+      fm_send_input_end
+      echo "error: key '$key' not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
+      exit 1
+    fi
+    fm_send_input_end
   fi
   fm_send_clear_after_interrupt "$semantic_key" || exit 1
   fm_send_record_interrupt "$semantic_key" || exit 1
@@ -1270,11 +1295,17 @@ else
   # block: remote text rides the inbox leg above, and remote --key exits
   # earlier.
   send_rc=0
+  if ! fm_send_input_begin text "$MESSAGE"; then
+    fm_send_known_undelivered_cleanup ||
+      echo "error: known-undelivered pending-reply state could not be reset for $TARGET_TASK_ID" >&2
+    exit 1
+  fi
   if verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL"); then
     :
   else
     send_rc=$?
   fi
+  fm_send_input_end
   if [ "$send_rc" -ne 0 ]; then
     fm_send_known_undelivered_cleanup ||
       echo "error: known-undelivered pending-reply state could not be reset for $TARGET_TASK_ID" >&2

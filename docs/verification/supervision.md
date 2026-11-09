@@ -231,7 +231,7 @@ Each pass polled `state/<id>.busy-state` while a real turn ran.
 | omp | 18.1.11 | Extension `agent_start` / `agent_end` without `willContinue` | Live Herdr scout on `openai-codex/gpt-6-astra` (2026-09-05): the spawn seed `busy source=fm-spawn`, then `busy source=omp-ext event=agent-start`, then `idle source=omp-ext event=agent-end` at the natural end of the brief; a steer through `fm-send` reopened `busy … agent-start`, and a control-plane interrupt closed it with `idle … agent-end` (omp fires `agent_end` on an interrupted turn). `ctx.isIdle()` is deliberately not consulted because it reads false at a natural TUI `agent_end`. |
 | OpenCode | 2.0.21 | Plugin `session.execution.*` (OpenCode 1 `session.status`/`session.idle` retained as legacy inputs) | Verified on 2026-10-01 via `opencode run --standalone`: the live event stream delivered `session.execution.started` then `session.execution.succeeded` for a tool-using turn, and the plugin maps them to `busy`/`idle`; `tests/fm-busy-adapter-wiring.test.sh` pins both the legacy and the `session.execution.*` mappings and the latched-session scoping. |
 | Claude | 2.1.220 (Claude Code) | Hooks `UserPromptSubmit`, `Stop`, `StopFailure`, `SessionEnd` | `UserPromptSubmit` fired for the argv launch prompt and each steer, and `Stop` closed every completed turn. A mid-stream Escape interrupt fired no closing hook, which is why the firstmate-controlled clear exists. `StopFailure` and `SessionEnd` are wired from the four hook names present in the installed binary; only the abnormal paths they cover were not reproduced live. |
-| Codex | codex-cli 0.145.0 | None usable | See below; classifies `unknown codex-unverified`. |
+| Codex | codex-cli 0.167.0 | Turn-end marker from the launch's `-c notify=` program, idle only | See below; otherwise classifies `unknown codex-unverified`. |
 | Kimi (standalone) | not installed | None usable | No binary on `PATH`, so the gate stays closed and it classifies `unknown kimi-unverified`. |
 | Grok | 0.2.112 | Isolated rendered-tail fallback | Retained unconverted; the approved audit could not credit a live structured-lifecycle run. |
 
@@ -246,6 +246,36 @@ The daemon refused with `managed standalone Codex install not found`, and an int
 In this 2026-07-28 Codex 0.145.0 semantic-busy probe, Firstmate-written lifecycle project hooks under `<worktree>/.codex/hooks.json` fired for neither an interactive pane whose directory trust was granted nor `codex exec`, in both cases with `--dangerously-bypass-hook-trust`, while an untracked global probe fired in the same runs; Firstmate does not ship, install, recommend, or depend on that global path.
 Codex also exposes no `StopFailure` hook, so an API-error turn end would need separate coverage even after hook discovery works.
 The app-server protocol schema does define the required lifecycle (`turn/started`, plus a `turn/completed` status of `completed`, `interrupted`, `failed`, or `inProgress`), so the gate is a reachability problem rather than a protocol gap.
+
+Re-checked on 2026-11-09 with codex-cli 0.167.0: `codex features list` reports `tui_app_server` as removed and always on, yet a TUI launched under an isolated `CODEX_HOME` started no app-server daemon and exposed no control socket, so the lifecycle is still unobservable from outside the process.
+Crewmate launches disable Codex hooks to avoid the unanswerable hook-trust modal, so hooks remain unusable for workers.
+
+The usable source is the launch's `-c notify=` program, observed on the same version by a real TUI against a loopback Responses fixture:
+
+```sh
+codex --disable hooks -c 'notify=["<logger>"]' '<prompt>'
+```
+
+Codex ran the program once per completed turn with one JSON argument such as `{"type":"agent-turn-complete","thread-id":"01a1c225-a45a-...","turn-id":"01a1c225-a479-...","cwd":"...","client":"codex-tui","input-messages":["<launch brief>","mid-turn steer one"],"last-assistant-message":"fixture complete"}`.
+Thread and turn ids are UUIDv7, so a turn id carries its start time in milliseconds.
+Codex's automatic title generator ran as a separate thread and fired its own payload while the worker's turn was still running, which is why the marker binds the thread whose first input is the launch brief.
+A steer typed into a running turn was folded into that turn, under the same turn id, and listed in its `input-messages`.
+An Escape interrupt produced no payload.
+
+Refresh command, which spends no model tokens:
+
+```sh
+tests/fm-codex-turn-end-live-e2e.test.sh
+```
+
+Observed result on 2026-11-09:
+
+```
+ok - codex-cli 0.167.0: the launch-brief turn binds its thread and reads idle codex-notify
+ok - codex-cli 0.167.0: input clears the marker and the turn it starts sets it again, title threads ignored
+ok - codex-cli 0.167.0: a steer absorbed into a running turn still lets that turn's end set the marker
+ok - codex-cli 0.167.0: an interrupted turn leaves the marker cleared
+```
 
 Deterministic entry points:
 

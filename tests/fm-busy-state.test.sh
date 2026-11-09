@@ -448,9 +448,181 @@ test_codex_unverified_gate() {
   "$EV" apply "$state" t1 busy --gen "$gen" --source codex-hook --event user-prompt-submit
   out=$(fm_busy_classify tmux w1 codex t1 "$state")
   [ "$out" = "unknown codex-unverified" ] || fail "unverified codex must classify unknown, got '$out'"
-  [ -z "$(fm_busy_sources_for_harness codex)" ] \
-    || fail "codex must trust no semantic source until one is verified"
+  case " $(fm_busy_sources_for_harness codex) " in
+    *' codex-hook '* | *' codex-appserver '*) fail "codex must not trust an unverified semantic source" ;;
+  esac
   pass "codex classifies unknown until a semantic source passes its verification gate"
+}
+
+# --- Codex turn-end marker ------------------------------------------------------
+
+# codex_payload <thread-tag> <thread-ms> <turn-ms> <messages-json>: an
+# agent-turn-complete payload shaped like codex-cli 0.167.0's, with UUIDv7
+# thread and turn ids carrying the given millisecond timestamps.
+codex_payload() {
+  python3 -I - "$@" <<'PYC'
+import json, sys
+def u7(ms, tag):
+    h = format(int(ms), "012x")
+    return f"{h[:8]}-{h[8:12]}-7{tag}{tag}{tag}-8{tag}{tag}{tag}-{tag * 12}"
+tag, thread_ms, turn_ms, messages = sys.argv[1:5]
+print(json.dumps({"type": "agent-turn-complete", "thread-id": u7(thread_ms, tag),
+                  "turn-id": u7(turn_ms, "f"), "client": "codex-tui",
+                  "input-messages": json.loads(messages), "last-assistant-message": "ok"}))
+PYC
+}
+
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time() * 1000'; }
+
+codex_brief_messages() {
+  printf 'Do the task.\n' | "$ROOT/bin/fm-operational-input.sh" encode launch-brief | jq -Rs '[.]'
+}
+
+# codex_arm <state>: arm exactly as fm-spawn does for a codex crewmate.
+codex_arm() {
+  "$EV" arm "$1" t1 --state unknown --source fm-spawn --event launch-brief
+}
+
+codex_notify() {  # <state> <gen> <payload>
+  "$ROOT/bin/fm-codex-notify.sh" "$1" t1 "$2" "$3"
+}
+
+test_codex_marker_binds_the_launch_brief_thread_only() {
+  local state gen out t0 brief
+  state=$(new_state_dir codex-bind)
+  gen=$(codex_arm "$state")
+  t0=$(now_ms)
+  brief=$(codex_brief_messages)
+  out=$(fm_busy_classify tmux w1 codex t1 "$state")
+  [ "$out" = "unknown codex-unverified" ] || fail "an armed codex task must start unknown, got '$out'"
+  # Codex's auto-title side thread completes first and must neither bind nor
+  # read idle, while it still rings the turn-end notification.
+  codex_notify "$state" "$gen" "$(codex_payload a "$((t0 + 5))" "$((t0 + 6))" '["Generate a concise title"]')"
+  [ -e "$state/t1.turn-ended" ] || fail "every payload must still touch the turn-ended notification"
+  [ ! -e "$state/t1.codex-thread" ] || fail "a side thread without the launch brief bound the marker"
+  out=$(fm_busy_classify tmux w1 codex t1 "$state")
+  [ "$out" = "unknown codex-unverified" ] || fail "a side thread's turn end read idle: '$out'"
+  codex_notify "$state" "$gen" "$(codex_payload b "$t0" "$((t0 + 10))" "$brief")"
+  out=$(fm_busy_classify tmux w1 codex t1 "$state")
+  [ "$out" = "idle codex-notify" ] || fail "the launch-brief turn end must read idle codex-notify, got '$out'"
+  "$EV" apply "$state" t1 unknown --gen "$gen" --source fm-input --event input
+  codex_notify "$state" "$gen" "$(codex_payload a "$((t0 + 5))" "$(($(now_ms) + 50))" '["x"]')"
+  out=$(fm_busy_classify tmux w1 codex t1 "$state")
+  [ "$out" = "unknown codex-unverified" ] || fail "an unbound thread read idle after binding: '$out'"
+  out=$(fm_busy_classify tmux w1 codex t1 "$state" '• Working (6s • esc to interrupt)')
+  [ "$out" = "unknown codex-unverified" ] || fail "codex must never classify from footer text, got '$out'"
+  pass "the codex marker binds the launch-brief thread and ignores every other thread"
+}
+
+test_codex_marker_cleared_by_input_until_a_later_turn() {
+  local state gen out t0 brief tok late
+  state=$(new_state_dir codex-input)
+  gen=$(codex_arm "$state")
+  t0=$(now_ms)
+  brief=$(codex_brief_messages)
+  codex_notify "$state" "$gen" "$(codex_payload b "$t0" "$((t0 + 1))" "$brief")"
+  [ "$(fm_busy_classify tmux w1 codex t1 "$state")" = "idle codex-notify" ] || fail "setup: marker not set"
+  tok=$(fm_busy_input_begin "$state" t1 codex key) || fail "input begin failed"
+  [ -n "$tok" ] || fail "input begin printed no token"
+  out=$(fm_busy_classify tmux w1 codex t1 "$state")
+  [ "$out" = "unknown codex-unverified" ] || fail "input must clear the idle marker, got '$out'"
+  fm_busy_input_end "$state" t1 codex "$tok"
+  # A late payload for a turn that began before the input stays refused.
+  late=$(codex_payload b "$t0" "$((tok - 1))" '["earlier"]')
+  codex_notify "$state" "$gen" "$late"
+  out=$(fm_busy_classify tmux w1 codex t1 "$state")
+  [ "$out" = "unknown codex-unverified" ] || fail "a turn that began before the last input read idle: '$out'"
+  codex_notify "$state" "$gen" "$(codex_payload b "$t0" "$((tok + 1))" '["after"]')"
+  out=$(fm_busy_classify tmux w1 codex t1 "$state")
+  [ "$out" = "idle codex-notify" ] || fail "a turn begun after the input must set the marker, got '$out'"
+  pass "input clears the codex marker, and only a turn begun after it sets it again"
+}
+
+test_codex_marker_accepts_an_absorbed_steer_only_after_its_delay() {
+  local state gen out t0 brief tok payload
+  state=$(new_state_dir codex-absorb)
+  gen=$(codex_arm "$state")
+  t0=$(now_ms)
+  brief=$(codex_brief_messages)
+  # The steer lands mid-turn, so Codex folds it into the running turn.
+  tok=$(fm_busy_input_begin "$state" t1 codex text ': Firstmate instruction waiting') || fail "input begin failed"
+  payload=$(codex_payload b "$t0" "$((t0 - 1))" "$(jq -n --argjson b "$brief" '$b + [": Firstmate instruction waiting"]')")
+  codex_notify "$state" "$gen" "$payload"
+  [ "$(fm_busy_classify tmux w1 codex t1 "$state")" = "unknown codex-unverified" ] \
+    || fail "an absorbed steer whose delivery never finished must not read idle"
+  fm_busy_input_end "$state" t1 codex "$tok"
+  FM_BUSY_CODEX_ABSORB_MS=600000 codex_notify "$state" "$gen" "$payload"
+  [ "$(fm_busy_classify tmux w1 codex t1 "$state")" = "unknown codex-unverified" ] \
+    || fail "a payload arriving inside the absorb delay must not read idle"
+  FM_BUSY_CODEX_ABSORB_MS=0 codex_notify "$state" "$gen" \
+    "$(codex_payload b "$t0" "$((t0 - 1))" "$brief")"
+  [ "$(fm_busy_classify tmux w1 codex t1 "$state")" = "unknown codex-unverified" ] \
+    || fail "a turn that did not absorb the last input must not read idle"
+  FM_BUSY_CODEX_ABSORB_MS=0 codex_notify "$state" "$gen" "$payload"
+  out=$(fm_busy_classify tmux w1 codex t1 "$state")
+  [ "$out" = "idle codex-notify" ] || fail "a finished turn that absorbed the last steer must read idle, got '$out'"
+  pass "a steer absorbed into the running turn counts only once delivered, matched, and past its delay"
+}
+
+test_codex_marker_is_generation_bound() {
+  local state gen old out t0 brief
+  state=$(new_state_dir codex-gen)
+  old=$(codex_arm "$state")
+  t0=$(now_ms)
+  brief=$(codex_brief_messages)
+  codex_notify "$state" "$old" "$(codex_payload b "$t0" "$((t0 + 1))" "$brief")"
+  fm_busy_input_begin "$state" t1 codex key >/dev/null || fail "input begin failed"
+  gen=$(codex_arm "$state")
+  [ ! -e "$state/t1.codex-thread" ] && [ ! -e "$state/t1.busy-input" ] \
+    || fail "re-arming must drop the previous incarnation's thread binding and input stamp"
+  codex_notify "$state" "$old" "$(codex_payload b "$t0" "$(($(now_ms) + 5))" "$brief")"
+  out=$(fm_busy_classify tmux w1 codex t1 "$state")
+  [ "$out" = "unknown codex-unverified" ] || fail "a superseded incarnation's payload read idle: '$out'"
+  "$EV" retire "$state" t1 --gen "$gen" || fail "retire failed"
+  [ ! -e "$state/t1.busy-gen" ] && [ ! -e "$state/t1.codex-thread" ] || fail "retire left codex sidecars"
+  pass "the codex marker, its binding, and its input stamp belong to one incarnation"
+}
+
+test_codex_marker_absent_or_unrecognised_stays_unknown() {
+  local state gen out t0
+  state=$(new_state_dir codex-absent)
+  out=$(fm_busy_classify tmux w1 codex t1 "$state")
+  [ "$out" = "unknown codex-unverified" ] || fail "an unarmed codex task must stay unknown, got '$out'"
+  gen=$(codex_arm "$state")
+  "$EV" apply "$state" t1 idle --gen "$gen" --source fm-recovery --event reset
+  out=$(fm_busy_classify tmux w1 codex t1 "$state")
+  [ "$out" = "unknown codex-unverified" ] || fail "only a codex-notify idle may speak for codex, got '$out'"
+  t0=$(now_ms)
+  for payload in 'not json' '{"type":"agent-turn-complete"}' \
+    '{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"1","input-messages":[]}' \
+    "$(codex_payload b "$t0" "$((t0 + 1))" "$(codex_brief_messages)" | jq -c '.type = "other"')"; do
+    if printf '%s' "$payload" | "$EV" codex-turn-end "$state" t1 --gen "$gen" 2>/dev/null; then
+      fail "an unrecognised payload was accepted: $payload"
+    fi
+  done
+  out=$(fm_busy_classify tmux w1 codex t1 "$state")
+  [ "$out" = "unknown codex-unverified" ] || fail "an unrecognised payload changed codex state: '$out'"
+  [ -z "$(fm_busy_input_begin "$state" t1 claude text hi)" ] || fail "input stamps must be codex-only"
+  [ -z "$(fm_busy_input_begin "$TMP_ROOT/none" t1 codex key)" ] || fail "an unarmed task must record no input"
+  pass "with no accepted marker codex keeps the unknown codex-unverified fallback"
+}
+
+test_codex_native_busy_overrides_the_marker() {
+  local state gen out t0
+  state=$(new_state_dir codex-native)
+  gen=$(codex_arm "$state")
+  t0=$(now_ms)
+  codex_notify "$state" "$gen" "$(codex_payload b "$t0" "$((t0 + 1))" "$(codex_brief_messages)")"
+  # shellcheck disable=SC2329 # invoked indirectly through fm_busy_classify
+  fm_backend_busy_state() { printf '%s' "$FAKE_NATIVE"; }
+  FAKE_NATIVE=busy
+  out=$(fm_busy_classify herdr s:p codex t1 "$state")
+  [ "$out" = "busy herdr-native" ] || fail "native busy must outrank the codex marker, got '$out'"
+  FAKE_NATIVE=unknown
+  out=$(fm_busy_classify herdr s:p codex t1 "$state")
+  [ "$out" = "idle codex-notify" ] || fail "an unknown native verdict must leave the marker, got '$out'"
+  unset -f fm_backend_busy_state
+  pass "a native backend busy verdict outranks the codex marker"
 }
 
 test_kimi_unverified_gate() {
@@ -739,6 +911,12 @@ test_launch_prompt_never_reclassifies_an_advanced_record
 test_launch_prompt_requires_a_captured_tail
 test_grok_regex_isolated
 test_codex_unverified_gate
+test_codex_marker_binds_the_launch_brief_thread_only
+test_codex_marker_cleared_by_input_until_a_later_turn
+test_codex_marker_accepts_an_absorbed_steer_only_after_its_delay
+test_codex_marker_is_generation_bound
+test_codex_marker_absent_or_unrecognised_stays_unknown
+test_codex_native_busy_overrides_the_marker
 test_kimi_unverified_gate
 test_pi_stream_version_floor_accepts_verified_rejects_unverified
 test_cursor_ignores_rendered_and_native_signals
