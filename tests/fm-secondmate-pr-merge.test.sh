@@ -570,7 +570,73 @@ test_red_checks_disarm_then_a_new_head_rearms() {
   assert_grep "could not be armed under the standing grant: the head of $FJ_URL is now $new, not the presented $head" \
     "$case_dir/auto.out" "grant-stale-report: a stale reported head was not refused"
   assert_absent "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-stale-report: a stale report was armed"
+  assert_grep "outcome=arm-refused" "$case_dir/home/state/secondmate-prs/auto/$RID.seen" \
+    "grant-stale-report: a genuine refusal was not marked seen"
+  run_auto "$case_dir"
+  [ ! -s "$case_dir/auto.out" ] || fail "grant-stale-report: a genuine refusal was retried: $(cat "$case_dir/auto.out")"
   pass "red checks disarm a granted pull request and the mate's report of a new head re-arms it"
+}
+
+# Point the forge's git URL at a repository that does not exist, or back.
+break_forge_git() {  # <case-dir>
+  printf '[url "file://%s/missing.git"]\n\tinsteadOf = https://%s/%s/%s.git\n' \
+    "$1" "$FJ_HOST" "$FJ_OWNER" "$FJ_REPO" > "$1/gitconfig"
+}
+mend_forge_git() {  # <case-dir>
+  printf '[url "file://%s/origin.git"]\n\tinsteadOf = https://%s/%s/%s.git\n' \
+    "$1" "$FJ_HOST" "$FJ_OWNER" "$FJ_REPO" > "$1/gitconfig"
+}
+
+test_transient_fetch_failure_is_retried_on_the_next_sweep() {
+  local case_dir head retry seen
+  case_dir=$(make_case grant-transient)
+  head=$(cat "$case_dir/head")
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  report_done "$case_dir" "$head"
+  retry="$case_dir/home/state/secondmate-prs/auto/$RID.retry"
+  seen="$case_dir/home/state/secondmate-prs/auto/$RID.seen"
+  break_forge_git "$case_dir"
+  run_auto "$case_dir"
+  [ ! -s "$case_dir/auto.out" ] || fail "grant-transient: one failed fetch was reported: $(cat "$case_dir/auto.out")"
+  assert_absent "$seen" "grant-transient: a failed fetch marked the done line seen"
+  assert_absent "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-transient: armed without the content guard's head"
+  run_auto "$case_dir"
+  assert_grep "second mate $MATE PR $FJ_URL could not be armed under the standing grant on 2 sweeps in a row and is retried on every sweep: could not fetch the head of $FJ_URL" \
+    "$case_dir/auto.out" "grant-transient: a persistent fetch failure was not reported once"
+  run_auto "$case_dir"
+  [ ! -s "$case_dir/auto.out" ] || fail "grant-transient: the same failure was reported again: $(cat "$case_dir/auto.out")"
+  assert_absent "$seen" "grant-transient: a persistent fetch failure marked the done line seen"
+  mend_forge_git "$case_dir"
+  run_auto "$case_dir"
+  [ ! -s "$case_dir/auto.out" ] || fail "grant-transient: the recovered arm was not silent: $(cat "$case_dir/auto.out")"
+  assert_grep "pr_head=$head" "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-transient: the next sweep did not arm"
+  assert_grep "outcome=armed" "$seen" "grant-transient: the armed line was not marked seen"
+  assert_absent "$retry" "grant-transient: the retry count outlived the arm"
+
+  # A first fetch that fails and a second that succeeds arms in one sweep.
+  case_dir=$(make_case grant-flaky-fetch)
+  head=$(cat "$case_dir/head")
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  report_done "$case_dir" "$head"
+  cat > "$case_dir/fakebin/git" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" fetch "*refs/pull/*)
+    if [ ! -e "$case_dir/fetch-failed-once" ]; then
+      : > "$case_dir/fetch-failed-once"
+      echo "fatal: unable to access 'https://$FJ_HOST/': transient" >&2
+      exit 128
+    fi
+    ;;
+esac
+exec $(command -v git) "\$@"
+SH
+  chmod +x "$case_dir/fakebin/git"
+  run_auto "$case_dir"
+  assert_present "$case_dir/fetch-failed-once" "grant-flaky-fetch: the first fetch was not failed"
+  [ ! -s "$case_dir/auto.out" ] || fail "grant-flaky-fetch: a retried fetch was reported: $(cat "$case_dir/auto.out")"
+  assert_grep "pr_head=$head" "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-flaky-fetch: arm did not retry the fetch"
+  pass "a transient fetch failure leaves the report for the next sweep, is reported once if it persists, and then arms"
 }
 
 test_content_guard_still_refuses_under_a_grant() {
@@ -648,6 +714,7 @@ fm_test_run \
   test_no_arm_without_a_matching_grant \
   test_dependency_change_escalates_instead_of_arming \
   test_red_checks_disarm_then_a_new_head_rearms \
+  test_transient_fetch_failure_is_retried_on_the_next_sweep \
   test_content_guard_still_refuses_under_a_grant \
   test_withdrawn_grant_stops_an_armed_merge \
   test_watcher_sweep_merges_a_granted_pull_request \

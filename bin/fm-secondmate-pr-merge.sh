@@ -33,7 +33,12 @@
 # registered for the host. The head bound is the live head at arm time, and
 # --head <sha>, the head that was presented, refuses the arm when the live head
 # differs. arm also fetches that head into a private bare repository for the
-# content guard, and refuses when it cannot. The record id it prints is
+# content guard, trying the fetch a second time before it refuses, and the
+# refusal names git's own error. A refusal that a later attempt may clear - the
+# pull request or its head unreadable at the forge, the content guard's head
+# fetch failing or returning another commit, or the dependency diff not
+# computable - exits 5; every other refusal exits 1 or 2, or 4 below. The
+# record id it prints is
 # <secondmate-id>-pr-<repo>-<number>, with characters outside [A-Za-z0-9_-]
 # replaced by "_". arm then registers a custom watcher check, state/<record-id>.check.sh,
 # that runs "poll" on every check sweep, so the merge happens once checks are
@@ -72,8 +77,13 @@
 # waits for a later sweep; a merged or closed one is noted silently; otherwise
 # it runs arm --grant, with --head <sha> when the line carries "<url> head
 # <sha>". An escalation or a refused arm prints one line naming the pull
-# request. A later done line for the same pull request, such as the mate's
-# report of a new head after red checks or a moved head, is acted on again;
+# request. An arm that exits 5, like an unreadable pull request, leaves the line
+# for the next sweep; after two sweeps in a row fail that way for the same line
+# the sweep prints one line naming the pull request and the last error, and
+# stays silent on that line after it while it keeps retrying (the count is
+# auto/<record-id>.retry). A later done line for the same pull request, such as
+# the mate's report of a new head after red checks or a moved head, is acted on
+# again;
 # the same line never is. What the sweep acted on is kept in
 # state/secondmate-prs/auto/<record-id>.seen.
 # A grant-armed record also closes, unmerged, when its grant has been removed.
@@ -116,6 +126,7 @@
 #                       bin/fm-pr-check.sh and bin/fm-pr-merge.sh write there
 #   closed/<record-id>-<epoch>/  a closed record, its meta carrying outcome=
 #   auto/<record-id>.seen        the done line the auto sweep last acted on
+#   auto/<record-id>.retry       that line's consecutive retryable failures
 set -eu
 
 usage() {
@@ -298,6 +309,28 @@ EOF
   printf '%s\n' "$found"
 }
 
+# Fetch the pull request's head into <cache> for the content guard, a second
+# time after a pause when the first try fails or returns another commit. On
+# failure GUARD_FETCH_ERROR holds git's last error line, or the commit fetched.
+GUARD_FETCH_ERROR=
+guard_fetch_head() {  # <cache> <number> <rid> <want-head>
+  local cache=$1 number=$2 rid=$3 want=$4 try err fetched
+  GUARD_FETCH_ERROR=
+  for try in 1 2; do
+    [ "$try" = 1 ] || sleep 2
+    fetched=
+    if err=$(GIT_TERMINAL_PROMPT=0 git -C "$cache" fetch --no-tags --quiet origin \
+        "+refs/pull/$number/head:refs/fm-merge-guard/$rid/head" 2>&1 >/dev/null); then
+      fetched=$(git -C "$cache" rev-parse --verify --quiet "refs/fm-merge-guard/$rid/head^{commit}" 2>/dev/null || true)
+      [ "$fetched" != "$want" ] || return 0
+      err="the forge's refs/pull/$number/head is ${fetched:-unreadable}, not $want"
+    fi
+    # Keep the last line git printed, without any credentials in a URL.
+    GUARD_FETCH_ERROR=$(printf '%s\n' "$err" | sed -e 's#://[^/@[:space:]]*@#://#g' -e '/^[[:space:]]*$/d' | tail -1 | cut -c1-200)
+  done
+  return 1
+}
+
 LOCK_HELD=
 SWEEP_LOCK_HELD=
 release_lock() {
@@ -424,10 +457,10 @@ cmd_arm() {
     die "$rid is already armed for $(record_value "$meta" reported_pr); disarm it before arming again"
   fi
 
-  fm_pr_forgejo_read_record "$host" "$path" "$number" || die "could not read $url"
+  fm_pr_forgejo_read_record "$host" "$path" "$number" || die "could not read $url" 5
   [ "$FM_PR_RECORD_MERGED" = false ] && [ "$FM_PR_RECORD_STATE" = open ] \
     || die "$url is not an open, unmerged pull request (state=$FM_PR_RECORD_STATE, merged=$FM_PR_RECORD_MERGED)"
-  fm_pr_head_valid "$FM_PR_RECORD_HEAD" || die "could not read the head of $url"
+  fm_pr_head_valid "$FM_PR_RECORD_HEAD" || die "could not read the head of $url" 5
   if [ -n "$presented_head" ] && [ "$presented_head" != "$FM_PR_RECORD_HEAD" ]; then
     die "the head of $url is now $FM_PR_RECORD_HEAD, not the presented $presented_head; present the changed pull request to the captain again"
   fi
@@ -439,21 +472,16 @@ cmd_arm() {
   [ ! -e "$cache" ] || rm -rf -- "${RECORDS:?}/$rid.git"
   git init -q --bare "$cache"
   git -C "$cache" remote add origin "https://$host/$owner/$repo.git"
-  fetched=
-  if GIT_TERMINAL_PROMPT=0 git -C "$cache" fetch --no-tags --quiet origin \
-      "+refs/pull/$number/head:refs/fm-merge-guard/$rid/head" >/dev/null 2>&1; then
-    fetched=$(git -C "$cache" rev-parse --verify --quiet "refs/fm-merge-guard/$rid/head^{commit}" 2>/dev/null || true)
-  fi
-  if [ "$fetched" != "$FM_PR_RECORD_HEAD" ]; then
+  if ! guard_fetch_head "$cache" "$number" "$rid" "$FM_PR_RECORD_HEAD"; then
     rm -rf -- "${RECORDS:?}/$rid.git"
-    die "could not fetch the head of $url from https://$host/$owner/$repo.git for the content guard"
+    die "could not fetch the head of $url from https://$host/$owner/$repo.git for the content guard: ${GUARD_FETCH_ERROR:-git reported nothing}" 5
   fi
 
   # A standing grant never covers a dependency change; the captain keeps those.
   if [ "$use_grant" = true ]; then
     if ! deps=$(pr_dependency_files "$cache" "$login" "$path" "$number" "$FM_PR_RECORD_HEAD"); then
       rm -rf -- "${RECORDS:?}/$rid.git"
-      die "could not compute the diff of $url against its base branch to check for dependency changes; nothing is armed"
+      die "could not compute the diff of $url against its base branch to check for dependency changes; nothing is armed" 5
     fi
     if [ -n "$deps" ]; then
       rm -rf -- "${RECORDS:?}/$rid.git"
@@ -679,7 +707,30 @@ mark_seen() {  # <record-id> <key> <outcome>
   tmp=$(mktemp "$AUTO/.seen.XXXXXX") || return 1
   printf 'key=%s\noutcome=%s\nat=%s\n' "$2" "$3" "$(date +%s)" > "$tmp"
   chmod 0600 "$tmp"
-  mv -f -- "$tmp" "$AUTO/$1.seen"
+  mv -f -- "$tmp" "$AUTO/$1.seen" || return 1
+  rm -f -- "$AUTO/$1.retry"
+}
+
+# Count one retryable failure of the done line <key>, which stays unseen so the
+# next sweep tries it again. The second failure in a row prints one line; later
+# ones for the same line stay silent.
+note_retryable() {  # <record-id> <key> <mate> <url> <error>
+  local rid=$1 key=$2 file="$AUTO/$1.retry" failures=0 reported=0 tmp
+  if [ "$(record_value "$file" key)" = "$key" ]; then
+    failures=$(record_value "$file" failures)
+    reported=$(record_value "$file" reported)
+    case "$failures" in '' | *[!0-9]*) failures=0 ;; esac
+  fi
+  failures=$((failures + 1))
+  if [ "$failures" -ge 2 ] && [ "$reported" != 1 ]; then
+    printf 'second mate %s PR %s could not be armed under the standing grant on %s sweeps in a row and is retried on every sweep: %s\n' \
+      "$3" "$4" "$failures" "$(one_line "$5")"
+    reported=1
+  fi
+  tmp=$(mktemp "$AUTO/.retry.XXXXXX") || return 1
+  printf 'key=%s\nfailures=%s\nreported=%s\nat=%s\n' "$key" "$failures" "$reported" "$(date +%s)" > "$tmp"
+  chmod 0600 "$tmp"
+  mv -f -- "$tmp" "$file"
 }
 
 # Close a grant-armed record that an interrupted arm left without its watcher
@@ -743,7 +794,10 @@ cmd_auto() {
       fi
       # An unreadable pull request is retried on a later sweep; a merged or
       # closed one needs nothing.
-      fm_pr_forgejo_read_record "$FM_PR_HOST" "$FM_PR_PATH" "$FM_PR_NUMBER" < /dev/null || continue
+      if ! fm_pr_forgejo_read_record "$FM_PR_HOST" "$FM_PR_PATH" "$FM_PR_NUMBER" < /dev/null; then
+        note_retryable "$rid" "$key" "$mate" "$url" "could not read $url" || true
+        continue
+      fi
       if [ "$FM_PR_RECORD_MERGED" != false ] || [ "$FM_PR_RECORD_STATE" != open ]; then
         mark_seen "$rid" "$key" not-open || true
         continue
@@ -759,6 +813,7 @@ cmd_auto() {
           mark_seen "$rid" "$key" dependency-change || true
           printf 'second mate %s PR %s is not merged automatically: %s\n' "$mate" "$url" "${out:-it changes dependency files}"
           ;;
+        5) note_retryable "$rid" "$key" "$mate" "$url" "${out:-arm exited $rc}" || true ;;
         *)
           mark_seen "$rid" "$key" arm-refused || true
           printf 'second mate %s PR %s could not be armed under the standing grant: %s\n' "$mate" "$url" "${out:-arm exited $rc}"
