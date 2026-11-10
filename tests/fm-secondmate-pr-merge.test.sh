@@ -93,11 +93,18 @@ write_status_json() {  # <file> <state|none>
 }
 
 # A commit on top of origin's main, published as the pull request's head ref.
-push_pr_head() {  # <case-dir> <label> -> sha
-  local case_dir=$1 label=$2 sha
-  printf '%s\n' "$label" > "$case_dir/src/pr-$label.txt"
+# [<extra-file>] is also added, and [<deleted-file>] removed, in that commit.
+push_pr_head() {  # <case-dir> <label> [<extra-file>] [<deleted-file>] -> sha
+  local case_dir=$1 label=$2 extra=${3:-} deleted=${4:-} sha
   git -C "$case_dir/src" checkout -q -B "pr-$label" main
+  printf '%s\n' "$label" > "$case_dir/src/pr-$label.txt"
   git -C "$case_dir/src" add "pr-$label.txt"
+  if [ -n "$extra" ]; then
+    mkdir -p "$(dirname "$case_dir/src/$extra")"
+    printf '%s\n' "$label" > "$case_dir/src/$extra"
+    git -C "$case_dir/src" add "$extra"
+  fi
+  [ -z "$deleted" ] || git -C "$case_dir/src" rm -q "$deleted"
   git -C "$case_dir/src" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm "pr $label"
   sha=$(git -C "$case_dir/src" rev-parse HEAD)
   git -C "$case_dir/src" push -q -f origin "$sha:refs/pull/9/head"
@@ -385,7 +392,265 @@ test_pr_check_still_refuses_the_secondmate_record() {
   pass "fm-pr-check.sh still refuses to bind a second mate's PR to the mate and points at the merge path"
 }
 
+FJ_REPO_URL="https://$FJ_HOST/$FJ_OWNER/$FJ_REPO"
+GRANT_WORDS="merge agent-dev's PRs automatically once green"
+REPORTS=0
+
+write_grants() {  # <case-dir> <grant-line>...
+  local case_dir=$1 file
+  shift
+  file="$case_dir/home/config/secondmate-pr-auto-merge"
+  printf '%s\n' '# standing second mate PR merge grants' "$@" > "$file"
+  chmod 0600 "$file"
+}
+
+# The mate reports the pull request done at <head> on its routed status channel.
+report_done() {  # <case-dir> <head>
+  REPORTS=$((REPORTS + 1))
+  printf 'done [key=child-pr-%s] [at=%s]: child PR ready: %s head %s mode=direct-PR yolo=off\n' \
+    "$REPORTS" "$((1794224938 + REPORTS))" "$FJ_URL" "$2" >> "$1/home/state/$MATE.status"
+}
+
+# Publish a new pull request head and make the forge report it.
+move_head() {  # <case-dir> <label> [<extra-file>] [<deleted-file>] -> sha
+  local case_dir=$1 head
+  head=$(push_pr_head "$@")
+  write_pr_json "$case_dir/pr.json" "$head"
+  write_pr_json "$case_dir/pr-post.json" "$head" closed false true
+  printf '%s\n' "$head" > "$case_dir/tea-expected-head"
+  printf '%s\n' "$head"
+}
+
+run_auto() {  # <case-dir>
+  run_sm "$1" auto > "$1/auto.out" 2> "$1/auto.err" \
+    || fail "auto: the sweep exited nonzero: $(cat "$1/auto.err")"
+}
+
+test_grant_arms_automatically_and_merges_when_green() {
+  local case_dir head out meta
+  case_dir=$(make_case grant-merges)
+  head=$(cat "$case_dir/head")
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  report_done "$case_dir" "$head"
+  write_status_json "$case_dir/tea-status.json" pending
+  run_auto "$case_dir"
+  [ ! -s "$case_dir/auto.out" ] || fail "grant-merges: arming under the grant should be silent, got: $(cat "$case_dir/auto.out")"
+  meta="$case_dir/home/state/secondmate-prs/$RID.meta"
+  assert_present "$meta" "grant-merges: the sweep did not arm the reported pull request"
+  assert_grep "authority=grant" "$meta" "grant-merges: the record does not name the grant as its authority"
+  assert_grep "instruction=$GRANT_WORDS" "$meta" "grant-merges: the grant's words were not recorded as the instruction"
+  assert_grep "grant_repo=$FJ_REPO_URL" "$meta" "grant-merges: the granted repository was not recorded"
+  assert_present "$case_dir/home/state/$RID.check-trust" "grant-merges: the watcher check was not registered"
+
+  out=$(run_check "$case_dir" 2>/dev/null)
+  [ -z "$out" ] || fail "grant-merges: a pending poll should be silent, got: $out"
+  merge_attempted "$case_dir" && fail "grant-merges: merged while checks were pending"
+
+  write_status_json "$case_dir/tea-status.json" success
+  out=$(run_check "$case_dir" 2>/dev/null)
+  assert_contains "$out" "second mate $MATE PR $FJ_URL merged automatically at head $head under the captain's standing grant for $FJ_REPO_URL" \
+    "grant-merges: the automatic merge was not reported with the full URL"
+  assert_grep "/repos/{owner}/{repo}/pulls/9/merge -f Do=merge -f head_commit_id=$head" "$case_dir/tea.log" \
+    "grant-merges: the merge was not bound to the reported head"
+  assert_grep "check: merge landed: $RID $FJ_URL" "$case_dir/home/state/.wake-queue" \
+    "grant-merges: the merge outcome did not reach the home's wake queue"
+
+  run_auto "$case_dir"
+  [ ! -s "$case_dir/auto.out" ] || fail "grant-merges: a later sweep reported again: $(cat "$case_dir/auto.out")"
+  assert_absent "$meta" "grant-merges: a later sweep armed the merged pull request again"
+  pass "a standing grant arms a reported pull request without a per-PR word and merges it once green"
+}
+
+test_no_arm_without_a_matching_grant() {
+  local case_dir head rc
+  # No grant file at all.
+  case_dir=$(make_case grant-absent)
+  head=$(cat "$case_dir/head")
+  report_done "$case_dir" "$head"
+  run_auto "$case_dir"
+  assert_absent "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-absent: armed without any grant"
+
+  # A grant for another repository, and one for another second mate.
+  case_dir=$(make_case grant-other)
+  head=$(cat "$case_dir/head")
+  fm_write_secondmate_meta "$case_dir/home/state/other-dev.meta" /home/agent/fm-other-dev
+  write_grants "$case_dir" \
+    "$MATE https://$FJ_HOST/$FJ_OWNER/other-repo $GRANT_WORDS" \
+    "other-dev $FJ_REPO_URL merge other-dev's PRs once green"
+  report_done "$case_dir" "$head"
+  run_auto "$case_dir"
+  [ ! -s "$case_dir/auto.out" ] || fail "grant-other: an ungranted report produced output: $(cat "$case_dir/auto.out")"
+  assert_absent "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-other: armed under a grant for another repository or mate"
+  rc=0
+  run_sm "$case_dir" arm "$MATE" "$FJ_URL" --grant > "$case_dir/arm.out" 2> "$case_dir/arm.err" || rc=$?
+  expect_code 1 "$rc" "grant-other: arm --grant with no grant naming this mate and repository"
+  assert_grep "no standing captain grant in config/secondmate-pr-auto-merge names second mate $MATE for $FJ_REPO_URL" \
+    "$case_dir/arm.err" "grant-other: the missing grant was not named"
+
+  # A grant file others could write grants nothing, and says so once.
+  case_dir=$(make_case grant-untrusted)
+  head=$(cat "$case_dir/head")
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  chmod 0666 "$case_dir/home/config/secondmate-pr-auto-merge"
+  report_done "$case_dir" "$head"
+  run_auto "$case_dir"
+  assert_grep "grants nothing: it must be a regular, single-link file only its owner can write" "$case_dir/auto.out" \
+    "grant-untrusted: the untrusted grant file was not reported"
+  assert_absent "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-untrusted: armed under an untrusted grant file"
+  run_auto "$case_dir"
+  [ ! -s "$case_dir/auto.out" ] || fail "grant-untrusted: the untrusted file was reported again unchanged"
+  merge_attempted "$case_dir" && fail "grant: a merge was attempted without a matching grant"
+  pass "nothing arms without a trusted grant naming that second mate and repository"
+}
+
+test_dependency_change_escalates_instead_of_arming() {
+  local case_dir head out
+  case_dir=$(make_case grant-deps)
+  head=$(move_head "$case_dir" deps go.mod)
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  report_done "$case_dir" "$head"
+  run_auto "$case_dir"
+  out=$(cat "$case_dir/auto.out")
+  assert_contains "$out" "second mate $MATE PR $FJ_URL is not merged automatically: $FJ_URL changes dependency files (go.mod)" \
+    "grant-deps: the dependency change was not escalated with the PR and its files"
+  assert_contains "$out" "waits for the captain's per-PR word" "grant-deps: the escalation did not say it waits for the captain"
+  assert_absent "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-deps: a dependency change was armed"
+  assert_absent "$case_dir/home/state/$RID.check.sh" "grant-deps: a watcher check was armed"
+  run_auto "$case_dir"
+  [ ! -s "$case_dir/auto.out" ] || fail "grant-deps: the same report was escalated twice"
+
+  # Lockfiles anywhere in the tree count too.
+  case_dir=$(make_case grant-deps-nested)
+  head=$(move_head "$case_dir" lock web/package-lock.json)
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  report_done "$case_dir" "$head"
+  run_auto "$case_dir"
+  assert_grep "changes dependency files (web/package-lock.json)" "$case_dir/auto.out" \
+    "grant-deps-nested: a nested lockfile was not escalated"
+
+  # The captain's per-PR word still arms it through the unchanged path.
+  arm "$case_dir" || fail "grant-deps: the per-PR instruction path refused a dependency change: $(cat "$case_dir/arm.err")"
+  assert_grep "authority=instruction" "$case_dir/home/state/secondmate-prs/$RID.meta" \
+    "grant-deps: the per-PR arm did not record the captain's instruction as its authority"
+  merge_attempted "$case_dir" && fail "grant-deps: a merge was attempted by the sweep"
+  pass "a dependency change is escalated to the captain instead of armed under the grant"
+}
+
+test_red_checks_disarm_then_a_new_head_rearms() {
+  local case_dir head new out
+  case_dir=$(make_case grant-rearm)
+  head=$(cat "$case_dir/head")
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  report_done "$case_dir" "$head"
+  run_auto "$case_dir"
+  write_status_json "$case_dir/tea-status.json" failure
+  out=$(run_check "$case_dir" 2>/dev/null)
+  assert_contains "$out" "merge refused and disarmed, its checks are \"failure\" at head $head" \
+    "grant-rearm: the red checks were not reported"
+  assert_contains "$out" "re-arms under the standing grant when the second mate reports done again" \
+    "grant-rearm: the red report did not say how it re-arms"
+  run_auto "$case_dir"
+  assert_absent "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-rearm: the same report re-armed a red head"
+
+  new=$(move_head "$case_dir" fixed)
+  report_done "$case_dir" "$new"
+  write_status_json "$case_dir/tea-status.json" success
+  run_auto "$case_dir"
+  assert_grep "pr_head=$new" "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-rearm: the new head was not armed"
+  out=$(run_check "$case_dir" 2>/dev/null)
+  assert_contains "$out" "merged automatically at head $new" "grant-rearm: the new head was not merged"
+
+  # A report naming a head that is no longer live is refused, not armed.
+  case_dir=$(make_case grant-stale-report)
+  head=$(cat "$case_dir/head")
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  new=$(move_head "$case_dir" later)
+  report_done "$case_dir" "$head"
+  run_auto "$case_dir"
+  assert_grep "could not be armed under the standing grant: the head of $FJ_URL is now $new, not the presented $head" \
+    "$case_dir/auto.out" "grant-stale-report: a stale reported head was not refused"
+  assert_absent "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-stale-report: a stale report was armed"
+  pass "red checks disarm a granted pull request and the mate's report of a new head re-arms it"
+}
+
+test_content_guard_still_refuses_under_a_grant() {
+  local case_dir head out meta
+  case_dir=$(make_case grant-guard)
+  mkdir -p "$case_dir/src/tests"
+  printf 'keep\n' > "$case_dir/src/tests/keep.test.sh"
+  git -C "$case_dir/src" add tests/keep.test.sh
+  git -C "$case_dir/src" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm 'add a test'
+  git -C "$case_dir/src" push -q origin main
+  head=$(move_head "$case_dir" drop-test "" tests/keep.test.sh)
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  report_done "$case_dir" "$head"
+  run_auto "$case_dir"
+  assert_present "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-guard: the sweep did not arm the pull request"
+  out=$(run_check "$case_dir" 2>/dev/null)
+  assert_contains "$out" "automatic merge refused and disarmed by the merge gate" "grant-guard: the guard refusal was not reported"
+  assert_contains "$out" "deleted-tests" "grant-guard: the content guard's finding was not relayed"
+  assert_contains "$out" "without the captain's per-PR word" "grant-guard: the refusal did not leave the call to the captain"
+  merge_attempted "$case_dir" && fail "grant-guard: merged past a content-guard finding"
+  meta=$(closed_meta "$case_dir")
+  assert_grep "outcome=merge-refused" "$meta" "grant-guard: the closed record does not say refused"
+  run_auto "$case_dir"
+  assert_absent "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-guard: the sweep re-armed past the refusal"
+  pass "the content guard still refuses an automatic merge and nothing overrides it"
+}
+
+test_withdrawn_grant_stops_an_armed_merge() {
+  local case_dir head out
+  case_dir=$(make_case grant-withdrawn)
+  head=$(cat "$case_dir/head")
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  report_done "$case_dir" "$head"
+  write_status_json "$case_dir/tea-status.json" pending
+  run_auto "$case_dir"
+  assert_present "$case_dir/home/state/secondmate-prs/$RID.meta" "grant-withdrawn: the sweep did not arm the pull request"
+  write_grants "$case_dir"
+  write_status_json "$case_dir/tea-status.json" success
+  out=$(run_check "$case_dir" 2>/dev/null)
+  assert_contains "$out" "the standing grant for $FJ_REPO_URL is gone, so the automatic merge is withdrawn and nothing was merged" \
+    "grant-withdrawn: the withdrawal was not reported"
+  merge_attempted "$case_dir" && fail "grant-withdrawn: merged after the grant was withdrawn"
+  pass "withdrawing a grant stops a merge armed under it"
+}
+
+# The watcher's check sweep runs the auto sweep while the grant file exists, so
+# a granted, green pull request merges in that same sweep with no turn at all.
+test_watcher_sweep_merges_a_granted_pull_request() {
+  local case_dir head rc stop
+  case_dir=$(make_case grant-watcher)
+  head=$(cat "$case_dir/head")
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  report_done "$case_dir" "$head"
+  stop="$case_dir/home/state/z-stop.check.sh"
+  printf '#!/usr/bin/env bash\nprintf "stop-cycle\\n"\n' > "$stop"
+  chmod 0700 "$stop"
+  FM_HOME="$case_dir/home" "$ROOT/bin/fm-check-register.sh" z-stop >/dev/null \
+    || fail "grant-watcher: could not register the stop check"
+  rc=0
+  FM_TEST_TEA_LOG="$case_dir/tea.log" GIT_CONFIG_GLOBAL="$case_dir/gitconfig" HOME="$case_dir/user-home" \
+    perl -MPOSIX=WNOHANG -MTime::HiRes=sleep -e 'my $left=60; my $pid=fork; die unless defined $pid; if (!$pid) { exec @ARGV } while (waitpid($pid, WNOHANG) == 0) { $left -= 0.05; if ($left <= 0) { kill "TERM", $pid; waitpid $pid, 0; exit 124 } sleep 0.05 } exit($? >> 8)' \
+    env -u FM_CHECK_TIMEOUT FM_HOME="$case_dir/home" FM_CHECK_INTERVAL=0 FM_POLL=0.02 FM_HEARTBEAT=999999 \
+      FM_SIGNAL_GRACE=0 PATH="$case_dir/fakebin:$PATH" "$ROOT/bin/fm-watch.sh" \
+    > "$case_dir/watch.out" 2> "$case_dir/watch.err" || rc=$?
+  [ "$rc" -eq 0 ] || fail "grant-watcher: the watcher failed ($rc): $(cat "$case_dir/watch.err")"
+  assert_grep "/repos/{owner}/{repo}/pulls/9/merge -f Do=merge -f head_commit_id=$head" "$case_dir/tea.log" \
+    "grant-watcher: the watcher sweep did not merge the granted pull request"
+  assert_grep "merged automatically at head $head" "$case_dir/home/state/.wake-queue" \
+    "grant-watcher: the automatic merge did not reach the wake queue"
+  pass "the watcher's check sweep arms and merges a granted pull request in one sweep"
+}
+
 fm_test_run \
+  test_grant_arms_automatically_and_merges_when_green \
+  test_no_arm_without_a_matching_grant \
+  test_dependency_change_escalates_instead_of_arming \
+  test_red_checks_disarm_then_a_new_head_rearms \
+  test_content_guard_still_refuses_under_a_grant \
+  test_withdrawn_grant_stops_an_armed_merge \
+  test_watcher_sweep_merges_a_granted_pull_request \
   test_arm_refuses_a_url_the_mate_did_not_report \
   test_no_merge_without_a_recorded_instruction \
   test_armed_check_waits_then_merges_when_green \

@@ -153,6 +153,11 @@
 #                          line reported a PR that the check sweep's
 #                          fm-pr-check.sh scan could not record; the line
 #                          names the task, the PR, and the refusal
+#   check: secondmate-pr-auto: <lines>
+#                          with config/secondmate-pr-auto-merge present, the
+#                          sweep could not arm a second mate PR its standing
+#                          grant covers, or found a dependency change it
+#                          leaves for the captain (bin/fm-secondmate-pr-merge.sh)
 #   check: rejected unauthenticated state checks: <paths>
 #                          unsafe state checks were refused without execution
 #   check: rejected unauthenticated PR poll retirement receipts: <paths>
@@ -4010,6 +4015,18 @@ while :; do
         fm_wake_append check pr-register "$pr_register_reason" || exit 1
       fi
     fi
+    # Arm each second mate PR a standing captain grant covers, so its merge
+    # check below runs in this same sweep (bin/fm-secondmate-pr-merge.sh owns
+    # the grant and the sweep).
+    secondmate_pr_auto_reason=
+    if [ -e "$CONFIG/secondmate-pr-auto-merge" ] || [ -L "$CONFIG/secondmate-pr-auto-merge" ]; then
+      FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
+        run_check_capture "$SCRIPT_DIR/fm-secondmate-pr-merge.sh" auto || exit 1
+      if [ -n "$FM_CHECK_RESULT" ]; then
+        secondmate_pr_auto_reason="check: secondmate-pr-auto: $FM_CHECK_RESULT"
+        fm_wake_append check secondmate-pr-auto "$secondmate_pr_auto_reason" || exit 1
+      fi
+    fi
     for c in "$STATE"/*.check.sh; do
       [ -e "$c" ] || continue
       is_pr_poll=0
@@ -4131,6 +4148,7 @@ EOF
     fi
     touch "$STATE/.last-check"
     [ -z "$pr_register_reason" ] || wake "$pr_register_reason"
+    [ -z "$secondmate_pr_auto_reason" ] || wake "$secondmate_pr_auto_reason"
     if [ -n "$contribution_check_output" ]; then
       wake "$contribution_check_output"
     fi

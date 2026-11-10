@@ -109,7 +109,7 @@ Each effective `FM_HOME` contains private operational directories.
 - Private secondmate config-reread generations with their retry and quarantine state.
 - Per-task steering-inbox records under `state/<id>.inbox/` (`bin/fm-task-inbox-lib.sh`).
 - Parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
-- Captain-instructed merge records for second mate pull requests under `state/secondmate-prs/` (`bin/fm-secondmate-pr-merge.sh`).
+- Captain-instructed and grant-armed merge records for second mate pull requests under `state/secondmate-prs/` (`bin/fm-secondmate-pr-merge.sh`).
 
 `config/` holds local gitignored operating choices, including explicit extension bindings under `config/extensions.d/`.
 
@@ -827,6 +827,19 @@ It skips persistent secondmate and scout records, a `pr=` that names another PR,
 A refused registration, such as a draft, prints one `check: pr-register:` wake for each task and PR, and later sweeps retry without a new wake, so a PR marked ready later is recorded.
 With the file absent, the check sweep does not run the scan, and `pr=` and the merge poll come only from a manual `bin/fm-pr-check.sh <id> <PR url>` run.
 The flag takes effect at the next check sweep, and is a home-local preference that is not inherited by secondmate homes.
+
+## Second mate PR auto-merge grants (config/secondmate-pr-auto-merge)
+
+The optional local, gitignored `config/secondmate-pr-auto-merge` file records the captain's standing grant to merge, once green, each Forgejo pull request one second mate reports for one repository, with no per-PR word.
+Only the captain grants one, and firstmate writes the file; a worker or a second mate never does.
+Each line is `<secondmate-id> <repository URL> <the captain's verbatim words>`, and blank lines and lines starting with `#` are ignored.
+The file grants nothing unless it is a regular, single-link file only its owner can write, and a line that does not parse grants nothing; both are reported once per change of the file.
+With the file present, the watcher's check sweep runs `bin/fm-secondmate-pr-merge.sh auto` before its other checks, which arms each granted pull request the mate's newest `done:` line reports, and arms it again after a later `done:` line, such as a report of a new head after red checks.
+The merge-time gates are unchanged: green checks at the reported head, an unchanged head, mergeability, and the content guard, whose findings are never overridden.
+A pull request that changes a dependency manifest, lockfile, or vendored tree is never armed under a grant and is reported for the captain's per-PR word instead.
+Removing a line withdraws the grant, including from pull requests already armed under it.
+The script's header owns the line format, the dependency file list, and every outcome.
+The file takes effect at the next check sweep, applies only in a main home, and is not inherited by secondmate homes.
 
 ## No-mistakes pipeline spend (config/pipeline-spend)
 

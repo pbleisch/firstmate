@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Merge a Forgejo pull request a registered second mate reported, on the
-# captain's explicit word, from the main home.
+# captain's explicit word or the captain's standing grant for its repository,
+# from the main home.
 #
 # A second mate's pull request belongs to a task in the mate's own home, so
 # bin/fm-pr-check.sh refuses to record it against the mate and the main home has
@@ -10,10 +11,13 @@
 # that script owns applies unchanged: open, not a draft, mergeable, a successful
 # combined status at the live head, the head bound to the content that was
 # presented, the content guard, the away-posture and captain-hold reads, a
-# head-bound merge call, and a recorded outcome. Nothing here merges on its own.
+# head-bound merge call, and a recorded outcome. Nothing here merges without a
+# recorded per-PR captain instruction or a standing captain grant.
 #
 # Usage:
 #   fm-secondmate-pr-merge.sh arm <secondmate-id> <pr-url> --instruction <words> [--head <sha>]
+#   fm-secondmate-pr-merge.sh arm <secondmate-id> <pr-url> --grant [--head <sha>]
+#   fm-secondmate-pr-merge.sh auto
 #   fm-secondmate-pr-merge.sh merge <record-id>
 #   fm-secondmate-pr-merge.sh poll <record-id>
 #   fm-secondmate-pr-merge.sh disarm <record-id> [--reason <text>]
@@ -33,8 +37,46 @@
 # <secondmate-id>-pr-<repo>-<number>, with characters outside [A-Za-z0-9_-]
 # replaced by "_". arm then registers a custom watcher check, state/<record-id>.check.sh,
 # that runs "poll" on every check sweep, so the merge happens once checks are
-# green without another turn. No standing authority is created: one record names
-# one pull request at one head, and closes for good after one outcome.
+# green without another turn. An instruction creates no standing authority: one
+# record names one pull request at one head, and closes for good after one
+# outcome.
+#
+# Standing grant. The captain may grant one second mate standing merge
+# authority for one Forgejo repository; firstmate writes the grant to the
+# captain-private config/secondmate-pr-auto-merge, and nothing else ever does.
+# One grant per line, blank lines and lines starting with # ignored:
+#   <secondmate-id> <repository-url> <the captain's verbatim words>
+# for example
+#   agent-dev https://git.example/owner/repo merge their PRs once green
+# The file must be a regular, single-link file that only its owner can write;
+# otherwise it grants nothing. A line that does not parse grants nothing and is
+# reported once per change of the file.
+# arm --grant arms under that grant instead of a per-PR instruction: the
+# record's instruction is the grant's words and its authority=grant, and every
+# other arming condition above still holds. It is refused when no grant names
+# the mate and the pull request's repository, and refused for escalation (exit
+# 4) when the pull request's own diff, from its merge base with the fetched base
+# branch, touches a dependency manifest, lockfile, or vendored tree: go.mod,
+# go.sum, go.work, go.work.sum, Cargo.toml, Cargo.lock, package.json,
+# package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml,
+# pnpm-workspace.yaml, bun.lock, bun.lockb, requirements*.txt, requirements*.in,
+# constraints*.txt, pyproject.toml, uv.lock, poetry.lock, Pipfile, Pipfile.lock,
+# setup.py, setup.cfg, Gemfile, Gemfile.lock, in any directory, or anything
+# under a vendor/ directory. Such a pull request merges only on the captain's
+# per-PR instruction.
+# auto is the sweep the watcher runs before its other checks while
+# config/secondmate-pr-auto-merge exists (bin/fm-watch.sh). For each granted
+# mate it reads the newest done line on the mate's status channel naming each
+# pull request in a granted repository, and acts once per such line: a
+# pull request that is already armed, or that the sweep cannot read right now,
+# waits for a later sweep; a merged or closed one is noted silently; otherwise
+# it runs arm --grant, with --head <sha> when the line carries "<url> head
+# <sha>". An escalation or a refused arm prints one line naming the pull
+# request. A later done line for the same pull request, such as the mate's
+# report of a new head after red checks or a moved head, is acted on again;
+# the same line never is. What the sweep acted on is kept in
+# state/secondmate-prs/auto/<record-id>.seen.
+# A grant-armed record also closes, unmerged, when its grant has been removed.
 #
 # merge attempts the merge now. poll is what the armed check runs, and differs
 # only in printing nothing while there is nothing to report, because its stdout
@@ -48,9 +90,11 @@
 #     reported, with no merge attempted;
 #   - green at the bound head: bin/fm-pr-merge.sh --secondmate-pr runs, and
 #     whatever it decides closes the record - merged, or refused with its own
-#     first error lines reported.
+#     first error lines reported. A content-guard finding is such a refusal;
+#     nothing here passes --allow-content.
 # A closed record never merges again; arming the same pull request again needs a
-# fresh captain instruction. disarm closes an armed record without merging.
+# fresh captain instruction, or under a grant a new done line from the mate.
+# disarm closes an armed record without merging.
 # Every close moves the record's files to state/secondmate-prs/closed/ and
 # retires its watcher check. The mate's own task records and home are never read
 # or written beyond its main-home status and metadata lines; the mate learns of
@@ -63,12 +107,15 @@
 #
 # Record layout, all mode 0600 under state/secondmate-prs/:
 #   <record-id>.meta    kind=secondmate-pr, secondmate=, reported_pr=,
-#                       instruction=, instructed_at=, worktree= (the private
-#                       bare repository), then pr= and pr_head= from the binding
+#                       instruction=, instructed_at=, authority= (instruction
+#                       or grant), grant_repo= under a grant, worktree= (the
+#                       private bare repository), then pr= and pr_head= from
+#                       the binding
 #   <record-id>.git/    the private bare repository the content guard fetches into
 #   <record-id>.*       the binding, guard, and authority records
 #                       bin/fm-pr-check.sh and bin/fm-pr-merge.sh write there
 #   closed/<record-id>-<epoch>/  a closed record, its meta carrying outcome=
+#   auto/<record-id>.seen        the done line the auto sweep last acted on
 set -eu
 
 usage() {
@@ -86,7 +133,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 RECORDS="$STATE/secondmate-prs"
+GRANTS="$CONFIG/secondmate-pr-auto-merge"
+AUTO="$RECORDS/auto"
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
@@ -146,12 +196,120 @@ record_lock() {  # <record-id>
   printf '%s/.secondmate-pr-%s.lock\n' "$RECORDS" "$1"
 }
 
+record_id_for() {  # <secondmate-id> <repo> <number>
+  printf '%s-pr-%s-%s' "$1" "$2" "$3" | LC_ALL=C tr -c 'A-Za-z0-9_\n-' '_'
+}
+
+# 0 when the grant file may be trusted: a regular, single-link file no one but
+# its owner can write. Anything else grants nothing.
+grants_file_trusted() {
+  [ -f "$GRANTS" ] && [ ! -L "$GRANTS" ] || return 1
+  [ "$(fm_pr_file_link_count "$GRANTS" 2>/dev/null)" = 1 ] || return 1
+  [ -O "$GRANTS" ] || return 1
+  [ -z "$(find "$GRANTS" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print 2>/dev/null)" ]
+}
+
+# Each well-formed grant as "<mate>\t<host>\t<path>\t<words>" on stdout, the
+# repository canonicalized through the same parser that reads pull request
+# URLs. With <malformed-var>, the numbers of the lines that grant nothing are
+# stored there.
+grants_read() {  # [<malformed-var>]
+  local line n=0 mate repo words bad=''
+  grants_file_trusted || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=$(one_line "$line")
+    case "$line" in
+      '' | '#'*) continue ;;
+    esac
+    [ -n "$(printf '%s' "$line" | tr -d '[:space:]')" ] || continue
+    read -r mate repo words <<EOF
+$line
+EOF
+    repo=${repo%/}
+    repo=${repo%.git}
+    if [ -z "${words:-}" ] || ! fm_pr_task_id_valid "${mate:-}" \
+      || ! ( fm_pr_url_parse "$repo/pulls/1" && [ "$FM_PR_PROVIDER" = forgejo ] ); then
+      bad="${bad:+$bad }$n"
+      continue
+    fi
+    fm_pr_url_parse "$repo/pulls/1"
+    printf '%s\t%s\t%s\t%s\n' "$mate" "$FM_PR_HOST" "$FM_PR_PATH" "$words"
+  done < "$GRANTS"
+  [ -z "${1:-}" ] || printf -v "$1" '%s' "$bad"
+}
+
+# 0 when a grant names <mate> for the repository <host>/<path>; GRANT_WORDS and
+# GRANT_REPO then hold the captain's words and the repository URL.
+GRANT_WORDS=
+GRANT_REPO=
+grant_for() {  # <mate> <host> <path>
+  local mate host path words
+  GRANT_WORDS=
+  GRANT_REPO=
+  while IFS="$(printf '\t')" read -r mate host path words; do
+    if [ "$mate" = "$1" ] && [ "$host" = "$2" ] && [ "$path" = "$3" ]; then
+      GRANT_WORDS=$words
+      GRANT_REPO="https://$host/$path"
+      return 0
+    fi
+  done < <(grants_read)
+  return 1
+}
+
+# 0 when <file> is a dependency manifest, lockfile, or vendored file; the
+# header owns the list.
+dependency_file() {  # <repo-relative path>
+  case "$1" in
+    vendor/* | */vendor/*) return 0 ;;
+  esac
+  case "${1##*/}" in
+    go.mod | go.sum | go.work | go.work.sum | Cargo.toml | Cargo.lock | package.json \
+      | package-lock.json | npm-shrinkwrap.json | yarn.lock | pnpm-lock.yaml \
+      | pnpm-workspace.yaml | bun.lock | bun.lockb | requirements*.txt | requirements*.in \
+      | constraints*.txt | pyproject.toml | uv.lock | poetry.lock | Pipfile | Pipfile.lock \
+      | setup.py | setup.cfg | Gemfile | Gemfile.lock)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# The dependency files the pull request's own diff touches, space-separated,
+# from the fetched head in <cache> against its merge base with the fetched
+# base branch. Returns 1 when the diff cannot be computed.
+pr_dependency_files() {  # <cache> <login> <path> <number> <head>
+  local cache=$1 login=$2 path=$3 number=$4 head=$5 base mb changed file found=''
+  base=$(tea api --login "$login" --repo "$path" "/repos/{owner}/{repo}/pulls/$number" 2>/dev/null \
+    | jq -r 'if type == "object" and (.base.ref | type) == "string" then .base.ref else empty end' 2>/dev/null) \
+    || return 1
+  [ -n "$base" ] && git check-ref-format --branch "$base" >/dev/null 2>&1 || return 1
+  GIT_TERMINAL_PROMPT=0 git -C "$cache" fetch --no-tags --quiet origin \
+    "+refs/heads/$base:refs/remotes/origin/$base" >/dev/null 2>&1 || return 1
+  mb=$(git -C "$cache" merge-base "refs/remotes/origin/$base" "$head" 2>/dev/null) && [ -n "$mb" ] || return 1
+  changed=$(git -C "$cache" -c core.quotePath=false diff --no-ext-diff --no-renames --name-only "$mb" "$head" -- 2>/dev/null) \
+    || return 1
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    dependency_file "$file" && found="${found:+$found }$file"
+  done <<EOF
+$changed
+EOF
+  printf '%s\n' "$found"
+}
+
 LOCK_HELD=
+SWEEP_LOCK_HELD=
 release_lock() {
   [ -z "$LOCK_HELD" ] || fm_lock_release "$LOCK_HELD" || true
   LOCK_HELD=
 }
-trap release_lock EXIT
+release_locks() {
+  release_lock
+  [ -z "$SWEEP_LOCK_HELD" ] || fm_lock_release "$SWEEP_LOCK_HELD" || true
+  SWEEP_LOCK_HELD=
+}
+trap release_locks EXIT
 
 valid_record_id() {
   fm_pr_task_id_valid "$1" || die "invalid second mate PR record id" 2
@@ -183,15 +341,21 @@ close_record() {  # <record-id> <outcome> <detail>
 
 cmd_arm() {
   local mate=${1:-} raw_url=${2:-} instruction='' presented_head='' url host path owner repo number
-  local rid login cache meta tmp check check_tmp fetched bound
-  [ "$#" -ge 2 ] || die "usage: fm-secondmate-pr-merge.sh arm <secondmate-id> <pr-url> --instruction <words> [--head <sha>]" 2
+  local rid login cache meta tmp check check_tmp fetched bound use_grant=false instruction_given=false
+  local authority=instruction grant_repo='' deps
+  [ "$#" -ge 2 ] || die "usage: fm-secondmate-pr-merge.sh arm <secondmate-id> <pr-url> (--instruction <words> | --grant) [--head <sha>]" 2
   shift 2
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --instruction)
         [ "$#" -ge 2 ] || die "--instruction requires the captain's words" 2
         instruction=$(one_line "$2")
+        instruction_given=true
         shift 2
+        ;;
+      --grant)
+        use_grant=true
+        shift
         ;;
       --head)
         [ "$#" -ge 2 ] || die "--head requires a commit" 2
@@ -223,10 +387,19 @@ cmd_arm() {
     || die "only Forgejo pull requests are supported; $url is a $FM_PR_PROVIDER URL"
   mate_reported_url "$STATE/$mate.status" "$url" \
     || die "$url was not reported in a done line on second mate $mate's status channel; arm only a URL the mate reported"
-  [ -n "$(printf '%s' "$instruction" | tr -d '[:space:]')" ] \
-    || die "no captain instruction recorded; pass the captain's own words with --instruction"
-  instruction_names_pr "$instruction" "$url" "$number" \
-    || die "the captain instruction does not name $url by its URL or number $number"
+  if [ "$use_grant" = true ]; then
+    [ "$instruction_given" = false ] || die "--grant and --instruction are exclusive: a grant carries the captain's own words" 2
+    grant_for "$mate" "$host" "$path" \
+      || die "no standing captain grant in config/secondmate-pr-auto-merge names second mate $mate for https://$host/$path"
+    instruction=$(one_line "$GRANT_WORDS")
+    grant_repo=$GRANT_REPO
+    authority=grant
+  else
+    [ -n "$(printf '%s' "$instruction" | tr -d '[:space:]')" ] \
+      || die "no captain instruction recorded; pass the captain's own words with --instruction"
+    instruction_names_pr "$instruction" "$url" "$number" \
+      || die "the captain instruction does not name $url by its URL or number $number"
+  fi
   if [ -n "$presented_head" ]; then
     fm_pr_head_valid "$presented_head" || die "--head must be a full commit id" 2
   fi
@@ -237,7 +410,7 @@ cmd_arm() {
   login=$(fm_pr_forgejo_login "$host") \
     || die "merging a Forgejo pull request at $host requires exactly one 'tea login' registered for that host (see 'tea login list')"
 
-  rid=$(printf '%s-pr-%s-%s' "$mate" "$repo" "$number" | LC_ALL=C tr -c 'A-Za-z0-9_\n-' '_')
+  rid=$(record_id_for "$mate" "$repo" "$number")
   fm_pr_task_id_valid "$rid" || die "could not derive a record id for $url"
   [ ! -e "$STATE/$rid.meta" ] && [ ! -e "$STATE/$rid.check.sh" ] && [ ! -e "$STATE/$rid.check-trust" ] \
     || die "record id $rid collides with an existing task or check in this home"
@@ -276,15 +449,31 @@ cmd_arm() {
     die "could not fetch the head of $url from https://$host/$owner/$repo.git for the content guard"
   fi
 
+  # A standing grant never covers a dependency change; the captain keeps those.
+  if [ "$use_grant" = true ]; then
+    if ! deps=$(pr_dependency_files "$cache" "$login" "$path" "$number" "$FM_PR_RECORD_HEAD"); then
+      rm -rf -- "${RECORDS:?}/$rid.git"
+      die "could not compute the diff of $url against its base branch to check for dependency changes; nothing is armed"
+    fi
+    if [ -n "$deps" ]; then
+      rm -rf -- "${RECORDS:?}/$rid.git"
+      die "$url changes dependency files ($deps); the standing grant does not cover dependency changes, so it waits for the captain's per-PR word" 4
+    fi
+  fi
+
   umask 077
   tmp=$(mktemp "$RECORDS/.secondmate-pr-meta.XXXXXX")
-  printf '%s\n' \
-    "kind=secondmate-pr" \
-    "secondmate=$mate" \
-    "reported_pr=$url" \
-    "instruction=$instruction" \
-    "instructed_at=$(date +%s)" \
-    "worktree=$cache" > "$tmp"
+  {
+    printf '%s\n' \
+      "kind=secondmate-pr" \
+      "secondmate=$mate" \
+      "reported_pr=$url" \
+      "instruction=$instruction" \
+      "instructed_at=$(date +%s)" \
+      "authority=$authority"
+    [ -z "$grant_repo" ] || printf 'grant_repo=%s\n' "$grant_repo"
+    printf 'worktree=%s\n' "$cache"
+  } > "$tmp"
   chmod 0600 "$tmp"
   mv -f -- "$tmp" "$meta"
 
@@ -317,14 +506,19 @@ cmd_arm() {
     close_record "$rid" arm-failed "the watcher check could not be registered"
     die "could not register the watcher check for $rid; nothing is armed"
   fi
-  printf 'armed: %s merges %s, reported by second mate %s, once its checks are green at head %s\n' \
-    "$rid" "$url" "$mate" "$bound"
+  if [ "$use_grant" = true ]; then
+    printf 'armed: %s merges %s, reported by second mate %s, once its checks are green at head %s, under the standing grant for %s\n' \
+      "$rid" "$url" "$mate" "$bound" "$grant_repo"
+  else
+    printf 'armed: %s merges %s, reported by second mate %s, once its checks are green at head %s\n' \
+      "$rid" "$url" "$mate" "$bound"
+  fi
 }
 
 # One attempt for an armed record. <mode> is merge or poll; see the header for
 # what each outcome does. Prints the captain-relevant outcome on stdout.
 attempt() {  # <mode> <record-id>
-  local mode=$1 rid=$2 meta url mate login output rc first
+  local mode=$1 rid=$2 meta url mate login output rc first grant_repo again
   meta="$RECORDS/$rid.meta"
   if [ ! -f "$meta" ] || [ -L "$meta" ]; then
     [ "$mode" = poll ] && return 0
@@ -332,6 +526,20 @@ attempt() {  # <mode> <record-id>
   fi
   url=$(record_value "$meta" reported_pr)
   mate=$(record_value "$meta" secondmate)
+  grant_repo=
+  again='present the changed pull request to the captain again'
+  if [ "$(record_value "$meta" authority)" = grant ]; then
+    grant_repo=$(record_value "$meta" grant_repo)
+    again='it re-arms under the standing grant when the second mate reports done again'
+    # A grant the captain withdrew stops every record armed under it.
+    if ! fm_pr_url_parse "$url" || ! grant_for "$mate" "$FM_PR_HOST" "$FM_PR_PATH" \
+      || [ "$GRANT_REPO" != "$grant_repo" ]; then
+      close_record "$rid" grant-revoked "no standing grant names $mate for ${grant_repo:-the repository}"
+      printf 'second mate %s PR %s: the standing grant for %s is gone, so the automatic merge is withdrawn and nothing was merged\n' \
+        "$mate" "$url" "${grant_repo:-its repository}"
+      return 0
+    fi
+  fi
   # A record this script cannot read back can never merge; closing it reports
   # the fault once instead of a silent poll on every sweep.
   if ! fm_pr_url_parse "$url" || ! fm_pr_binding_read "$RECORDS" "$rid" \
@@ -358,8 +566,8 @@ attempt() {  # <mode> <record-id>
   fi
   if [ "$FM_PR_RECORD_HEAD" != "$FM_PR_BINDING_HEAD" ]; then
     close_record "$rid" head-moved "head moved from $FM_PR_BINDING_HEAD to $FM_PR_RECORD_HEAD"
-    printf 'second mate %s PR %s: merge refused and disarmed, its head moved from the presented %s to %s; present the changed pull request to the captain again\n' \
-      "$mate" "$url" "$FM_PR_BINDING_HEAD" "$FM_PR_RECORD_HEAD"
+    printf 'second mate %s PR %s: merge refused and disarmed, its head moved from the presented %s to %s; %s\n' \
+      "$mate" "$url" "$FM_PR_BINDING_HEAD" "$FM_PR_RECORD_HEAD" "$again"
     return 0
   fi
   fm_pr_forgejo_combined_status "$login" "$FM_PR_PATH" "$FM_PR_RECORD_HEAD"
@@ -377,8 +585,13 @@ attempt() {  # <mode> <record-id>
       ;;
     *)
       close_record "$rid" checks-red "combined status $FM_PR_FORGEJO_CI_STATE at $FM_PR_RECORD_HEAD"
-      printf 'second mate %s PR %s: merge refused and disarmed, its checks are "%s" at head %s; nothing was merged\n' \
-        "$mate" "$url" "$FM_PR_FORGEJO_CI_STATE" "$FM_PR_RECORD_HEAD"
+      if [ -n "$grant_repo" ]; then
+        printf 'second mate %s PR %s: merge refused and disarmed, its checks are "%s" at head %s; nothing was merged; %s\n' \
+          "$mate" "$url" "$FM_PR_FORGEJO_CI_STATE" "$FM_PR_RECORD_HEAD" "$again"
+      else
+        printf 'second mate %s PR %s: merge refused and disarmed, its checks are "%s" at head %s; nothing was merged\n' \
+          "$mate" "$url" "$FM_PR_FORGEJO_CI_STATE" "$FM_PR_RECORD_HEAD"
+      fi
       return 0
       ;;
   esac
@@ -389,16 +602,172 @@ attempt() {  # <mode> <record-id>
   [ "$mode" = poll ] || printf '%s\n' "$output" >&2
   if [ "$rc" -eq 0 ]; then
     close_record "$rid" merged "merged at head $FM_PR_RECORD_HEAD"
-    printf 'second mate %s PR %s merged at head %s on the recorded captain instruction; the mate'"'"'s own home cleans up its task\n' \
-      "$mate" "$url" "$FM_PR_RECORD_HEAD"
+    if [ -n "$grant_repo" ]; then
+      printf 'second mate %s PR %s merged automatically at head %s under the captain'"'"'s standing grant for %s; the mate'"'"'s own home cleans up its task\n' \
+        "$mate" "$url" "$FM_PR_RECORD_HEAD" "$grant_repo"
+    else
+      printf 'second mate %s PR %s merged at head %s on the recorded captain instruction; the mate'"'"'s own home cleans up its task\n' \
+        "$mate" "$url" "$FM_PR_RECORD_HEAD"
+    fi
     return 0
   fi
   first=$(printf '%s\n' "$output" | grep -E '^(error|actionable):|^  - ' | head -4 | tr '\n' ' ')
   close_record "$rid" merge-refused "${first:-bin/fm-pr-merge.sh exited $rc}"
-  printf 'second mate %s PR %s: merge refused and disarmed by the merge gate: %s\n' \
-    "$mate" "$url" "$(one_line "${first:-bin/fm-pr-merge.sh exited $rc}")"
+  if [ -n "$grant_repo" ]; then
+    # A merge-gate refusal, a content-guard finding among them, is never
+    # overridden under a grant; the same head stays unmerged until the captain
+    # rules on it.
+    printf 'second mate %s PR %s: automatic merge refused and disarmed by the merge gate: %s; nothing merges past this refusal without the captain'"'"'s per-PR word\n' \
+      "$mate" "$url" "$(one_line "${first:-bin/fm-pr-merge.sh exited $rc}")"
+  else
+    printf 'second mate %s PR %s: merge refused and disarmed by the merge gate: %s\n' \
+      "$mate" "$url" "$(one_line "${first:-bin/fm-pr-merge.sh exited $rc}")"
+  fi
   [ "$mode" = poll ] && return 0
   return 1
+}
+
+# Each granted pull request the mate's done lines name, one per line as
+# "<url>\t<reported-head>\t<line-key>", taken from the newest done line naming
+# it. The reported head is the commit after "<url> head" on that line, or empty;
+# the key identifies the line itself so the sweep acts on it once.
+granted_reports() {  # <mate>
+  local mate=$1 file="$STATE/$1.status" line key token next after url head i
+  local -a toks
+  [ -f "$file" ] && [ ! -L "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ "$(status_line_verb "$line")" = "done" ] || continue
+    key=$(printf '%s' "$line" | cksum | awk '{print $1 "-" $2}')
+    read -ra toks <<EOF
+$line
+EOF
+    i=0
+    while [ "$i" -lt "${#toks[@]}" ]; do
+      token=${toks[$i]}
+      i=$((i + 1))
+      case "$token" in
+        *https://*) token="https://${token#*https://}" ;;
+        *) continue ;;
+      esac
+      while :; do
+        case "$token" in
+          *[\).,\;:\'\"]) token=${token%?} ;;
+          *) break ;;
+        esac
+      done
+      fm_pr_url_parse "$token" && [ "$FM_PR_PROVIDER" = forgejo ] || continue
+      url=$FM_PR_URL
+      grant_for "$mate" "$FM_PR_HOST" "$FM_PR_PATH" || continue
+      head=
+      next=${toks[$i]:-}
+      after=${toks[$((i + 1))]:-}
+      after=${after%%[!0-9a-f]*}
+      if [ "$next" = head ] && fm_pr_head_valid "$after"; then
+        head=$after
+      fi
+      printf '%s\t%s\t%s\n' "$url" "$head" "$key"
+    done
+  done < "$file"
+}
+
+seen_key() {  # <record-id>
+  record_value "$AUTO/$1.seen" key
+}
+
+mark_seen() {  # <record-id> <key> <outcome>
+  local tmp
+  tmp=$(mktemp "$AUTO/.seen.XXXXXX") || return 1
+  printf 'key=%s\noutcome=%s\nat=%s\n' "$2" "$3" "$(date +%s)" > "$tmp"
+  chmod 0600 "$tmp"
+  mv -f -- "$tmp" "$AUTO/$1.seen"
+}
+
+# Close a grant-armed record that an interrupted arm left without its watcher
+# check, so the sweep can arm it again; the caller holds no lock on it.
+close_orphaned_grant_record() {  # <record-id>
+  local rid=$1 meta="$RECORDS/$1.meta"
+  [ "$(record_value "$meta" authority)" = grant ] || return 1
+  [ ! -e "$STATE/$rid.check-trust" ] || return 1
+  fm_lock_try_acquire "$(record_lock "$rid")" || return 1
+  LOCK_HELD=$(record_lock "$rid")
+  if [ -f "$meta" ] && [ ! -e "$STATE/$rid.check-trust" ]; then
+    close_record "$rid" arm-interrupted "the arm stopped before its watcher check was registered"
+  fi
+  release_lock
+  [ ! -e "$meta" ]
+}
+
+cmd_auto() {
+  local home_rc=0 malformed='' fingerprint mate seen_mates=' ' url head key rid out rc
+  [ "$#" -eq 0 ] || die "usage: fm-secondmate-pr-merge.sh auto" 2
+  [ -e "$GRANTS" ] || [ -L "$GRANTS" ] || return 0
+  fm_parent_channel_home_id "$FM_HOME" >/dev/null 2>&1 || home_rc=$?
+  [ "$home_rc" -eq 1 ] || return 0
+  [ ! -L "$RECORDS" ] || return 0
+  mkdir -p "$AUTO"
+  chmod 0700 "$RECORDS" "$AUTO"
+  fm_lock_try_acquire "$RECORDS/.secondmate-pr-auto.lock" || return 0
+  SWEEP_LOCK_HELD="$RECORDS/.secondmate-pr-auto.lock"
+
+  # A grant file that cannot be trusted, or a line that grants nothing, is
+  # reported once per change of the file.
+  fingerprint=$( { ls -ln "$GRANTS" 2>/dev/null; cksum < "$GRANTS" 2>/dev/null; } | cksum | awk '{print $1}')
+  if grants_file_trusted; then
+    grants_read malformed >/dev/null
+  else
+    malformed=untrusted
+  fi
+  if [ "$(cat "$AUTO/.grants-reported" 2>/dev/null || true)" != "$fingerprint" ]; then
+    if [ "$malformed" = untrusted ]; then
+      printf 'config/secondmate-pr-auto-merge grants nothing: it must be a regular, single-link file only its owner can write\n'
+    elif [ -n "$malformed" ]; then
+      printf 'config/secondmate-pr-auto-merge lines %s grant nothing: each grant is "<secondmate-id> <Forgejo repository URL> <the captain'"'"'s words>"\n' "$malformed"
+    fi
+    printf '%s\n' "$fingerprint" > "$AUTO/.grants-reported"
+  fi
+  [ "$malformed" != untrusted ] || return 0
+
+  while IFS="$(printf '\t')" read -r mate _; do
+    case "$seen_mates" in *" $mate "*) continue ;; esac
+    seen_mates="$seen_mates$mate "
+    [ -f "$STATE/$mate.meta" ] && [ ! -L "$STATE/$mate.meta" ] \
+      && [ "$(record_value "$STATE/$mate.meta" kind)" = secondmate ] || continue
+    # Only the newest report of each pull request counts.
+    while IFS="$(printf '\t')" read -r url head key; do
+      fm_pr_url_parse "$url" || continue
+      rid=$(record_id_for "$mate" "$FM_PR_REPO" "$FM_PR_NUMBER")
+      fm_pr_task_id_valid "$rid" || continue
+      [ "$(seen_key "$rid")" != "$key" ] || continue
+      if [ -e "$RECORDS/$rid.meta" ] || [ -L "$RECORDS/$rid.meta" ]; then
+        close_orphaned_grant_record "$rid" || continue
+      fi
+      # An unreadable pull request is retried on a later sweep; a merged or
+      # closed one needs nothing.
+      fm_pr_forgejo_read_record "$FM_PR_HOST" "$FM_PR_PATH" "$FM_PR_NUMBER" < /dev/null || continue
+      if [ "$FM_PR_RECORD_MERGED" != false ] || [ "$FM_PR_RECORD_STATE" != open ]; then
+        mark_seen "$rid" "$key" not-open || true
+        continue
+      fi
+      rc=0
+      out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
+        "$SCRIPT_DIR/fm-secondmate-pr-merge.sh" arm "$mate" "$url" --grant ${head:+--head "$head"} 2>&1 >/dev/null < /dev/null) \
+        || rc=$?
+      out=$(printf '%s\n' "$out" | sed -n 's/^error: //p' | head -1)
+      case "$rc" in
+        0) mark_seen "$rid" "$key" armed || true ;;
+        4)
+          mark_seen "$rid" "$key" dependency-change || true
+          printf 'second mate %s PR %s is not merged automatically: %s\n' "$mate" "$url" "${out:-it changes dependency files}"
+          ;;
+        *)
+          mark_seen "$rid" "$key" arm-refused || true
+          printf 'second mate %s PR %s could not be armed under the standing grant: %s\n' "$mate" "$url" "${out:-arm exited $rc}"
+          ;;
+      esac
+    done < <(granted_reports "$mate" | awk -F '\t' '{ last[$1] = $0; if (!($1 in order)) { order[$1] = ++n; urls[n] = $1 } }
+      END { for (i = 1; i <= n; i++) print last[urls[i]] }')
+  done < <(grants_read)
+  return 0
 }
 
 cmd_merge() {
@@ -460,6 +829,7 @@ sub=$1
 shift
 case "$sub" in
   arm) cmd_arm "$@" ;;
+  auto) cmd_auto "$@" ;;
   merge) cmd_merge "$@" ;;
   poll) cmd_poll "$@" ;;
   disarm) cmd_disarm "$@" ;;
