@@ -81,7 +81,8 @@
 # for the next sweep; after two sweeps in a row fail that way for the same line
 # the sweep prints one line naming the pull request and the last error, and
 # stays silent on that line after it while it keeps retrying (the count is
-# auto/<record-id>.retry). A later done line for the same pull request, such as
+# auto/<record-id>.retry). An unreadable pull request's error names the forge's
+# host and its own words. A later done line for the same pull request, such as
 # the mate's report of a new head after red checks or a moved head, is acted on
 # again;
 # the same line never is. What the sweep acted on is kept in
@@ -93,15 +94,23 @@
 # becomes the watcher's wake text. Both read the pull request first:
 #   - checks pending, or no status reported yet: nothing happens and the record
 #     stays armed (merge exits 3 saying so);
-#   - an unreadable read: nothing happens and the record stays armed (merge
-#     exits 1 saying so);
+#   - the pull request or its checks unreadable at the forge (no answer, an
+#     empty one, or an error body): nothing happens and the record stays armed
+#     (merge exits 1 saying so). poll reports it once per episode, on the
+#     second sweep in a row, as one line naming the forge's host and its own
+#     error text, and stays silent while it lasts; a read that succeeds ends
+#     the episode (<record-id>.read-wait);
 #   - merged, closed, a head that moved from the bound one, or a combined
 #     status that is not success: the record closes and the outcome is
 #     reported, with no merge attempted;
 #   - green at the bound head: bin/fm-pr-merge.sh --secondmate-pr runs, and
 #     whatever it decides closes the record - merged, or refused with its own
 #     first error lines reported. A content-guard finding is such a refusal;
-#     nothing here passes --allow-content.
+#     nothing here passes --allow-content. The one exception is a refusal whose
+#     only findings are the guard being unable to fetch origin/<base> or the
+#     head: that leaves the record armed for the next sweep (merge exits 1
+#     saying so), and poll reports it once per episode the same way
+#     (<record-id>.guard-wait).
 # A closed record never merges again; arming the same pull request again needs a
 # fresh captain instruction, or under a grant a new done line from the mate.
 # disarm closes an armed record without merging.
@@ -124,6 +133,9 @@
 #   <record-id>.git/    the private bare repository the content guard fetches into
 #   <record-id>.*       the binding, guard, and authority records
 #                       bin/fm-pr-check.sh and bin/fm-pr-merge.sh write there
+#   <record-id>.read-wait, <record-id>.guard-wait
+#                       poll's count of consecutive unreadable reads and
+#                       guard fetch failures, and whether each was reported
 #   closed/<record-id>-<epoch>/  a closed record, its meta carrying outcome=
 #   auto/<record-id>.seen        the done line the auto sweep last acted on
 #   auto/<record-id>.retry       that line's consecutive retryable failures
@@ -457,7 +469,8 @@ cmd_arm() {
     die "$rid is already armed for $(record_value "$meta" reported_pr); disarm it before arming again"
   fi
 
-  fm_pr_forgejo_read_record "$host" "$path" "$number" || die "could not read $url" 5
+  fm_pr_forgejo_read_record "$host" "$path" "$number" \
+    || die "could not read $url: ${FM_PR_RECORD_ERROR:-the forge gave no reason}" 5
   [ "$FM_PR_RECORD_MERGED" = false ] && [ "$FM_PR_RECORD_STATE" = open ] \
     || die "$url is not an open, unmerged pull request (state=$FM_PR_RECORD_STATE, merged=$FM_PR_RECORD_MERGED)"
   fm_pr_head_valid "$FM_PR_RECORD_HEAD" || die "could not read the head of $url" 5
@@ -543,10 +556,71 @@ cmd_arm() {
   fi
 }
 
+# Count one more failure in the episode file <file>, whose <key> names what
+# failed; another key starts a new episode. Returns 0 exactly once per episode,
+# on its second failure in a row, when the caller reports it; EPISODE_FAILURES
+# then holds the count.
+EPISODE_FAILURES=0
+episode_failure() {  # <file> <key>
+  local file=$1 key=$2 failures=0 reported=0 report=1 tmp
+  if [ -f "$file" ] && [ ! -L "$file" ] && [ "$(record_value "$file" key)" = "$key" ]; then
+    failures=$(record_value "$file" failures)
+    reported=$(record_value "$file" reported)
+    case "$failures" in '' | *[!0-9]*) failures=0 ;; esac
+  fi
+  failures=$((failures + 1))
+  EPISODE_FAILURES=$failures
+  if [ "$failures" -ge 2 ] && [ "$reported" != 1 ]; then
+    report=0
+    reported=1
+  fi
+  if tmp=$(mktemp "${file%/*}/.episode.XXXXXX"); then
+    printf 'key=%s\nfailures=%s\nreported=%s\nat=%s\n' "$key" "$failures" "$reported" "$(date +%s)" > "$tmp"
+    chmod 0600 "$tmp"
+    mv -f -- "$tmp" "$file" || rm -f -- "$tmp"
+  fi
+  return "$report"
+}
+
+# An armed record that cannot progress for a reason a later sweep may clear:
+# it stays armed, and poll prints one line per episode naming the reason.
+forge_wait() {  # <record-id> <read|guard> <mate> <url> <what happened> <reason>
+  if episode_failure "$RECORDS/$1.$2-wait" "$2"; then
+    printf 'second mate %s PR %s stays armed but %s on %s sweeps in a row: %s; it is tried again on every sweep and nothing was merged\n' \
+      "$3" "$4" "$5" "$EPISODE_FAILURES" "$(one_line "$6")"
+  fi
+}
+
+# 0 when bin/fm-pr-merge.sh's refusal <output> is the content guard's alone and
+# each of its findings is a fetch from the forge that failed, which a later
+# sweep may clear; GUARD_WAIT_REASON then holds those findings. Any other
+# refusal or finding returns 1 and disarms as before.
+GUARD_WAIT_REASON=
+guard_fetch_unavailable_only() {  # <fm-pr-merge.sh output>
+  local line guard=false reasons=''
+  GUARD_WAIT_REASON=
+  while IFS= read -r line; do
+    case "$line" in
+      'error: refusing to merge '*': the content guard found') guard=true ;;
+      'error: present this diff stat and these findings to the captain;'*) ;;
+      error:* | actionable:*) return 1 ;;
+      '  - unavailable: origin/'*' could not be fetched' \
+        | '  - unavailable: the verified head '*' could not be fetched')
+        reasons="${reasons:+$reasons; }${line#  - unavailable: }"
+        ;;
+      '  - '*) return 1 ;;
+    esac
+  done <<EOF
+$1
+EOF
+  [ "$guard" = true ] && [ -n "$reasons" ] || return 1
+  GUARD_WAIT_REASON=$reasons
+}
+
 # One attempt for an armed record. <mode> is merge or poll; see the header for
 # what each outcome does. Prints the captain-relevant outcome on stdout.
 attempt() {  # <mode> <record-id>
-  local mode=$1 rid=$2 meta url mate login output rc first grant_repo again
+  local mode=$1 rid=$2 meta url mate login output rc first grant_repo again read_error
   meta="$RECORDS/$rid.meta"
   if [ ! -f "$meta" ] || [ -L "$meta" ]; then
     [ "$mode" = poll ] && return 0
@@ -577,10 +651,18 @@ attempt() {  # <mode> <record-id>
     [ "$mode" = poll ] && return 0
     return 1
   fi
-  if ! login=$(fm_pr_forgejo_login "$FM_PR_HOST") \
-    || ! fm_pr_forgejo_read_record "$FM_PR_HOST" "$FM_PR_PATH" "$FM_PR_NUMBER"; then
-    [ "$mode" = poll ] && return 0
-    die "could not read $url; $rid stays armed"
+  read_error=
+  if ! login=$(fm_pr_forgejo_login "$FM_PR_HOST"); then
+    read_error="no single 'tea login' is registered for $FM_PR_HOST"
+  elif ! fm_pr_forgejo_read_record "$FM_PR_HOST" "$FM_PR_PATH" "$FM_PR_NUMBER"; then
+    read_error=${FM_PR_RECORD_ERROR:-$FM_PR_HOST gave no reason}
+  fi
+  if [ -n "$read_error" ]; then
+    if [ "$mode" = poll ]; then
+      forge_wait "$rid" read "$mate" "$url" "could not be read" "$read_error"
+      return 0
+    fi
+    die "could not read $url: $read_error; $rid stays armed"
   fi
   if [ "$FM_PR_RECORD_MERGED" = true ]; then
     close_record "$rid" merged-elsewhere "already merged when read"
@@ -598,7 +680,16 @@ attempt() {  # <mode> <record-id>
       "$mate" "$url" "$FM_PR_BINDING_HEAD" "$FM_PR_RECORD_HEAD" "$again"
     return 0
   fi
-  fm_pr_forgejo_combined_status "$login" "$FM_PR_PATH" "$FM_PR_RECORD_HEAD"
+  fm_pr_forgejo_combined_status "$login" "$FM_PR_PATH" "$FM_PR_RECORD_HEAD" "$FM_PR_HOST"
+  if [ "$FM_PR_FORGEJO_CI_STATE" = unreadable ]; then
+    read_error=${FM_PR_FORGEJO_CI_ERROR:-$FM_PR_HOST gave no reason}
+    if [ "$mode" = poll ]; then
+      forge_wait "$rid" read "$mate" "$url" "had checks that could not be read" "$read_error"
+      return 0
+    fi
+    die "could not read the checks of $url: $read_error; $rid stays armed"
+  fi
+  rm -f -- "$RECORDS/$rid.read-wait"
   case "$FM_PR_FORGEJO_CI_STATE" in
     success) ;;
     pending | none)
@@ -606,10 +697,6 @@ attempt() {  # <mode> <record-id>
       printf 'not green yet: %s has combined status "%s" at head %s; %s stays armed and merges once it is green\n' \
         "$url" "$FM_PR_FORGEJO_CI_STATE" "$FM_PR_RECORD_HEAD" "$rid" >&2
       return 3
-      ;;
-    unreadable)
-      [ "$mode" = poll ] && return 0
-      die "could not read the checks of $url; $rid stays armed"
       ;;
     *)
       close_record "$rid" checks-red "combined status $FM_PR_FORGEJO_CI_STATE at $FM_PR_RECORD_HEAD"
@@ -639,6 +726,18 @@ attempt() {  # <mode> <record-id>
     fi
     return 0
   fi
+  # The guard unable to fetch from the forge found nothing; it runs again.
+  if guard_fetch_unavailable_only "$output"; then
+    if [ "$mode" = poll ]; then
+      forge_wait "$rid" guard "$mate" "$url" "was not merged because the content guard could not fetch from the forge" \
+        "$GUARD_WAIT_REASON"
+      return 0
+    fi
+    printf 'not merged: the content guard could not fetch from the forge (%s); %s stays armed and is tried again on the next sweep\n' \
+      "$GUARD_WAIT_REASON" "$rid" >&2
+    return 1
+  fi
+  rm -f -- "$RECORDS/$rid.guard-wait"
   first=$(printf '%s\n' "$output" | grep -E '^(error|actionable):|^  - ' | head -4 | tr '\n' ' ')
   close_record "$rid" merge-refused "${first:-bin/fm-pr-merge.sh exited $rc}"
   if [ -n "$grant_repo" ]; then
@@ -715,22 +814,10 @@ mark_seen() {  # <record-id> <key> <outcome>
 # next sweep tries it again. The second failure in a row prints one line; later
 # ones for the same line stay silent.
 note_retryable() {  # <record-id> <key> <mate> <url> <error>
-  local rid=$1 key=$2 file="$AUTO/$1.retry" failures=0 reported=0 tmp
-  if [ "$(record_value "$file" key)" = "$key" ]; then
-    failures=$(record_value "$file" failures)
-    reported=$(record_value "$file" reported)
-    case "$failures" in '' | *[!0-9]*) failures=0 ;; esac
-  fi
-  failures=$((failures + 1))
-  if [ "$failures" -ge 2 ] && [ "$reported" != 1 ]; then
+  if episode_failure "$AUTO/$1.retry" "$2"; then
     printf 'second mate %s PR %s could not be armed under the standing grant on %s sweeps in a row and is retried on every sweep: %s\n' \
-      "$3" "$4" "$failures" "$(one_line "$5")"
-    reported=1
+      "$3" "$4" "$EPISODE_FAILURES" "$(one_line "$5")"
   fi
-  tmp=$(mktemp "$AUTO/.retry.XXXXXX") || return 1
-  printf 'key=%s\nfailures=%s\nreported=%s\nat=%s\n' "$key" "$failures" "$reported" "$(date +%s)" > "$tmp"
-  chmod 0600 "$tmp"
-  mv -f -- "$tmp" "$file"
 }
 
 # Close a grant-armed record that an interrupted arm left without its watcher
@@ -795,7 +882,8 @@ cmd_auto() {
       # An unreadable pull request is retried on a later sweep; a merged or
       # closed one needs nothing.
       if ! fm_pr_forgejo_read_record "$FM_PR_HOST" "$FM_PR_PATH" "$FM_PR_NUMBER" < /dev/null; then
-        note_retryable "$rid" "$key" "$mate" "$url" "could not read $url" || true
+        note_retryable "$rid" "$key" "$mate" "$url" \
+          "could not read $url: ${FM_PR_RECORD_ERROR:-the forge gave no reason}" || true
         continue
       fi
       if [ "$FM_PR_RECORD_MERGED" != false ] || [ "$FM_PR_RECORD_STATE" != open ]; then

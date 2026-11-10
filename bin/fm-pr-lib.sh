@@ -105,6 +105,7 @@ FM_PR_RETIRE_RECEIPT_HASH=
 FM_PR_RETIRE_RECEIPT_IDENTITY=
 FM_PR_RECORD_STATE=
 FM_PR_RECORD_MERGED=
+FM_PR_RECORD_ERROR=
 FM_PR_POLL_RETIREMENT_REJECTED=
 
 fm_task_id_path_safe() {
@@ -1181,27 +1182,83 @@ fm_pr_forgejo_login() {  # <host>
   tea login list --output json 2>/dev/null | jq -er --arg h "$1" "$FM_PR_FORGEJO_LOGIN_JQ" 2>/dev/null
 }
 
+# One line naming why a "tea api" call against <host> answered nothing usable,
+# in the forge's or tea's own words: an error body's message, or the last line
+# tea printed to <stderr-file> with its "Error:" and "request failed:" prefixes,
+# the request line, and any credential in a URL removed. A request that never
+# completed reads "cannot reach <host>: <reason>".
+fm_pr_forgejo_api_error() {  # <host> <stdout> <stderr-file>
+  local host=$1 out=$2 err_file=$3 message='' failed=false
+  if [ -n "$out" ] && command -v jq >/dev/null 2>&1; then
+    message=$(printf '%s' "$out" | jq -r 'if type == "object" and (.message | type) == "string" then .message else empty end' 2>/dev/null || true)
+    message=$(printf '%s' "$message" | tr '\r\n\t' '   ')
+    if [ -n "$message" ]; then
+      printf '%s answered: %s\n' "$host" "$message" | cut -c1-300
+      return 0
+    fi
+  fi
+  if [ -n "$err_file" ] && [ -s "$err_file" ]; then
+    message=$(sed -e '/^[[:space:]]*$/d' "$err_file" 2>/dev/null | tail -1)
+    message=${message#Error: }
+    case "$message" in
+      'request failed: '*)
+        failed=true
+        message=${message#request failed: }
+        ;;
+    esac
+    message=$(printf '%s' "$message" \
+      | sed -E -e 's#^[A-Za-z]+ "[^"]*": ##' -e 's#://[^/@[:space:]]*@#://#g' | tr '\r\t' '  ')
+  fi
+  if [ -z "$message" ]; then
+    if [ -n "$out" ]; then
+      message="$host answered with an unreadable record"
+    else
+      message="$host returned an empty answer"
+    fi
+  elif [ "$failed" = true ]; then
+    message="cannot reach $host: $message"
+  else
+    message="$host could not be read: $message"
+  fi
+  printf '%s\n' "$message" | cut -c1-300
+}
+
 # The state, merged flag, and head commit of one Forgejo pull request, read
 # from the REST record through "tea api" so the credential never leaves tea.
 # "tea api" exits 0 on an HTTP error and prints the error body instead, so
 # only a record whose state, merged, and head.sha fields all have the expected
-# types is accepted; anything else returns 1 for an honest unknown.
+# types is accepted; anything else returns 1 for an honest unknown, with
+# FM_PR_RECORD_ERROR naming why (fm_pr_forgejo_api_error).
 fm_pr_forgejo_read_record() {  # <host> <path> <number>
-  local host=$1 path=$2 number=$3 login json fields line
+  local host=$1 path=$2 number=$3 login json fields line err_file
   local total=0 named=0 state='' merged='' head=''
   FM_PR_RECORD_STATE=
   FM_PR_RECORD_MERGED=
   FM_PR_RECORD_HEAD=
-  command -v jq >/dev/null 2>&1 || return 1
-  case "$number" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  login=$(fm_pr_forgejo_login "$host") || return 1
-  [ -n "$login" ] || return 1
-  if ! json=$(tea api --login "$login" --repo "$path" \
-      "/repos/{owner}/{repo}/pulls/$number" 2>/dev/null) || [ -z "$json" ]; then
+  FM_PR_RECORD_ERROR=
+  if ! command -v jq >/dev/null 2>&1; then
+    FM_PR_RECORD_ERROR="jq is not on PATH"
     return 1
   fi
+  case "$number" in
+    ''|*[!0-9]*)
+      FM_PR_RECORD_ERROR="'$number' is not a pull request number"
+      return 1
+      ;;
+  esac
+  if ! login=$(fm_pr_forgejo_login "$host") || [ -z "$login" ]; then
+    FM_PR_RECORD_ERROR="no single 'tea login' is registered for $host"
+    return 1
+  fi
+  err_file=$(mktemp "${TMPDIR:-/tmp}/fm-tea-err.XXXXXX" 2>/dev/null) || err_file=
+  json=
+  if ! json=$(tea api --login "$login" --repo "$path" \
+      "/repos/{owner}/{repo}/pulls/$number" 2>"${err_file:-/dev/null}") || [ -z "$json" ]; then
+    FM_PR_RECORD_ERROR=$(fm_pr_forgejo_api_error "$host" "$json" "$err_file")
+    [ -z "$err_file" ] || rm -f -- "$err_file"
+    return 1
+  fi
+  [ -z "$err_file" ] || rm -f -- "$err_file"
   if ! fields=$(printf '%s' "$json" | jq -r '
       if type == "object" and (.state | type) == "string" and .state != ""
         and (.merged | type) == "boolean" and (.head.sha | type) == "string"
@@ -1212,6 +1269,7 @@ fm_pr_forgejo_read_record() {  # <host> <path> <number>
       else
         error("invalid pull request record")
       end' 2>/dev/null); then
+    FM_PR_RECORD_ERROR=$(fm_pr_forgejo_api_error "$host" "$json" "")
     return 1
   fi
   while IFS= read -r line; do
@@ -1228,6 +1286,7 @@ $fields
 FIELDS
   if [ "$named" -ne 3 ] || [ "$total" -ne 3 ] || [ -z "$state" ] \
     || { [ "$merged" != true ] && [ "$merged" != false ]; }; then
+    FM_PR_RECORD_ERROR="$host answered with an unreadable record"
     return 1
   fi
 
@@ -1252,13 +1311,18 @@ FIELDS
 # success only when each non-empty page is; the first page that is not
 # success, or that cannot be read, decides the result. Shared by
 # bin/fm-pr-merge.sh's pre-merge gate and bin/fm-secondmate-pr-merge.sh's poll.
-# shellcheck disable=SC2034 # FM_PR_FORGEJO_CI_STATE is read by sourcing callers.
-fm_pr_forgejo_combined_status() {  # <login> <owner/repo> <sha>
-  local login=$1 slug=$2 sha=$3 status_json fields line page=1 page_count page_state
+# An unreadable result leaves FM_PR_FORGEJO_CI_ERROR naming why, in the words
+# fm_pr_forgejo_api_error gives for a forge at [<host>].
+# shellcheck disable=SC2034 # FM_PR_FORGEJO_CI_* are read by sourcing callers.
+fm_pr_forgejo_combined_status() {  # <login> <owner/repo> <sha> [<host>]
+  local login=$1 slug=$2 sha=$3 host=${4:-the forge} status_json fields line page=1 page_count page_state err_file
   FM_PR_FORGEJO_CI_STATE=none
+  FM_PR_FORGEJO_CI_ERROR=
   while :; do
+    err_file=$(mktemp "${TMPDIR:-/tmp}/fm-tea-err.XXXXXX" 2>/dev/null) || err_file=
+    status_json=
     if ! status_json=$(tea api --login "$login" --repo "$slug" \
-        "/repos/{owner}/{repo}/commits/$sha/status?limit=50&page=$page" 2>/dev/null) \
+        "/repos/{owner}/{repo}/commits/$sha/status?limit=50&page=$page" 2>"${err_file:-/dev/null}") \
       || ! fields=$(printf '%s' "$status_json" | jq -r '
           if type == "object" and ((.statuses // []) | type) == "array" then
             "count=" + ((.statuses // []) | length | tostring),
@@ -1267,8 +1331,11 @@ fm_pr_forgejo_combined_status() {  # <login> <owner/repo> <sha>
             error("status payload is not a combined status")
           end' 2>/dev/null); then
       FM_PR_FORGEJO_CI_STATE=unreadable
+      FM_PR_FORGEJO_CI_ERROR=$(fm_pr_forgejo_api_error "$host" "$status_json" "$err_file")
+      [ -z "$err_file" ] || rm -f -- "$err_file"
       return 0
     fi
+    [ -z "$err_file" ] || rm -f -- "$err_file"
     page_count='' page_state=''
     while IFS= read -r line; do
       case "$line" in
@@ -1281,6 +1348,7 @@ FIELDS
     [ "$page_count" != 0 ] || return 0
     if [ "$page_state" != success ]; then
       FM_PR_FORGEJO_CI_STATE=${page_state:-unreadable}
+      [ -n "$page_state" ] || FM_PR_FORGEJO_CI_ERROR="$host reported statuses with no combined state"
       return 0
     fi
     FM_PR_FORGEJO_CI_STATE=success
@@ -1289,6 +1357,7 @@ FIELDS
     # forever, so an implausible page count is unreadable rather than green.
     if [ "$page" -gt 100 ]; then
       FM_PR_FORGEJO_CI_STATE=unreadable
+      FM_PR_FORGEJO_CI_ERROR="$host repeats its status page past page 100"
       return 0
     fi
   done

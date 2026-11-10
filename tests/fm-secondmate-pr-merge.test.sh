@@ -27,7 +27,9 @@ INSTRUCTION="merge PR 9 when CI is green"
 # from pr.json (pr-post.json once a merge landed), a commit status read from
 # tea-status.json, the repository read with a merge default style, and a merge
 # POST lands only when head_commit_id matches tea-expected-head. "tea api"
-# exits 0 even on an HTTP error, so every branch exits 0.
+# exits 0 even on an HTTP error, so every branch exits 0, except that with
+# tea-down present every api call fails the way tea reports an unreachable
+# host, and with tea-error-body present it answers with a Forgejo error body.
 add_tea_mock() {
   local case_dir=$1
   cat > "$case_dir/fakebin/tea" <<'SH'
@@ -40,6 +42,14 @@ if [ "${1:-} ${2:-}" = "login list" ]; then
   exit 0
 fi
 [ "${1:-}" = api ] || exit 0
+if [ -e "$log_dir/tea-down" ]; then
+  printf 'Error: request failed: Get "https://forgejo.example/api/v1/repos/fixture/fixture-repo/pulls/9": dial tcp 192.0.2.10:443: connect: no route to host\n' >&2
+  exit 1
+fi
+if [ -e "$log_dir/tea-error-body" ]; then
+  printf '{"message":"token is required","url":"https://forgejo.example/api/swagger"}\n'
+  exit 0
+fi
 shift
 endpoint= head_commit_id=
 while [ $# -gt 0 ]; do
@@ -639,6 +649,86 @@ SH
   pass "a transient fetch failure leaves the report for the next sweep, is reported once if it persists, and then arms"
 }
 
+test_unreadable_forge_is_reported_once_and_the_arm_kept() {
+  local case_dir out head meta
+  case_dir=$(make_case forge-down)
+  head=$(cat "$case_dir/head")
+  arm "$case_dir" || fail "forge-down: arm failed: $(cat "$case_dir/arm.err")"
+  meta="$case_dir/home/state/secondmate-prs/$RID.meta"
+  : > "$case_dir/tea-down"
+  out=$(run_check "$case_dir" 2>/dev/null)
+  [ -z "$out" ] || fail "forge-down: one unreadable sweep was reported: $out"
+  assert_present "$meta" "forge-down: an unreadable read disarmed the record"
+  out=$(run_check "$case_dir" 2>/dev/null)
+  assert_contains "$out" "second mate $MATE PR $FJ_URL stays armed but could not be read on 2 sweeps in a row: cannot reach $FJ_HOST: dial tcp 192.0.2.10:443: connect: no route to host" \
+    "forge-down: the persistent unreadable read was not reported with the host and the forge's error"
+  out=$(run_check "$case_dir" 2>/dev/null)
+  [ -z "$out" ] || fail "forge-down: the same episode was reported again: $out"
+  assert_present "$meta" "forge-down: a persistent unreadable read disarmed the record"
+  assert_present "$case_dir/home/state/$RID.check.sh" "forge-down: the watcher check was retired"
+
+  # A read that succeeds ends the episode, so the next one is reported again.
+  rm -f "$case_dir/tea-down"
+  write_status_json "$case_dir/tea-status.json" pending
+  out=$(run_check "$case_dir" 2>/dev/null)
+  [ -z "$out" ] || fail "forge-down: a readable pending sweep was not silent: $out"
+  assert_absent "$case_dir/home/state/secondmate-prs/$RID.read-wait" "forge-down: a successful read did not end the episode"
+  : > "$case_dir/tea-error-body"
+  run_check "$case_dir" > /dev/null 2>&1
+  out=$(run_check "$case_dir" 2>/dev/null)
+  assert_contains "$out" "could not be read on 2 sweeps in a row: $FJ_HOST answered: token is required" \
+    "forge-down: an error body was not reported in the forge's own words"
+  rm -f "$case_dir/tea-error-body"
+  merge_attempted "$case_dir" && fail "forge-down: a merge was attempted while the forge was unreadable"
+
+  write_status_json "$case_dir/tea-status.json" success
+  out=$(run_check "$case_dir" 2>/dev/null)
+  assert_contains "$out" "second mate $MATE PR $FJ_URL merged at head $head" "forge-down: the recovered record did not merge"
+
+  # The auto sweep names the forge's error when it cannot read a reported PR.
+  case_dir=$(make_case forge-down-auto)
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  report_done "$case_dir" "$(cat "$case_dir/head")"
+  : > "$case_dir/tea-down"
+  run_auto "$case_dir"
+  [ ! -s "$case_dir/auto.out" ] || fail "forge-down-auto: one unreadable sweep was reported: $(cat "$case_dir/auto.out")"
+  run_auto "$case_dir"
+  assert_grep "could not be armed under the standing grant on 2 sweeps in a row and is retried on every sweep: could not read $FJ_URL: cannot reach $FJ_HOST: dial tcp 192.0.2.10:443: connect: no route to host" \
+    "$case_dir/auto.out" "forge-down-auto: the sweep did not name the forge's error"
+  pass "an unreadable forge keeps the arm and is reported once per episode with the host and the forge's own error"
+}
+
+test_guard_fetch_failure_keeps_the_arm_and_merges_later() {
+  local case_dir out head rc meta
+  case_dir=$(make_case guard-unavailable)
+  head=$(cat "$case_dir/head")
+  arm "$case_dir" || fail "guard-unavailable: arm failed: $(cat "$case_dir/arm.err")"
+  meta="$case_dir/home/state/secondmate-prs/$RID.meta"
+  break_forge_git "$case_dir"
+  out=$(run_check "$case_dir" 2>/dev/null)
+  [ -z "$out" ] || fail "guard-unavailable: one failed guard fetch was reported: $out"
+  assert_present "$meta" "guard-unavailable: a failed guard fetch disarmed the record"
+  out=$(run_check "$case_dir" 2>/dev/null)
+  assert_contains "$out" "second mate $MATE PR $FJ_URL stays armed but was not merged because the content guard could not fetch from the forge on 2 sweeps in a row: origin/main could not be fetched" \
+    "guard-unavailable: the persistent guard fetch failure was not reported once"
+  out=$(run_check "$case_dir" 2>/dev/null)
+  [ -z "$out" ] || fail "guard-unavailable: the same episode was reported again: $out"
+  rc=0
+  run_sm "$case_dir" merge "$RID" > /dev/null 2> "$case_dir/merge.err" || rc=$?
+  expect_code 1 "$rc" "guard-unavailable: an immediate merge while the guard cannot fetch"
+  assert_grep "not merged: the content guard could not fetch from the forge (origin/main could not be fetched); $RID stays armed" \
+    "$case_dir/merge.err" "guard-unavailable: the immediate merge did not say the record stays armed"
+  assert_present "$meta" "guard-unavailable: the immediate merge disarmed the record"
+  assert_present "$case_dir/home/state/$RID.check.sh" "guard-unavailable: the watcher check was retired"
+  merge_attempted "$case_dir" && fail "guard-unavailable: merged without the content guard"
+
+  mend_forge_git "$case_dir"
+  out=$(run_check "$case_dir" 2>/dev/null)
+  assert_contains "$out" "second mate $MATE PR $FJ_URL merged at head $head" \
+    "guard-unavailable: the record did not merge once the fetch worked"
+  pass "a content guard that cannot fetch keeps the arm, is reported once, and merges once the fetch works"
+}
+
 test_content_guard_still_refuses_under_a_grant() {
   local case_dir head out meta
   case_dir=$(make_case grant-guard)
@@ -656,6 +746,8 @@ test_content_guard_still_refuses_under_a_grant() {
   assert_contains "$out" "automatic merge refused and disarmed by the merge gate" "grant-guard: the guard refusal was not reported"
   assert_contains "$out" "deleted-tests" "grant-guard: the content guard's finding was not relayed"
   assert_contains "$out" "without the captain's per-PR word" "grant-guard: the refusal did not leave the call to the captain"
+  assert_not_contains "$out" "stays armed" "grant-guard: a real finding was treated as a fetch failure"
+  assert_absent "$case_dir/home/state/$RID.check.sh" "grant-guard: the watcher check was not retired"
   merge_attempted "$case_dir" && fail "grant-guard: merged past a content-guard finding"
   meta=$(closed_meta "$case_dir")
   assert_grep "outcome=merge-refused" "$meta" "grant-guard: the closed record does not say refused"
@@ -715,6 +807,8 @@ fm_test_run \
   test_dependency_change_escalates_instead_of_arming \
   test_red_checks_disarm_then_a_new_head_rearms \
   test_transient_fetch_failure_is_retried_on_the_next_sweep \
+  test_unreadable_forge_is_reported_once_and_the_arm_kept \
+  test_guard_fetch_failure_keeps_the_arm_and_merges_later \
   test_content_guard_still_refuses_under_a_grant \
   test_withdrawn_grant_stops_an_armed_merge \
   test_watcher_sweep_merges_a_granted_pull_request \
