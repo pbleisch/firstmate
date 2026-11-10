@@ -10,7 +10,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | Firstmate's code, private files, or project location | [FM_HOME](#fm_home) and [operational home layout](#operational-home-layout-and-state) |
 | Task windows and worker tools | [Runtime backend](#runtime-backend-configbackend--fm_backend) and [harness support](#harness-support) |
 | Worker permissions, accounts, or environment | [Codex approval review](#codex-automatic-approval-review), [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [Codex permission mode](#codex-permission-mode-configcodex-permission-mode), [persistent managed-policy failover](#persistent-managed-policy-failover), [worker account pin](#worker-account-pin-configclaude-account-configpi-account), [several Claude accounts](#several-claude-accounts-configclaude-accounts), [worker tool exclusions](#worker-tool-exclusions-configcrew-exclude-tools), [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist), and its [Orca environment source](#orca-environment-source-configlaunch-env-tmux-session) |
-| Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), [external memory tiers](#external-memory-tiers-memory-layering-section), [record export](#record-export-configrecord-export-root), and [startup memory budget](#startup-memory-budget-configstartup-memory-budget) |
+| Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), [project visions](#project-visions-datavisions), [external memory tiers](#external-memory-tiers-memory-layering-section), [record export](#record-export-configrecord-export-root), and [startup memory budget](#startup-memory-budget-configstartup-memory-budget) |
 | Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), [Codex native Stop park](#codex-native-stop-park-configcodex-stop-park), [warm-cache compaction](#warm-cache-compaction-configwarm-compact), and [Calm preference](#calm-preference-configcalm) |
 | Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) |
 | Review bots on owned GitHub pull requests | [Contribution review bots](#contribution-review-bots-configcontribution-review-bots) |
@@ -96,6 +96,7 @@ Each effective `FM_HOME` contains private operational directories.
 - Project and secondmate registries.
 - Captain preferences and optional shared captain preferences.
 - Learnings, backlog, briefs, scout reports, optional task status archives, and the optional per-task no-mistakes pipeline-spend ledger.
+- Per-project vision records under `data/visions/` and the dated `/course` reports they are assessed in.
 - Explicitly installed content-addressed extension packages under `data/extensions/packages/`.
 
 `state/` holds runtime records:
@@ -1124,6 +1125,25 @@ Fleet-local operational facts and gotchas live locally in `data/learnings.md`; i
 The file is created lazily on first learning and follows the internal [`stow` skill's](../.agents/skills/stow/SKILL.md) aging-tier and cold-archive contract: inspect the current file first and curate it instead of appending forever.
 
 There is no shared learnings file by captain decision.
+
+## Project visions (data/visions/)
+
+A vision record states what success means for one project or effort, so the [`course` skill](../.agents/skills/course/SKILL.md) can assess progress against it.
+`<name>` is the project's registry name, or a short kebab-case slug for an effort that is not one registered project.
+The record is private and gitignored with the rest of `data/`, created lazily, and holds only text the captain has confirmed: `/course` drafts live in its report until the captain confirms or corrects them.
+Edit it with inspect-then-update; the captain may also edit it directly.
+
+Each record is a Markdown file titled `# Vision: <name>`, with these bullets in this order:
+
+- **Vision:** one sentence on what the project is for and who it serves.
+- **Success criteria:** nested bullets, each one observable enough that evidence can show it met or not.
+- **Current milestone:** the next target and what reaching it looks like.
+- **Stance:** `active`, `parked <YYYY-MM-DD>`, or `ended <YYYY-MM-DD>`, with the reason after a dash for the latter two.
+- **Review date:** `YYYY-MM-DD` when the vision itself is due for a fresh look; a passed date is a `/course` recommendation, not an expiry.
+- **Confirmed:** `YYYY-MM-DD` of the captain's latest confirmation or correction.
+- **Sources:** the captain's own words with their date, plus any charter, plan, or report the text came from.
+
+Free-form notes may follow the bullets; `/course` treats them as context, never as success criteria.
 
 ## External memory tiers (Memory layering section)
 
