@@ -262,6 +262,20 @@ fm_backend_hc_hello() {  # <session>
   printf '%s' "$gen"
 }
 
+# fm_backend_hc_sandbox_hint: when this process runs inside Claude Code's Bash
+# sandbox (it exports SANDBOX_RUNTIME), print why an hc call failed followed by
+# <remedy>, a clause that reads naturally before "as its own Bash call"; return
+# 1 outside the sandbox so callers keep their ordinary message. The sandbox
+# blocks socket(AF_UNIX), so hc cannot reach its core, tries to start one, and
+# reports a misleading read-only file system error. Its excludedCommands exemption applies only when every part of
+# a Bash call matches, so a pipe, a chain, a VAR= prefix, or a file redirect
+# pulls the whole call back inside; 2>&1 does not.
+fm_backend_hc_sandbox_hint() {  # <remedy>
+  [ -n "${SANDBOX_RUNTIME:-}" ] || return 1
+  printf 'this ran inside the Claude Code sandbox (SANDBOX_RUNTIME is set), which blocks the Unix socket hc needs to reach herdr-core, so this is not an install problem; %s as its own Bash call: no pipe, no && or ;, no leading VAR=, no file redirect (2>&1 is fine)' \
+    "$1"
+}
+
 # fm_backend_hc_container_ensure: prove the binary is herdr-core at the
 # verified floor, make sure the session's core answers (hc starts its own
 # core on first use) and speaks protocol generation 1, then print the
@@ -273,8 +287,15 @@ fm_backend_hc_container_ensure() {
     || { echo "error: backend=hc selected but 'jq' is not installed (required to parse hc's JSON output)" >&2; return 1; }
   session=$(fm_backend_hc_session)
   fm_backend_hc_atom_valid "$session" || { echo "error: refusing hc session name '$session'" >&2; return 1; }
-  fm_backend_hc_cli "$session" server status --json >/dev/null 2>&1 \
-    || { echo "error: 'hc server status' failed for session '$session'; is herdr-core installed and startable?" >&2; return 1; }
+  if ! fm_backend_hc_cli "$session" server status --json >/dev/null 2>&1; then
+    local hint
+    if hint=$(fm_backend_hc_sandbox_hint "rerun this exact bin/fm-spawn.sh call"); then
+      echo "error: 'hc server status' failed for session '$session': $hint" >&2
+    else
+      echo "error: 'hc server status' failed for session '$session'; is herdr-core installed and startable?" >&2
+    fi
+    return 1
+  fi
   gen=$(fm_backend_hc_hello "$session") || {
     echo "error: herdr-core session '$session' did not answer the hello handshake; is the core reachable?" >&2
     return 1

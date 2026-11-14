@@ -14,8 +14,8 @@ CONTROL_ID="hcc$$"
 FM_TEST_CLEANUP_DIRS+=("/tmp/fm-$CONTROL_ID")
 
 # The stub answers `get` from <dir>/<address>.json (exit from <address>.exit,
-# 3 = not_found when no file exists), `ls` from <dir>/ls.json, `run` with
-# <dir>/run.json, and removes <address>.json on `rm` unless <dir>/rm-sticks
+# 3 = not_found when no file exists), `server` fails when <dir>/server.exit
+# exists, `ls` from <dir>/ls.json, `run` with <dir>/run.json, and removes <address>.json on `rm` unless <dir>/rm-sticks
 # exists. Every call is logged with its HC_SESSION and HC_SOCKET.
 make_hc_fakebin() {  # <dir> -> echoes fakebin dir
   local fb="$1/fakebin"
@@ -34,7 +34,13 @@ last=""
 for a in "$@"; do last=$a; done
 case "$cmd" in
   --version) printf 'hc %s\n' "${FAKE_HC_VERSION:-0.1.15}" ;;
-  server) printf '{"live":0}\n' ;;
+  server)
+    if [ -f "$D/server.exit" ]; then
+      echo "error: cannot start core: Read-only file system (os error 30)" >&2
+      exit "$(cat "$D/server.exit")"
+    fi
+    printf '{"live":0}\n'
+    ;;
   connect)
     IFS= read -r _req || true
     printf '{"jsonrpc":"2.0","id":1,"result":{"generation":%s}}\n' "${FAKE_HC_GENERATION:-1}"
@@ -709,6 +715,64 @@ test_task_names_are_valid_stable_and_collision_safe() {
   pass "hc: task-derived names obey core rules, distinguish truncation collisions, and never hide a naming refusal"
 }
 
+# Inside Claude Code's sandbox (SANDBOX_RUNTIME set) a failed preflight names
+# the sandbox and the standalone-call remedy; outside it the message is unchanged.
+test_container_ensure_names_the_sandbox_when_status_fails() {
+  local out rc
+  setup_case sbx-spawn
+  echo 1 > "$D/server.exit"
+  rc=0
+  out=$(SANDBOX_RUNTIME=1 hc_shell 'fm_backend_hc_container_ensure' 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "a failed server status must refuse inside the sandbox"
+  assert_contains "$out" "inside the Claude Code sandbox" "the sandboxed refusal must name the sandbox"
+  assert_contains "$out" "rerun this exact bin/fm-spawn.sh call as its own Bash call" "the sandboxed refusal must give the standalone-call remedy"
+  assert_contains "$out" "no pipe, no && or ;, no leading VAR=, no file redirect (2>&1 is fine)" "the remedy must name every call shape that re-enters the sandbox"
+  assert_not_contains "$out" "installed and startable" "the sandboxed refusal must not blame the install"
+  rc=0
+  out=$(env -u SANDBOX_RUNTIME FAKE_HC_DIR="$D" PATH="$FB:$PATH" FM_HC_BIN="$FB/hc" \
+    FM_HOME="$HOMEDIR" FM_ROOT_OVERRIDE="$HOMEDIR" HC_SESSION=fmtest bash -c '
+      . "'"$FM_TEST_ROOT"'/bin/fm-backend.sh"
+      fm_backend_source hc || exit 90
+      fm_backend_hc_container_ensure' 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "a failed server status must refuse outside the sandbox"
+  assert_contains "$out" "is herdr-core installed and startable?" "outside the sandbox the message is unchanged"
+  assert_not_contains "$out" "Claude Code sandbox" "outside the sandbox no sandbox hint is added"
+  pass "hc: a failed preflight names the sandbox remedy only when SANDBOX_RUNTIME is set"
+}
+
+# fm-send's doorbell to an hc task: a failed ring inside the sandbox adds the
+# cause and the standalone-call rule without inviting a duplicate steer.
+test_send_doorbell_failure_names_the_sandbox() {
+  local tag out rc id=hcsbx1
+  setup_case sbx-send
+  tag=$(hometag_of)
+  write_terminal "$D" t2 live "fm-$id" "$tag" 2.1.312 claude
+  echo 1 > "$D/send.exit"
+  mkdir -p "$HOMEDIR/state" "$HOMEDIR/data"
+  printf 'window=fmtest:t2\nendpoint_task_id=%s\nworktree=%s\nproject=%s\nharness=claude\nkind=scout\nbackend=hc\nhc_session=fmtest\nhc_terminal=t2\n' \
+    "$id" "$D" "$D" > "$HOMEDIR/state/$id.meta"
+  send_case() {  # <sandbox-value or empty>
+    local sbx=$1
+    if [ -n "$sbx" ]; then set -- env SANDBOX_RUNTIME="$sbx"; else set -- env -u SANDBOX_RUNTIME; fi
+    "$@" FAKE_HC_DIR="$D" PATH="$FB:$PATH" FM_HC_BIN="$FB/hc" FM_HOME="$HOMEDIR" FM_ROOT_OVERRIDE="$HOMEDIR" \
+      FM_STATE_OVERRIDE="$HOMEDIR/state" FM_DATA_OVERRIDE="$HOMEDIR/data" \
+      "$FM_TEST_ROOT/bin/fm-send.sh" "$id" "please check the inbox" 2>&1
+  }
+  rc=0
+  out=$(send_case 1) || rc=$?
+  expect_code 0 "$rc" "a failed doorbell is still a recorded steer"$'\n'"$out"
+  assert_contains "$out" "doorbell did not reach" "the ordinary doorbell notice stays"
+  assert_contains "$out" "inside the Claude Code sandbox" "the sandboxed doorbell failure must name the sandbox"
+  assert_contains "$out" "do not rerun this steer" "the hint must not invite a duplicate steer"
+  assert_contains "$out" "run each later bin/fm-send.sh call as its own Bash call: no pipe, no && or ;, no leading VAR=, no file redirect (2>&1 is fine)" "the hint must give the standalone-call rule"
+  rc=0
+  out=$(send_case "") || rc=$?
+  expect_code 0 "$rc" "a failed doorbell outside the sandbox is still a recorded steer"$'\n'"$out"
+  assert_contains "$out" "doorbell did not reach" "outside the sandbox the ordinary notice stays"
+  assert_not_contains "$out" "Claude Code sandbox" "outside the sandbox no sandbox hint is added"
+  pass "fm-send: an hc doorbell failure names the sandbox remedy only when SANDBOX_RUNTIME is set"
+}
+
 fm_test_run \
   test_hc_is_spawn_capable_and_needs_app_signals \
   test_required_tool_check_uses_the_adapter_resolver \
@@ -724,6 +788,8 @@ fm_test_run \
   test_capture_and_current_path_read_the_recorded_terminal \
   test_endpoint_validation_binds_hc_meta \
   test_container_ensure_gates_binary_version_and_generation \
+  test_container_ensure_names_the_sandbox_when_status_fails \
+  test_send_doorbell_failure_names_the_sandbox \
   test_send_text_submit_confirms_through_send_wait \
   test_send_delimiters_and_binary_socket_pins \
   test_secondmate_spawn_lands_in_the_mates_own_space \

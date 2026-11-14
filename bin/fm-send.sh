@@ -1254,7 +1254,15 @@ else
     fi
     case "$ring_rc" in
     1) echo "fm-send: doorbell skipped (composer visibly holds pending text); the steer is durably recorded at $INBOX_RECORD and $ring_retry" >&2 ;;
-    2) echo "fm-send: doorbell did not reach $T; the steer is durably recorded at $INBOX_RECORD and $ring_retry" >&2 ;;
+    2)
+      echo "fm-send: doorbell did not reach $T; the steer is durably recorded at $INBOX_RECORD and $ring_retry" >&2
+      # Inside Claude Code's sandbox the hc doorbell cannot reach its core;
+      # say so, without inviting a rerun that would record the steer twice.
+      if [ "$TARGET_BACKEND" = hc ] && fm_backend_source hc 2>/dev/null \
+        && sandbox_hint=$(fm_backend_hc_sandbox_hint "do not rerun this steer, which is already recorded; run each later bin/fm-send.sh call"); then
+        echo "fm-send: the doorbell failed because $sandbox_hint" >&2
+      fi
+      ;;
     3) echo "fm-send: doorbell not typed because the agent in $T has exited; the steer is durably recorded at $INBOX_RECORD for recovery (stuck-crewmate-recovery), and the watcher will not re-ring a dead pane" >&2 ;;
     esac
     exit 0
