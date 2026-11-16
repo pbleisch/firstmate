@@ -1229,12 +1229,17 @@ fm_pr_forgejo_api_error() {  # <host> <stdout> <stderr-file>
 # only a record whose state, merged, and head.sha fields all have the expected
 # types is accepted; anything else returns 1 for an honest unknown, with
 # FM_PR_RECORD_ERROR naming why (fm_pr_forgejo_api_error).
+# FM_PR_RECORD_DRAFT is "true" or "false" when the record carries a boolean
+# draft flag and empty when an older instance omits it, and FM_PR_RECORD_TITLE
+# is the title on one line, empty when absent; neither is required.
 fm_pr_forgejo_read_record() {  # <host> <path> <number>
   local host=$1 path=$2 number=$3 login json fields line err_file
-  local total=0 named=0 state='' merged='' head=''
+  local total=0 named=0 state='' merged='' head='' draft='' title=''
   FM_PR_RECORD_STATE=
   FM_PR_RECORD_MERGED=
   FM_PR_RECORD_HEAD=
+  FM_PR_RECORD_DRAFT=
+  FM_PR_RECORD_TITLE=
   FM_PR_RECORD_ERROR=
   if ! command -v jq >/dev/null 2>&1; then
     FM_PR_RECORD_ERROR="jq is not on PATH"
@@ -1265,7 +1270,9 @@ fm_pr_forgejo_read_record() {  # <host> <path> <number>
       then
         "state=" + .state,
         "merged=" + (.merged | tostring),
-        "head=" + .head.sha
+        "head=" + .head.sha,
+        "draft=" + (if (.draft | type) == "boolean" then (.draft | tostring) else "" end),
+        "title=" + (if (.title | type) == "string" then (.title | gsub("[\\r\\n\\t]"; " ")) else "" end)
       else
         error("invalid pull request record")
       end' 2>/dev/null); then
@@ -1278,13 +1285,15 @@ fm_pr_forgejo_read_record() {  # <host> <path> <number>
       state=*) state=${line#state=} ;;
       merged=*) merged=${line#merged=} ;;
       head=*) head=${line#head=} ;;
+      draft=*) draft=${line#draft=} ;;
+      title=*) title=${line#title=} ;;
       *) continue ;;
     esac
     named=$((named + 1))
   done <<FIELDS
 $fields
 FIELDS
-  if [ "$named" -ne 3 ] || [ "$total" -ne 3 ] || [ -z "$state" ] \
+  if [ "$named" -ne 5 ] || [ "$total" -ne 5 ] || [ -z "$state" ] \
     || { [ "$merged" != true ] && [ "$merged" != false ]; }; then
     FM_PR_RECORD_ERROR="$host answered with an unreadable record"
     return 1
@@ -1299,6 +1308,11 @@ FIELDS
   # Consumed by bin/fm-teardown.sh pr_is_merged.
   # shellcheck disable=SC2034
   FM_PR_RECORD_HEAD=$head
+  # Consumed by bin/fm-secondmate-pr-merge.sh pr_held.
+  # shellcheck disable=SC2034
+  FM_PR_RECORD_DRAFT=$draft
+  # shellcheck disable=SC2034
+  FM_PR_RECORD_TITLE=$title
 }
 
 # The combined commit status of <sha> in Forgejo repository <owner/repo>, read

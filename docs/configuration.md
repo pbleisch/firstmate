@@ -836,6 +836,8 @@ Only the captain grants one, and firstmate writes the file; a worker or a second
 Each line is `<secondmate-id> <repository URL> <the captain's verbatim words>`, and blank lines and lines starting with `#` are ignored.
 The file grants nothing unless it is a regular, single-link file only its owner can write, and a line that does not parse grants nothing; both are reported once per change of the file.
 With the file present, the watcher's check sweep runs `bin/fm-secondmate-pr-merge.sh auto` before its other checks, which arms each granted pull request the mate's newest `done:` line reports, and arms it again after a later `done:` line, such as a report of a new head after red checks.
+Each sweep scans only the status lines added since its last completed scan, and scans the whole file again when it was truncated or replaced or the mate's grants changed.
+A pull request its author holds, as a draft or with a title starting `WIP:` or `[WIP]`, is not armed, and later sweeps read it again until the hold is lifted.
 The merge-time gates are unchanged: green checks at the reported head, an unchanged head, mergeability, and the content guard, whose findings are never overridden.
 A pull request that changes a dependency manifest, lockfile, or vendored tree is never armed under a grant and is reported for the captain's per-PR word instead.
 Removing a line withdraws the grant, including from pull requests already armed under it.
