@@ -30,6 +30,9 @@ INSTRUCTION="merge PR 9 when CI is green"
 # exits 0 even on an HTTP error, so every branch exits 0, except that with
 # tea-down present every api call fails the way tea reports an unreachable
 # host, and with tea-error-body present it answers with a Forgejo error body.
+# A read of pull request <n> answers from pr-<n>.json when that file exists,
+# and with append-on-read present the first pull request read appends that
+# file's lines to the mate's status channel, as a report landing mid-sweep.
 add_tea_mock() {
   local case_dir=$1
   cat > "$case_dir/fakebin/tea" <<'SH'
@@ -80,7 +83,18 @@ case "$endpoint" in
     fi
     ;;
   *)
-    if [ -e "$log_dir/tea-merged" ]; then cat "$log_dir/pr-post.json"; else cat "$log_dir/pr.json"; fi
+    if [ -e "$log_dir/append-on-read" ]; then
+      cat "$log_dir/append-on-read" >> "$log_dir/home/state/agent-dev.status"
+      rm -f "$log_dir/append-on-read"
+    fi
+    number=${endpoint##*/pulls/}
+    if [ -e "$log_dir/pr-$number.json" ]; then
+      cat "$log_dir/pr-$number.json"
+    elif [ -e "$log_dir/tea-merged" ]; then
+      cat "$log_dir/pr-post.json"
+    else
+      cat "$log_dir/pr.json"
+    fi
     ;;
 esac
 exit 0
@@ -89,9 +103,9 @@ SH
   ln -sf "$JQ_BIN" "$case_dir/fakebin/jq"
 }
 
-write_pr_json() {  # <file> <head> [state] [mergeable] [merged]
-  printf '{"state":"%s","mergeable":%s,"merged":%s,"draft":false,"head":{"sha":"%s"},"base":{"ref":"main"}}\n' \
-    "${3:-open}" "${4:-true}" "${5:-false}" "$2" > "$1"
+write_pr_json() {  # <file> <head> [state] [mergeable] [merged] [draft] [title]
+  printf '{"state":"%s","mergeable":%s,"merged":%s,"draft":%s,"title":"%s","head":{"sha":"%s"},"base":{"ref":"main"}}\n' \
+    "${3:-open}" "${4:-true}" "${5:-false}" "${6:-false}" "${7:-child PR}" "$2" > "$1"
 }
 
 write_status_json() {  # <file> <state|none>
@@ -801,8 +815,153 @@ test_watcher_sweep_merges_a_granted_pull_request() {
   pass "the watcher's check sweep arms and merges a granted pull request in one sweep"
 }
 
+# A done line for pull request <n> in the granted repository.
+report_other() {  # <case-dir> <number>
+  printf 'done [key=other-%s] [at=1794225000]: child PR ready: https://%s/%s/%s/pulls/%s mode=direct-PR\n' \
+    "$2" "$FJ_HOST" "$FJ_OWNER" "$FJ_REPO" "$2" >> "$1/home/state/$MATE.status"
+}
+
+# The forge answers pull request <n> as merged.
+merged_other() {  # <case-dir> <number>
+  write_pr_json "$1/pr-$2.json" "$(cat "$1/head")" closed true true
+}
+
+test_sweep_scans_only_new_status_lines() {
+  local case_dir n auto reads
+  case_dir=$(make_case grant-incremental)
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  auto="$case_dir/home/state/secondmate-prs/auto"
+  for n in $(seq 100 179); do
+    report_other "$case_dir" "$n"
+    merged_other "$case_dir" "$n"
+  done
+  run_auto "$case_dir"
+  [ ! -s "$case_dir/auto.out" ] || fail "incremental: merged reports were not noted silently: $(cat "$case_dir/auto.out")"
+  assert_grep "outcome=not-open" "$auto/$MATE-pr-$FJ_REPO-179.seen" "incremental: the first sweep did not act on the whole log"
+  assert_present "$case_dir/home/state/secondmate-prs/$RID.meta" "incremental: the first sweep did not arm the open pull request"
+
+  # With their seen records gone, the old lines could only be acted on again
+  # by a sweep that parsed them again.
+  for n in $(seq 100 179); do
+    rm -f "$auto/$MATE-pr-$FJ_REPO-$n.seen"
+  done
+  report_other "$case_dir" 200
+  merged_other "$case_dir" 200
+  : > "$case_dir/tea.log"
+  run_auto "$case_dir"
+  assert_grep "outcome=not-open" "$auto/$MATE-pr-$FJ_REPO-200.seen" "incremental: the new line was not acted on"
+  reads=$(grep -c '/pulls/1[0-9][0-9]' "$case_dir/tea.log" || true)
+  [ "$reads" = 0 ] || fail "incremental: a later sweep read $reads pull requests from lines it had already scanned"
+  assert_absent "$auto/$MATE-pr-$FJ_REPO-100.seen" "incremental: a later sweep acted on a line it had already scanned"
+
+  : > "$case_dir/tea.log"
+  run_auto "$case_dir"
+  assert_no_grep "/pulls/" "$case_dir/tea.log" "incremental: a sweep with no new lines read the forge"
+  pass "the sweep parses only the status lines added since its last completed pass"
+}
+
+test_truncated_or_replaced_status_is_scanned_again() {
+  local case_dir status meta seen head line
+  case_dir=$(make_case grant-truncated)
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  status="$case_dir/home/state/$MATE.status"
+  meta="$case_dir/home/state/secondmate-prs/$RID.meta"
+  seen="$case_dir/home/state/secondmate-prs/auto/$RID.seen"
+  head=$(cat "$case_dir/head")
+  run_auto "$case_dir"
+  assert_present "$meta" "truncated: the first sweep did not arm"
+  run_sm "$case_dir" disarm "$RID" > /dev/null || fail "truncated: could not disarm"
+
+  # A shorter file: the cursor's offset is past its end.
+  line="done: $FJ_URL head $head"
+  printf '%s\n' "$line" > "$status"
+  run_auto "$case_dir"
+  assert_present "$meta" "truncated: a truncated status file was not scanned from its start"
+  run_sm "$case_dir" disarm "$RID" > /dev/null || fail "truncated: could not disarm again"
+
+  # A replaced file whose bytes before the offset differ, ending in the line
+  # already acted on: it is scanned again, and that line is not acted on twice.
+  printf '%s\n' "working [at=1794229999]: the channel was rewritten with a longer first line" "$line" > "$status"
+  run_auto "$case_dir"
+  assert_absent "$meta" "replaced: a line already acted on was armed again after a rescan"
+  printf '%s\n' "done [at=1794230000]: $FJ_URL ready again" >> "$status"
+  run_auto "$case_dir"
+  assert_present "$meta" "replaced: a new line after the rescan was not acted on"
+
+  # A replaced file with new lines before the old offset.
+  run_sm "$case_dir" disarm "$RID" > /dev/null || fail "replaced: could not disarm"
+  printf '%s\n' "done [at=1794230001]: rewritten history names $FJ_URL" > "$status"
+  printf '%s\n' "working [at=1794230002]: padding past the old offset, padding past the old offset, padding" >> "$status"
+  run_auto "$case_dir"
+  assert_present "$meta" "replaced: a rewritten file's new line was skipped"
+  assert_grep "outcome=armed" "$seen" "replaced: the rescanned line was not marked seen"
+  pass "a truncated or replaced status file is scanned again from its start without acting twice on a line"
+}
+
+test_line_written_during_a_sweep_is_not_skipped() {
+  local case_dir status auto
+  case_dir=$(make_case grant-mid-sweep)
+  write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+  status="$case_dir/home/state/$MATE.status"
+  auto="$case_dir/home/state/secondmate-prs/auto"
+  merged_other "$case_dir" 12
+  printf 'done [at=1794225001]: child PR ready: https://%s/%s/%s/pulls/12\n' "$FJ_HOST" "$FJ_OWNER" "$FJ_REPO" \
+    > "$case_dir/append-on-read"
+  run_auto "$case_dir"
+  assert_absent "$case_dir/append-on-read" "mid-sweep: the report was not appended during the sweep"
+  assert_absent "$auto/$MATE-pr-$FJ_REPO-12.seen" "mid-sweep: a line that landed during the sweep was read by it"
+  run_auto "$case_dir"
+  assert_grep "outcome=not-open" "$auto/$MATE-pr-$FJ_REPO-12.seen" "mid-sweep: a line that landed during a sweep was skipped"
+
+  # A line still being written waits for its newline.
+  merged_other "$case_dir" 13
+  printf 'done [at=1794225002]: child PR ready: https://%s/%s/%s/pulls/13' "$FJ_HOST" "$FJ_OWNER" "$FJ_REPO" >> "$status"
+  run_auto "$case_dir"
+  assert_absent "$auto/$MATE-pr-$FJ_REPO-13.seen" "mid-sweep: an unterminated line was acted on"
+  printf ' head\n' >> "$status"
+  run_auto "$case_dir"
+  assert_grep "outcome=not-open" "$auto/$MATE-pr-$FJ_REPO-13.seen" "mid-sweep: a completed line was skipped"
+  pass "a status line that lands during a sweep, or is still being written, is acted on by a later sweep"
+}
+
+test_held_pull_request_waits_for_the_hold_to_lift() {
+  local case_dir head meta seen title rc
+  for title in "WIP: child PR" "[wip] child PR" draft; do
+    case_dir=$(make_case "grant-held-$(printf '%s' "$title" | tr -c '[:alnum:]' '-')")
+    head=$(cat "$case_dir/head")
+    meta="$case_dir/home/state/secondmate-prs/$RID.meta"
+    seen="$case_dir/home/state/secondmate-prs/auto/$RID.seen"
+    write_grants "$case_dir" "$MATE $FJ_REPO_URL $GRANT_WORDS"
+    if [ "$title" = draft ]; then
+      write_pr_json "$case_dir/pr.json" "$head" open true false true
+    else
+      write_pr_json "$case_dir/pr.json" "$head" open true false false "$title"
+    fi
+    run_auto "$case_dir"
+    run_auto "$case_dir"
+    [ ! -s "$case_dir/auto.out" ] || fail "held ($title): a held pull request produced output: $(cat "$case_dir/auto.out")"
+    assert_absent "$meta" "held ($title): a held pull request was armed"
+    assert_absent "$seen" "held ($title): a held pull request's report was closed instead of re-checked"
+    rc=0
+    run_sm "$case_dir" arm "$MATE" "$FJ_URL" --grant > "$case_dir/arm.out" 2> "$case_dir/arm.err" || rc=$?
+    expect_code 6 "$rc" "held ($title): arm --grant on a held pull request"
+    assert_grep "is held: " "$case_dir/arm.err" "held ($title): the refused arm did not name the hold"
+    assert_absent "$meta" "held ($title): arm --grant armed a held pull request"
+
+    write_pr_json "$case_dir/pr.json" "$head"
+    run_auto "$case_dir"
+    assert_present "$meta" "held ($title): the pull request was not armed once the hold lifted"
+    assert_grep "outcome=armed" "$seen" "held ($title): the armed report was not marked seen"
+  done
+  pass "a draft or work-in-progress pull request is not armed under a grant until its hold is lifted"
+}
+
 fm_test_run \
   test_grant_arms_automatically_and_merges_when_green \
+  test_sweep_scans_only_new_status_lines \
+  test_truncated_or_replaced_status_is_scanned_again \
+  test_line_written_during_a_sweep_is_not_skipped \
+  test_held_pull_request_waits_for_the_hold_to_lift \
   test_no_arm_without_a_matching_grant \
   test_dependency_change_escalates_instead_of_arming \
   test_red_checks_disarm_then_a_new_head_rearms \

@@ -37,7 +37,7 @@
 # refusal names git's own error. A refusal that a later attempt may clear - the
 # pull request or its head unreadable at the forge, the content guard's head
 # fetch failing or returning another commit, or the dependency diff not
-# computable - exits 5; every other refusal exits 1 or 2, or 4 below. The
+# computable - exits 5; every other refusal exits 1 or 2, or 4 or 6 below. The
 # record id it prints is
 # <secondmate-id>-pr-<repo>-<number>, with characters outside [A-Za-z0-9_-]
 # replaced by "_". arm then registers a custom watcher check, state/<record-id>.check.sh,
@@ -68,25 +68,37 @@
 # constraints*.txt, pyproject.toml, uv.lock, poetry.lock, Pipfile, Pipfile.lock,
 # setup.py, setup.cfg, Gemfile, Gemfile.lock, in any directory, or anything
 # under a vendor/ directory. Such a pull request merges only on the captain's
-# per-PR instruction.
+# per-PR instruction. arm --grant also refuses (exit 6) a pull request its
+# author holds: a draft, or one whose title starts with "WIP:" or "[WIP]" in any
+# case, the work-in-progress prefixes Forgejo and Gitea recognize.
 # auto is the sweep the watcher runs before its other checks while
 # config/secondmate-pr-auto-merge exists (bin/fm-watch.sh). For each granted
-# mate it reads the newest done line on the mate's status channel naming each
-# pull request in a granted repository, and acts once per such line: a
-# pull request that is already armed, or that the sweep cannot read right now,
-# waits for a later sweep; a merged or closed one is noted silently; otherwise
-# it runs arm --grant, with --head <sha> when the line carries "<url> head
-# <sha>". An escalation or a refused arm prints one line naming the pull
+# mate it scans only the status lines added since its last completed scan, and
+# keeps the newest done line naming each pull request in a granted repository
+# as that pull request's pending report (auto/<record-id>.pending) until a
+# sweep resolves it. It acts once per such line: a pull request that is already
+# armed, that the sweep cannot read right now, or that its author holds (a
+# draft, or a "WIP:" or "[WIP]" title, as for arm --grant) waits for a later
+# sweep, which reads it again; a merged or closed one is noted silently;
+# otherwise it runs arm --grant, with --head <sha> when the line carries "<url>
+# head <sha>". An escalation or a refused arm prints one line naming the pull
 # request. An arm that exits 5, like an unreadable pull request, leaves the line
 # for the next sweep; after two sweeps in a row fail that way for the same line
 # the sweep prints one line naming the pull request and the last error, and
 # stays silent on that line after it while it keeps retrying (the count is
 # auto/<record-id>.retry). An unreadable pull request's error names the forge's
 # host and its own words. A later done line for the same pull request, such as
-# the mate's report of a new head after red checks or a moved head, is acted on
-# again;
-# the same line never is. What the sweep acted on is kept in
-# state/secondmate-prs/auto/<record-id>.seen.
+# the mate's report of a new head after red checks or a moved head, replaces
+# the pending one and is acted on again; the same line never is. What the
+# sweep acted on is kept in state/secondmate-prs/auto/<record-id>.seen.
+# The scan's cursor, auto/<mate>.cursor, keeps the byte offset scanned to, the
+# digest of the bytes before it, and the digest of the mate's granted
+# repositories. A missing or unreadable cursor, a status file now shorter than
+# the offset or with other bytes before it, or a changed grant drops the mate's
+# pending reports and scans the whole file again, which acts on no line twice
+# because the seen records still hold every line acted on. Each scan reads one
+# snapshot of the file and stops at its last newline, so a line that lands
+# during a sweep, or is still being written, is scanned by a later one.
 # A grant-armed record also closes, unmerged, when its grant has been removed.
 #
 # merge attempts the merge now. poll is what the armed check runs, and differs
@@ -139,6 +151,8 @@
 #   closed/<record-id>-<epoch>/  a closed record, its meta carrying outcome=
 #   auto/<record-id>.seen        the done line the auto sweep last acted on
 #   auto/<record-id>.retry       that line's consecutive retryable failures
+#   auto/<record-id>.pending     the newest done line not yet resolved
+#   auto/<secondmate-id>.cursor  how far the sweep has scanned that mate's status
 set -eu
 
 usage() {
@@ -187,10 +201,11 @@ one_line() {
 # by canonical identity so trailing punctuation or a non-canonical spelling of
 # the same pull request still matches.
 mate_reported_url() {  # <status-file> <canonical-url>
-  local file=$1 want=$2 line token
+  local file=$1 want=$2 line token line_verb
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
-    [ "$(status_line_verb "$line")" = "done" ] || continue
+    status_line_verb "$line" line_verb
+    [ "$line_verb" = "done" ] || continue
     while IFS= read -r token; do
       while :; do
         case "$token" in
@@ -202,7 +217,7 @@ mate_reported_url() {  # <status-file> <canonical-url>
         return 0
       fi
     done < <(printf '%s\n' "$line" | grep -oE 'https://[^[:space:]]+' || true)
-  done < "$file"
+  done < <(grep -F 'https://' "$file" | grep -F 'done' || true)
   return 1
 }
 
@@ -345,6 +360,7 @@ guard_fetch_head() {  # <cache> <number> <rid> <want-head>
 
 LOCK_HELD=
 SWEEP_LOCK_HELD=
+SNAPSHOT=
 release_lock() {
   [ -z "$LOCK_HELD" ] || fm_lock_release "$LOCK_HELD" || true
   LOCK_HELD=
@@ -353,6 +369,8 @@ release_locks() {
   release_lock
   [ -z "$SWEEP_LOCK_HELD" ] || fm_lock_release "$SWEEP_LOCK_HELD" || true
   SWEEP_LOCK_HELD=
+  [ -z "$SNAPSHOT" ] || rm -f -- "$SNAPSHOT"
+  SNAPSHOT=
 }
 trap release_locks EXIT
 
@@ -382,6 +400,28 @@ close_record() {  # <record-id> <outcome> <detail>
     FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$SCRIPT_DIR/fm-check-unregister.sh" "$rid" >/dev/null \
       || printf 'warning: the watcher check for %s could not be retired\n' "$rid" >&2
   fi
+}
+
+# 0 while the pull request the last fm_pr_forgejo_read_record read is held by
+# its author: a draft, or a title that starts with "WIP:" or "[WIP]" in any
+# case, the work-in-progress prefixes Forgejo and Gitea recognize. HOLD_REASON
+# then names the hold.
+HOLD_REASON=
+pr_held() {
+  local title=${FM_PR_RECORD_TITLE:-}
+  HOLD_REASON=
+  if [ "${FM_PR_RECORD_DRAFT:-}" = true ]; then
+    HOLD_REASON='it is a draft'
+    return 0
+  fi
+  title=${title#"${title%%[![:space:]]*}"}
+  case "$title" in
+    [Ww][Ii][Pp]:* | \[[Ww][Ii][Pp]\]*)
+      HOLD_REASON='its title marks it work in progress'
+      return 0
+      ;;
+  esac
+  return 1
 }
 
 cmd_arm() {
@@ -474,6 +514,10 @@ cmd_arm() {
   [ "$FM_PR_RECORD_MERGED" = false ] && [ "$FM_PR_RECORD_STATE" = open ] \
     || die "$url is not an open, unmerged pull request (state=$FM_PR_RECORD_STATE, merged=$FM_PR_RECORD_MERGED)"
   fm_pr_head_valid "$FM_PR_RECORD_HEAD" || die "could not read the head of $url" 5
+  # A grant never covers a pull request its author still holds.
+  if [ "$use_grant" = true ] && pr_held; then
+    die "$url is held: $HOLD_REASON; the standing grant arms it once the hold is lifted" 6
+  fi
   if [ -n "$presented_head" ] && [ "$presented_head" != "$FM_PR_RECORD_HEAD" ]; then
     die "the head of $url is now $FM_PR_RECORD_HEAD, not the presented $presented_head; present the changed pull request to the captain again"
   fi
@@ -754,17 +798,42 @@ attempt() {  # <mode> <record-id>
   return 1
 }
 
-# Each granted pull request the mate's done lines name, one per line as
-# "<url>\t<reported-head>\t<line-key>", taken from the newest done line naming
-# it. The reported head is the commit after "<url> head" on that line, or empty;
-# the key identifies the line itself so the sweep acts on it once.
-granted_reports() {  # <mate>
-  local mate=$1 file="$STATE/$1.status" line key token next after url head i
+# This mate's granted repositories as "<host>\t<path>" lines between newlines,
+# from the grant lines the sweep read once, so a per-token grant check reads
+# no file.
+MATE_GRANTS=
+mate_grants_load() {  # <mate> <grant-lines>
+  local mate host path words nl tab
+  nl=$'\n'
+  tab=$'\t'
+  MATE_GRANTS=$nl
+  while IFS="$tab" read -r mate host path words; do
+    [ "$mate" = "$1" ] || continue
+    MATE_GRANTS="$MATE_GRANTS$host$tab$path$nl"
+  done <<EOF
+$2
+EOF
+}
+
+mate_granted() {  # <host> <path>
+  case "$MATE_GRANTS" in
+    *$'\n'"$1"$'\t'"$2"$'\n'*) return 0 ;;
+  esac
+  return 1
+}
+
+# Each granted pull request the done lines on stdin name, one per line as
+# "<url>\t<reported-head>\t<line-key>". The reported head is the commit after
+# "<url> head" on that line, or "-" when there is none, since a read splitting
+# on tabs would merge an empty field; the key identifies the line itself so the
+# sweep acts on it once.
+granted_reports() {
+  local line line_verb key token next after url head i
   local -a toks
-  [ -f "$file" ] && [ ! -L "$file" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
-    [ "$(status_line_verb "$line")" = "done" ] || continue
-    key=$(printf '%s' "$line" | cksum | awk '{print $1 "-" $2}')
+    status_line_verb "$line" line_verb
+    [ "$line_verb" = "done" ] || continue
+    key=
     read -ra toks <<EOF
 $line
 EOF
@@ -784,8 +853,9 @@ EOF
       done
       fm_pr_url_parse "$token" && [ "$FM_PR_PROVIDER" = forgejo ] || continue
       url=$FM_PR_URL
-      grant_for "$mate" "$FM_PR_HOST" "$FM_PR_PATH" || continue
-      head=
+      mate_granted "$FM_PR_HOST" "$FM_PR_PATH" || continue
+      [ -n "$key" ] || key=$(printf '%s' "$line" | cksum | awk '{print $1 "-" $2}')
+      head=-
       next=${toks[$i]:-}
       after=${toks[$((i + 1))]:-}
       after=${after%%[!0-9a-f]*}
@@ -794,7 +864,7 @@ EOF
       fi
       printf '%s\t%s\t%s\n' "$url" "$head" "$key"
     done
-  done < "$file"
+  done
 }
 
 seen_key() {  # <record-id>
@@ -802,15 +872,130 @@ seen_key() {  # <record-id>
 }
 
 mark_seen() {  # <record-id> <key> <outcome>
-  local tmp
+  local rid=${1:?} tmp
   tmp=$(mktemp "$AUTO/.seen.XXXXXX") || return 1
   printf 'key=%s\noutcome=%s\nat=%s\n' "$2" "$3" "$(date +%s)" > "$tmp"
   chmod 0600 "$tmp"
-  mv -f -- "$tmp" "$AUTO/$1.seen" || return 1
-  rm -f -- "$AUTO/$1.retry"
+  mv -f -- "$tmp" "$AUTO/$rid.seen" || return 1
+  rm -f -- "${AUTO:?}/$rid.retry" "${AUTO:?}/$rid.pending"
 }
 
-# Count one retryable failure of the done line <key>, which stays unseen so the
+# The newest unresolved report of one pull request, kept until a sweep resolves
+# it, so a retry or a hold outlives the cursor moving past its line.
+write_pending() {  # <record-id> <mate> <url> <head> <key>
+  local tmp
+  tmp=$(mktemp "$AUTO/.pending.XXXXXX") || return 1
+  printf 'mate=%s\nurl=%s\nhead=%s\nkey=%s\n' "$2" "$3" "$4" "$5" > "$tmp"
+  chmod 0600 "$tmp"
+  mv -f -- "$tmp" "$AUTO/$1.pending" || { rm -f -- "${tmp:?}"; return 1; }
+}
+
+PENDING_MATE=
+PENDING_URL=
+PENDING_HEAD=
+PENDING_KEY=
+read_pending() {  # <file>
+  local k v
+  PENDING_MATE=
+  PENDING_URL=
+  PENDING_HEAD=
+  PENDING_KEY=
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  while IFS='=' read -r k v; do
+    case "$k" in
+      mate) PENDING_MATE=$v ;;
+      url) PENDING_URL=$v ;;
+      head) PENDING_HEAD=$v ;;
+      key) PENDING_KEY=$v ;;
+    esac
+  done < "$1"
+  [ -n "$PENDING_MATE" ] && [ -n "$PENDING_URL" ] && [ -n "$PENDING_KEY" ]
+}
+
+drop_pending() {  # <mate>
+  local file
+  for file in "$AUTO"/*.pending; do
+    [ -e "$file" ] || [ -L "$file" ] || continue
+    if ! read_pending "$file" || [ "$PENDING_MATE" = "$1" ]; then
+      rm -f -- "${file:?}"
+    fi
+  done
+}
+
+# cksum of the first <bytes> bytes of <file>, as "<crc>-<length>".
+prefix_sum() {  # <file> <bytes>
+  if [ "$2" -gt 0 ]; then
+    head -c "$2" "$1" | cksum | awk '{print $1 "-" $2}'
+  else
+    printf '' | cksum | awk '{print $1 "-" $2}'
+  fi
+}
+
+# Turn the done lines the mate's status channel gained since the last completed
+# scan into pending reports, then move the mate's cursor past them; the header
+# owns the cursor's rules. Every read comes from one snapshot of the file, so
+# the offset never passes a byte this scan did not read.
+scan_status() {  # <mate>
+  local mate=$1 file="$STATE/$1.status" cursor="$AUTO/$1.cursor" offset=0 prefix='' grants='' fp
+  local size end rescan=false url head key rid tmp
+  [ -f "$file" ] && [ ! -L "$file" ] || return 0
+  # A scan that stopped early left its snapshot behind.
+  [ -z "$SNAPSHOT" ] || rm -f -- "${SNAPSHOT:?}"
+  SNAPSHOT=
+  fp=$(printf '%s' "$MATE_GRANTS" | LC_ALL=C sort | cksum | awk '{print $1 "-" $2}')
+  if [ -f "$cursor" ] && [ ! -L "$cursor" ]; then
+    offset=$(record_value "$cursor" offset)
+    prefix=$(record_value "$cursor" prefix)
+    grants=$(record_value "$cursor" grants)
+    case "$offset" in '' | *[!0-9]*) rescan=true ;; esac
+  else
+    rescan=true
+  fi
+  SNAPSHOT=$(mktemp "$AUTO/.status.XXXXXX") || return 1
+  cat -- "$file" > "$SNAPSHOT" || return 1
+  size=$(wc -c < "$SNAPSHOT" | tr -d '[:space:]')
+  if [ "$rescan" = false ]; then
+    if [ "$grants" != "$fp" ] || [ "$offset" -gt "$size" ] \
+      || [ "$(prefix_sum "$SNAPSHOT" "$offset")" != "$prefix" ]; then
+      rescan=true
+    fi
+  fi
+  if [ "$rescan" = true ]; then
+    offset=0
+    drop_pending "$mate"
+  fi
+  # A last line without its newline is still being written; it waits.
+  end=$size
+  if [ -n "$(tail -c 1 "$SNAPSHOT")" ]; then
+    end=$((offset + $(tail -c +"$((offset + 1))" "$SNAPSHOT" | LC_ALL=C sed '$d' | wc -c | tr -d '[:space:]')))
+  fi
+  if [ "$end" -gt "$offset" ]; then
+    while IFS="$(printf '\t')" read -r url head key; do
+      [ "$head" != - ] || head=
+      fm_pr_url_parse "$url" || continue
+      rid=$(record_id_for "$mate" "$FM_PR_REPO" "$FM_PR_NUMBER")
+      fm_pr_task_id_valid "$rid" || continue
+      if [ "$(seen_key "$rid")" = "$key" ]; then
+        rm -f -- "${AUTO:?}/$rid.pending"
+        continue
+      fi
+      write_pending "$rid" "$mate" "$url" "$head" "$key" || return 1
+    done < <(tail -c +"$((offset + 1))" "$SNAPSHOT" | head -c "$((end - offset))" \
+      | grep -F 'https://' | grep -F 'done' | granted_reports \
+      | awk -F '\t' '{ last[$1] = $0; if (!($1 in order)) { order[$1] = ++n; urls[n] = $1 } }
+        END { for (i = 1; i <= n; i++) print last[urls[i]] }')
+  fi
+  if [ "$rescan" = true ] || [ "$end" -gt "$offset" ]; then
+    tmp=$(mktemp "$AUTO/.cursor.XXXXXX") || return 1
+    printf 'offset=%s\nprefix=%s\ngrants=%s\n' "$end" "$(prefix_sum "$SNAPSHOT" "$end")" "$fp" > "$tmp"
+    chmod 0600 "$tmp"
+    mv -f -- "$tmp" "$cursor" || { rm -f -- "${tmp:?}"; return 1; }
+  fi
+  rm -f -- "${SNAPSHOT:?}"
+  SNAPSHOT=
+}
+
+# Count one retryable failure of the done line <key>, which stays pending so the
 # next sweep tries it again. The second failure in a row prints one line; later
 # ones for the same line stay silent.
 note_retryable() {  # <record-id> <key> <mate> <url> <error>
@@ -835,8 +1020,62 @@ close_orphaned_grant_record() {  # <record-id>
   [ ! -e "$meta" ]
 }
 
+# Act on each of the mate's pending reports; the header owns every outcome.
+process_pending() {  # <mate>
+  local mate=$1 pending rid url head key out rc
+  for pending in "$AUTO"/*.pending; do
+    read_pending "$pending" || continue
+    [ "$PENDING_MATE" = "$mate" ] || continue
+    url=$PENDING_URL
+    head=$PENDING_HEAD
+    key=$PENDING_KEY
+    rid=${pending##*/}
+    rid=${rid%.pending}
+    if ! fm_pr_url_parse "$url" || [ "$FM_PR_PROVIDER" != forgejo ] \
+      || [ "$(record_id_for "$mate" "$FM_PR_REPO" "$FM_PR_NUMBER")" != "$rid" ] \
+      || ! mate_granted "$FM_PR_HOST" "$FM_PR_PATH" \
+      || [ "$(seen_key "$rid")" = "$key" ]; then
+      rm -f -- "${pending:?}"
+      continue
+    fi
+    if [ -e "$RECORDS/$rid.meta" ] || [ -L "$RECORDS/$rid.meta" ]; then
+      close_orphaned_grant_record "$rid" || continue
+    fi
+    # An unreadable pull request is retried on a later sweep; a merged or
+    # closed one needs nothing; one its author holds waits for the hold to lift.
+    if ! fm_pr_forgejo_read_record "$FM_PR_HOST" "$FM_PR_PATH" "$FM_PR_NUMBER" < /dev/null; then
+      note_retryable "$rid" "$key" "$mate" "$url" \
+        "could not read $url: ${FM_PR_RECORD_ERROR:-the forge gave no reason}" || true
+      continue
+    fi
+    if [ "$FM_PR_RECORD_MERGED" != false ] || [ "$FM_PR_RECORD_STATE" != open ]; then
+      mark_seen "$rid" "$key" not-open || true
+      continue
+    fi
+    pr_held && continue
+    rc=0
+    out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
+      "$SCRIPT_DIR/fm-secondmate-pr-merge.sh" arm "$mate" "$url" --grant ${head:+--head "$head"} 2>&1 >/dev/null < /dev/null) \
+      || rc=$?
+    out=$(printf '%s\n' "$out" | sed -n 's/^error: //p' | head -1)
+    case "$rc" in
+      0) mark_seen "$rid" "$key" armed || true ;;
+      4)
+        mark_seen "$rid" "$key" dependency-change || true
+        printf 'second mate %s PR %s is not merged automatically: %s\n' "$mate" "$url" "${out:-it changes dependency files}"
+        ;;
+      5) note_retryable "$rid" "$key" "$mate" "$url" "${out:-arm exited $rc}" || true ;;
+      6) ;;
+      *)
+        mark_seen "$rid" "$key" arm-refused || true
+        printf 'second mate %s PR %s could not be armed under the standing grant: %s\n' "$mate" "$url" "${out:-arm exited $rc}"
+        ;;
+    esac
+  done
+}
+
 cmd_auto() {
-  local home_rc=0 malformed='' fingerprint mate seen_mates=' ' url head key rid out rc
+  local home_rc=0 malformed='' fingerprint grants mate seen_mates=' '
   [ "$#" -eq 0 ] || die "usage: fm-secondmate-pr-merge.sh auto" 2
   [ -e "$GRANTS" ] || [ -L "$GRANTS" ] || return 0
   fm_parent_channel_home_id "$FM_HOME" >/dev/null 2>&1 || home_rc=$?
@@ -865,51 +1104,19 @@ cmd_auto() {
   fi
   [ "$malformed" != untrusted ] || return 0
 
+  grants=$(grants_read)
   while IFS="$(printf '\t')" read -r mate _; do
+    [ -n "$mate" ] || continue
     case "$seen_mates" in *" $mate "*) continue ;; esac
     seen_mates="$seen_mates$mate "
     [ -f "$STATE/$mate.meta" ] && [ ! -L "$STATE/$mate.meta" ] \
       && [ "$(record_value "$STATE/$mate.meta" kind)" = secondmate ] || continue
-    # Only the newest report of each pull request counts.
-    while IFS="$(printf '\t')" read -r url head key; do
-      fm_pr_url_parse "$url" || continue
-      rid=$(record_id_for "$mate" "$FM_PR_REPO" "$FM_PR_NUMBER")
-      fm_pr_task_id_valid "$rid" || continue
-      [ "$(seen_key "$rid")" != "$key" ] || continue
-      if [ -e "$RECORDS/$rid.meta" ] || [ -L "$RECORDS/$rid.meta" ]; then
-        close_orphaned_grant_record "$rid" || continue
-      fi
-      # An unreadable pull request is retried on a later sweep; a merged or
-      # closed one needs nothing.
-      if ! fm_pr_forgejo_read_record "$FM_PR_HOST" "$FM_PR_PATH" "$FM_PR_NUMBER" < /dev/null; then
-        note_retryable "$rid" "$key" "$mate" "$url" \
-          "could not read $url: ${FM_PR_RECORD_ERROR:-the forge gave no reason}" || true
-        continue
-      fi
-      if [ "$FM_PR_RECORD_MERGED" != false ] || [ "$FM_PR_RECORD_STATE" != open ]; then
-        mark_seen "$rid" "$key" not-open || true
-        continue
-      fi
-      rc=0
-      out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_CONFIG_OVERRIDE="$CONFIG" \
-        "$SCRIPT_DIR/fm-secondmate-pr-merge.sh" arm "$mate" "$url" --grant ${head:+--head "$head"} 2>&1 >/dev/null < /dev/null) \
-        || rc=$?
-      out=$(printf '%s\n' "$out" | sed -n 's/^error: //p' | head -1)
-      case "$rc" in
-        0) mark_seen "$rid" "$key" armed || true ;;
-        4)
-          mark_seen "$rid" "$key" dependency-change || true
-          printf 'second mate %s PR %s is not merged automatically: %s\n' "$mate" "$url" "${out:-it changes dependency files}"
-          ;;
-        5) note_retryable "$rid" "$key" "$mate" "$url" "${out:-arm exited $rc}" || true ;;
-        *)
-          mark_seen "$rid" "$key" arm-refused || true
-          printf 'second mate %s PR %s could not be armed under the standing grant: %s\n' "$mate" "$url" "${out:-arm exited $rc}"
-          ;;
-      esac
-    done < <(granted_reports "$mate" | awk -F '\t' '{ last[$1] = $0; if (!($1 in order)) { order[$1] = ++n; urls[n] = $1 } }
-      END { for (i = 1; i <= n; i++) print last[urls[i]] }')
-  done < <(grants_read)
+    mate_grants_load "$mate" "$grants"
+    scan_status "$mate" || continue
+    process_pending "$mate"
+  done <<EOF
+$grants
+EOF
   return 0
 }
 
